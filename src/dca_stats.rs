@@ -4,8 +4,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
-use tracing::{error, info};
-use uuid::Uuid;
+use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DcaPurchase {

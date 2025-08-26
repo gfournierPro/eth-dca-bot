@@ -2,6 +2,7 @@ mod binance;
 mod config;
 mod dca;
 mod dca_stats;
+mod dca_stats_mongo;
 
 use anyhow::Result;
 use config::Config;

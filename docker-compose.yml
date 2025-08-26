@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: dca-bot-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: your_secure_password
+      MONGO_INITDB_DATABASE: dca_bot
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    networks:
+      - dca-network
+
+volumes:
+  mongodb_data:
+
+networks:
+  dca-network:
+    driver: bridge
