@@ -1,0 +1,52 @@
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Config {
+    pub binance: BinanceConfig,
+    pub trading: TradingConfig,
+    pub schedule: ScheduleConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BinanceConfig {
+    pub api_key: String,
+    pub secret_key: String,
+    pub base_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TradingConfig {
+    pub symbol: String,
+    pub buy_amount_usdc: Decimal,
+    pub min_balance_usdc: Decimal,
+    pub max_slippage: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScheduleConfig {
+    pub cron_expression: String,
+    pub timezone: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            binance: BinanceConfig {
+                api_key: String::new(),
+                secret_key: String::new(),
+                base_url: "https://api.binance.com".to_string(),
+            },
+            trading: TradingConfig {
+                symbol: "ETHUSDC".to_string(),
+                buy_amount_usdc: Decimal::new(100, 0), // Default to $100
+                min_balance_usdc: Decimal::new(50, 0), // Default to $50
+                max_slippage: Decimal::new(1, 2),      // Default to 1%
+            },
+            schedule: ScheduleConfig {
+                cron_expression: "0 30 7 * * MON".to_string(),
+                timezone: "UTC".to_string(),
+            },
+        }
+    }
+}
