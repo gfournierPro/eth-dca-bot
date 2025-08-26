@@ -21,5 +21,6 @@ sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "chron
 uuid = { version = "1.18.0", features = ["v4"] }
 
 rust_decimal_macros = "1.37.1"
-bson = { version = "3.0.0", features = ["chrono-0_4"] }
 mongodb = "3.2.5"
+futures = "0.3.31"
+bson = { version = "2.15", features = ["chrono-0_4"] }

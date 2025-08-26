@@ -1,13 +1,13 @@
 // src/dca_stats_mongo.rs
 use anyhow::Result;
-use bson::{doc, Document};
+use bson::doc;
 use chrono::{DateTime, Utc};
-use mongodb::{Client, Collection, Database};
+use futures::stream::TryStreamExt;
+use mongodb::{bson::Document, Client, Collection};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
-use tracing::{info, error};
-use uuid::Uuid;
+use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DcaPurchase {
@@ -61,12 +61,12 @@ impl DcaStatsDB {
 
     pub async fn get_summary(&self, current_eth_price: Decimal) -> Result<DcaSummary> {
         let pipeline = vec![
-            doc! {
+            Document::from(doc! {
                 "$match": {
                     "status": "FILLED"
                 }
-            },
-            doc! {
+            }),
+            Document::from(doc! {
                 "$group": {
                     "_id": null,
                     "total_purchases": { "$sum": 1 },
@@ -76,7 +76,7 @@ impl DcaStatsDB {
                     "first_purchase": { "$min": "$timestamp" },
                     "last_purchase": { "$max": "$timestamp" }
                 }
-            }
+            })
         ];
 
         let mut cursor = self.collection.aggregate(pipeline).await?;
@@ -131,14 +131,22 @@ impl DcaStatsDB {
     }
 
     pub async fn get_recent_purchases(&self, limit: i64) -> Result<Vec<DcaPurchase>> {
-        let cursor = self
+        let mut cursor = self
             .collection
-            .find(None, None)
-            .sort(doc! { "timestamp": -1 })
-            .limit(limit)
+            .find(Document::new())
             .await?;
 
-        let purchases: Vec<DcaPurchase> = cursor.try_collect().await?;
+        let mut purchases = Vec::new();
+        while let Some(purchase) = cursor.try_next().await? {
+            purchases.push(purchase);
+            if purchases.len() >= limit as usize {
+                break;
+            }
+        }
+        
+        // Sort by timestamp in descending order
+        purchases.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        
         Ok(purchases)
     }
 }
