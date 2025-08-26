@@ -30,8 +30,18 @@ async fn main() -> Result<()> {
     let dca_trader = DcaTrader::new(binance_client, config.trading.clone()).await?;
 
     info!("Testing Binance API connection...");
-    let balance = dca_trader.binance_client.get_usdc_balanc().await?;
-    info!("Current USDC balance: {}", balance);
+    match dca_trader.binance_client.get_usdc_balanc().await {
+        Ok(balance) => {
+            info!("Current USDC balance: {}", balance);
+            dca_trader.show_dca_summary().await.unwrap_or_else(|e| {
+                error!("Failed to load DCA summary: {}", e);
+            })
+        }
+        Err(e) => {
+            error!("Failed to connect to Binance API: {}", e);
+            return Err(e);
+        }
+    };
 
     let sched = JobScheduler::new().await?;
 
