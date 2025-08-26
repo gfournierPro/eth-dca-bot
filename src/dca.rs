@@ -1,5 +1,6 @@
 use crate::config::TradingConfig;
 use crate::dca_stats_mongo::{DcaPurchase, print_dca_summary, print_recent_purchases};
+use crate::notion_integration::NotionDCATracker;
 use crate::{binance::BinanceClient, dca_stats_mongo::DcaStatsDB};
 use anyhow::{Result, anyhow};
 use chrono::Utc;
@@ -12,15 +13,29 @@ pub struct DcaTrader {
     pub binance_client: BinanceClient,
     trading_config: TradingConfig,
     pub stats_db: DcaStatsDB,
+    notion_tracker: Option<NotionDCATracker>,
 }
 
 impl DcaTrader {
     pub async fn new(binance_client: BinanceClient, trading_config: TradingConfig) -> Result<Self> {
         let stats_db = DcaStatsDB::new().await?;
+
+        let notion_tracker = match NotionDCATracker::new() {
+            Ok(tracker) => {
+                info!("Notion integration enabled");
+                Some(tracker)
+            }
+            Err(e) => {
+                warn!("Notion integration disabled: {}", e);
+                None
+            }
+        };
+
         Ok(Self {
             binance_client,
             trading_config,
             stats_db,
+            notion_tracker,
         })
     }
 
@@ -91,6 +106,17 @@ impl DcaTrader {
             status: order_result.status.clone(),
         };
         self.stats_db.record_purchase(&purchase).await?;
+
+        if let Some(ref notion_tracker) = self.notion_tracker {
+            let eur_usd_price = self.binance_client.get_symbol_price("EURUSDC").await?;
+            let eur_amount = executed_value / eur_usd_price;
+            if let Err(e) = notion_tracker
+                .record_dca_purchase(&purchase, eur_amount)
+                .await
+            {
+                warn!("⚠️  Failed to record purchase in Notion: {}", e);
+            }
+        }
 
         // Print purchase details
         info!("✅ DCA purchase completed successfully!");

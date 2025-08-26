@@ -29,6 +29,7 @@ pub struct MonthlyDCAData {
     pub eur: Decimal,
 }
 
+#[derive(Debug, Clone)]
 pub struct NotionDCATracker {
     client: NotionClient,
     database_id: String,
