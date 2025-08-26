@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 
+use rust_decimal_macros::dec;
 use anyhow::{Ok, Result, anyhow};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
@@ -47,6 +48,7 @@ pub struct OrderResponse {
     pub fills: Option<Vec<Fill>>,
 }
 
+#[derive(Debug, Deserialize)]
 pub struct Fill {
     pub price: String,
     pub qty: String,
