@@ -3,7 +3,7 @@ use anyhow::Result;
 use bson::doc;
 use chrono::{DateTime, Utc};
 use futures::stream::TryStreamExt;
-use mongodb::{bson::Document, Client, Collection};
+use mongodb::{Client, Collection, bson::Document};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
@@ -36,15 +36,17 @@ pub struct DcaSummary {
     pub unrealized_pnl_percentage: Decimal,
 }
 
+#[derive(Debug, Clone)]
 pub struct DcaStatsDB {
     collection: Collection<DcaPurchase>,
 }
 
 impl DcaStatsDB {
     pub async fn new() -> Result<Self> {
-        let mongodb_url = std::env::var("MONGODB_URL")
-            .unwrap_or_else(|_| "mongodb://dca_user:dca_password@localhost:27017/dca_bot".to_string());
-        
+        let mongodb_url = std::env::var("MONGODB_URL").unwrap_or_else(|_| {
+            "mongodb://dca_user:dca_password@localhost:27017/dca_bot".to_string()
+        });
+
         let client = Client::with_uri_str(&mongodb_url).await?;
         let database = client.database("dca_bot");
         let collection = database.collection("dca_purchases");
@@ -76,16 +78,22 @@ impl DcaStatsDB {
                     "first_purchase": { "$min": "$timestamp" },
                     "last_purchase": { "$max": "$timestamp" }
                 }
-            })
+            }),
         ];
 
         let mut cursor = self.collection.aggregate(pipeline).await?;
-        
+
         if let Some(doc) = cursor.try_next().await? {
             let total_purchases = doc.get_i32("total_purchases").unwrap_or(0) as i64;
-            let total_usdc_invested = Decimal::from_f64_retain(doc.get_f64("total_usdc_invested").unwrap_or(0.0)).unwrap_or(dec!(0));
-            let total_eth_acquired = Decimal::from_f64_retain(doc.get_f64("total_eth_acquired").unwrap_or(0.0)).unwrap_or(dec!(0));
-            let total_fees_paid = Decimal::from_f64_retain(doc.get_f64("total_fees_paid").unwrap_or(0.0)).unwrap_or(dec!(0));
+            let total_usdc_invested =
+                Decimal::from_f64_retain(doc.get_f64("total_usdc_invested").unwrap_or(0.0))
+                    .unwrap_or(dec!(0));
+            let total_eth_acquired =
+                Decimal::from_f64_retain(doc.get_f64("total_eth_acquired").unwrap_or(0.0))
+                    .unwrap_or(dec!(0));
+            let total_fees_paid =
+                Decimal::from_f64_retain(doc.get_f64("total_fees_paid").unwrap_or(0.0))
+                    .unwrap_or(dec!(0));
 
             let average_eth_price = if total_eth_acquired > dec!(0) {
                 total_usdc_invested / total_eth_acquired
@@ -107,8 +115,14 @@ impl DcaStatsDB {
                 total_eth_acquired,
                 total_fees_paid,
                 average_eth_price,
-                first_purchase: doc.get_datetime("first_purchase").ok().map(|dt| dt.to_chrono()),
-                last_purchase: doc.get_datetime("last_purchase").ok().map(|dt| dt.to_chrono()),
+                first_purchase: doc
+                    .get_datetime("first_purchase")
+                    .ok()
+                    .map(|dt| dt.to_chrono()),
+                last_purchase: doc
+                    .get_datetime("last_purchase")
+                    .ok()
+                    .map(|dt| dt.to_chrono()),
                 current_eth_value,
                 unrealized_pnl,
                 unrealized_pnl_percentage,
@@ -131,10 +145,7 @@ impl DcaStatsDB {
     }
 
     pub async fn get_recent_purchases(&self, limit: i64) -> Result<Vec<DcaPurchase>> {
-        let mut cursor = self
-            .collection
-            .find(Document::new())
-            .await?;
+        let mut cursor = self.collection.find(Document::new()).await?;
 
         let mut purchases = Vec::new();
         while let Some(purchase) = cursor.try_next().await? {
@@ -143,10 +154,10 @@ impl DcaStatsDB {
                 break;
             }
         }
-        
+
         // Sort by timestamp in descending order
         purchases.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        
+
         Ok(purchases)
     }
 }
@@ -157,28 +168,59 @@ pub fn print_dca_summary(summary: &DcaSummary) {
     info!("║            📊 DCA SUMMARY             ║");
     info!("╠═══════════════════════════════════════╣");
     info!("║ Total Purchases: {:>19} ║", summary.total_purchases);
-    info!("║ Total USDC Invested: ${:>13} ║", summary.total_usdc_invested.round_dp(2));
-    info!("║ Total ETH Acquired: {:>14} ║", summary.total_eth_acquired.round_dp(6));
-    info!("║ Total Fees Paid: ${:>16} ║", summary.total_fees_paid.round_dp(2));
-    info!("║ Average ETH Price: ${:>15} ║", summary.average_eth_price.round_dp(2));
+    info!(
+        "║ Total USDC Invested: ${:>13} ║",
+        summary.total_usdc_invested.round_dp(2)
+    );
+    info!(
+        "║ Total ETH Acquired: {:>14} ║",
+        summary.total_eth_acquired.round_dp(6)
+    );
+    info!(
+        "║ Total Fees Paid: ${:>16} ║",
+        summary.total_fees_paid.round_dp(2)
+    );
+    info!(
+        "║ Average ETH Price: ${:>15} ║",
+        summary.average_eth_price.round_dp(2)
+    );
     info!("╠═══════════════════════════════════════╣");
-    info!("║ Current ETH Value: ${:>15} ║", summary.current_eth_value.round_dp(2));
-    
-    let pnl_symbol = if summary.unrealized_pnl >= dec!(0) { "📈" } else { "📉" };
-    let pnl_sign = if summary.unrealized_pnl >= dec!(0) { "+" } else { "" };
-    
-    info!("║ Unrealized P&L: {}{:>17} ║", pnl_sign, format!("${}", summary.unrealized_pnl.round_dp(2)));
-    info!("║ P&L Percentage: {}{:>17} ║", pnl_sign, format!("{}%", summary.unrealized_pnl_percentage.round_dp(2)));
+    info!(
+        "║ Current ETH Value: ${:>15} ║",
+        summary.current_eth_value.round_dp(2)
+    );
+
+    let pnl_symbol = if summary.unrealized_pnl >= dec!(0) {
+        "📈"
+    } else {
+        "📉"
+    };
+    let pnl_sign = if summary.unrealized_pnl >= dec!(0) {
+        "+"
+    } else {
+        ""
+    };
+
+    info!(
+        "║ Unrealized P&L: {}{:>17} ║",
+        pnl_sign,
+        format!("${}", summary.unrealized_pnl.round_dp(2))
+    );
+    info!(
+        "║ P&L Percentage: {}{:>17} ║",
+        pnl_sign,
+        format!("{}%", summary.unrealized_pnl_percentage.round_dp(2))
+    );
     info!("║ Performance: {:>23} ║", pnl_symbol);
     info!("╠═══════════════════════════════════════╣");
-    
+
     if let Some(first) = summary.first_purchase {
         info!("║ First Purchase: {:>18} ║", first.format("%Y-%m-%d"));
     }
     if let Some(last) = summary.last_purchase {
         info!("║ Last Purchase: {:>19} ║", last.format("%Y-%m-%d"));
     }
-    
+
     info!("╚═══════════════════════════════════════╝");
 }
 
@@ -191,18 +233,21 @@ pub fn print_recent_purchases(purchases: &[DcaPurchase]) {
     info!("╔════════════════════════════════════════════════════════════════╗");
     info!("║                    📝 RECENT PURCHASES                         ║");
     info!("╠════════════════════════════════════════════════════════════════╣");
-    
+
     for (i, purchase) in purchases.iter().enumerate() {
         if i > 0 {
             info!("║                                                                ║");
         }
-        info!("║ Date: {:>55} ║", purchase.timestamp.format("%Y-%m-%d %H:%M:%S UTC"));
+        info!(
+            "║ Date: {:>55} ║",
+            purchase.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+        );
         info!("║ USDC Spent: ${:>47} ║", purchase.usdc_amount.round_dp(2));
         info!("║ ETH Acquired: {:>45} ║", purchase.eth_amount.round_dp(6));
         info!("║ ETH Price: ${:>48} ║", purchase.eth_price.round_dp(2));
         info!("║ Fees: ${:>53} ║", purchase.fees_usdc.round_dp(4));
         info!("║ Order ID: {:>49} ║", purchase.order_id);
     }
-    
+
     info!("╚════════════════════════════════════════════════════════════════╝");
 }

@@ -1,6 +1,6 @@
 use crate::config::TradingConfig;
-use crate::dca_stats::{DcaPurchase, print_dca_summary, print_recent_purchases};
-use crate::{binance::BinanceClient, dca_stats::DcaStatsDB};
+use crate::dca_stats_mongo::{DcaPurchase, print_dca_summary, print_recent_purchases};
+use crate::{binance::BinanceClient, dca_stats_mongo::DcaStatsDB};
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -16,7 +16,7 @@ pub struct DcaTrader {
 
 impl DcaTrader {
     pub async fn new(binance_client: BinanceClient, trading_config: TradingConfig) -> Result<Self> {
-        let stats_db = DcaStatsDB::new("sqlite:dca_history.db").await?;
+        let stats_db = DcaStatsDB::new().await?;
         Ok(Self {
             binance_client,
             trading_config,
