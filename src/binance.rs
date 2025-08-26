@@ -1,12 +1,12 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 
-use rust_decimal_macros::dec;
 use anyhow::{Ok, Result, anyhow};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use sha2::Sha256;
 use tracing::{error, info, warn};
 

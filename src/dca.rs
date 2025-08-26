@@ -1,5 +1,5 @@
 use crate::config::TradingConfig;
-use crate::dca_stats::{print_dca_summary, print_recent_purchases, DcaPurchase};
+use crate::dca_stats::{DcaPurchase, print_dca_summary, print_recent_purchases};
 use crate::{binance::BinanceClient, dca_stats::DcaStatsDB};
 use anyhow::{Result, anyhow};
 use chrono::Utc;
