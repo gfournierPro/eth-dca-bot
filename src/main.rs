@@ -2,6 +2,7 @@ mod binance;
 mod config;
 mod dca;
 mod dca_stats_mongo;
+mod notion_integration;
 
 use anyhow::Result;
 use config::Config;
