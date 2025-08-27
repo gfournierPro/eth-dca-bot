@@ -1,7 +1,8 @@
-use crate::config::{TradingConfig, NotionConfig};
+use crate::config::{TradingConfig, NotionConfig, WithdrawalConfig};
 use crate::dca_stats_mongo::{DcaPurchase, print_dca_summary, print_recent_purchases};
 use crate::notion_integration::NotionDCATracker;
 use crate::{binance::BinanceClient, dca_stats_mongo::DcaStatsDB};
+use crate::date_utils::should_check_withdrawal;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -12,6 +13,7 @@ use uuid::Uuid;
 pub struct DcaTrader {
     pub binance_client: BinanceClient,
     trading_config: TradingConfig,
+    withdrawal_config: WithdrawalConfig,
     pub stats_db: DcaStatsDB,
     notion_tracker: Option<NotionDCATracker>,
 }
@@ -20,6 +22,7 @@ impl DcaTrader {
     pub async fn new(
         binance_client: BinanceClient, 
         trading_config: TradingConfig,
+        withdrawal_config: WithdrawalConfig,
         notion_config: Option<&NotionConfig>
     ) -> Result<Self> {
         let stats_db = DcaStatsDB::new().await?;
@@ -48,6 +51,7 @@ impl DcaTrader {
         Ok(Self {
             binance_client,
             trading_config,
+            withdrawal_config,
             stats_db,
             notion_tracker,
         })
@@ -159,6 +163,14 @@ impl DcaTrader {
 
         self.show_dca_summary().await?;
 
+        // Check if we should perform a withdrawal after the purchase
+        if should_check_withdrawal() {
+            info!("🔍 Checking if withdrawal is needed after DCA purchase...");
+            if let Err(e) = self.check_and_execute_withdrawal().await {
+                warn!("Withdrawal check failed: {}", e);
+            }
+        }
+
         Ok(())
     }
     pub async fn show_dca_summary(&self) -> Result<()> {
@@ -192,5 +204,112 @@ impl DcaTrader {
         
         print_recent_purchases(&recent_purchases);
         Ok(())
+    }
+
+    pub async fn check_and_execute_withdrawal(&self) -> Result<()> {
+        if !self.withdrawal_config.enabled {
+            info!("Withdrawal is disabled in configuration");
+            return Ok(());
+        }
+
+        if !should_check_withdrawal() {
+            info!("Not the right time for withdrawal check");
+            return Ok(());
+        }
+
+        info!("🔍 Checking if withdrawal is needed (last Monday of month)...");
+        
+        // First check if withdrawals are available for ETH
+        match self.binance_client.check_withdrawal_capability("ETH").await {
+            Ok(can_withdraw) => {
+                if !can_withdraw {
+                    warn!("⚠️  ETH withdrawals are not enabled for your account");
+                    warn!("💡 Please check:");
+                    warn!("   • Account verification status");
+                    warn!("   • API key withdrawal permissions");
+                    warn!("   • Regional restrictions");
+                    warn!("   • Account security settings (2FA, etc.)");
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                warn!("Could not verify withdrawal capability: {}", e);
+                // Continue anyway, let the withdrawal attempt provide the specific error
+            }
+        }
+
+        // Also check the specific network
+        match self.binance_client.check_network_withdrawal_capability("ETH", &self.withdrawal_config.network).await {
+            Ok(network_available) => {
+                if !network_available {
+                    warn!("⚠️  Network '{}' is not available for ETH withdrawals", self.withdrawal_config.network);
+                    warn!("💡 Try these network names instead:");
+                    warn!("   • ARBITRUM (for Arbitrum One)");
+                    warn!("   • ETH (for Ethereum mainnet)");
+                    warn!("   • BSC (for Binance Smart Chain)");
+                    warn!("   • OPTIMISM (for Optimism)");
+                    return Ok(());
+                }
+                info!("Network '{}' is available for ETH withdrawals", self.withdrawal_config.network);
+            }
+            Err(e) => {
+                warn!("Could not verify network capability: {}", e);
+            }
+        }
+        
+        let eth_balance = self.binance_client.get_eth_balance().await?;
+        info!("Current ETH balance: {} ETH", eth_balance);
+
+        if eth_balance < self.withdrawal_config.min_eth_threshold {
+            info!(
+                "ETH balance {} is below minimum threshold {}. No withdrawal needed.",
+                eth_balance, self.withdrawal_config.min_eth_threshold
+            );
+            return Ok(());
+        }
+
+        let withdrawal_amount = self.withdrawal_config.withdrawal_amount
+            .unwrap_or(eth_balance);
+
+        if withdrawal_amount > eth_balance {
+            warn!(
+                "Requested withdrawal amount {} exceeds available balance {}. Using available balance.",
+                withdrawal_amount, eth_balance
+            );
+        }
+
+        let actual_withdrawal_amount = withdrawal_amount.min(eth_balance);
+
+        info!("💸 Initiating withdrawal of {} ETH to cold wallet", actual_withdrawal_amount);
+        
+        match self.binance_client.withdraw_eth(
+            &self.withdrawal_config.cold_wallet_address,
+            actual_withdrawal_amount,
+            &self.withdrawal_config.network,
+        ).await {
+            Ok(response) => {
+                info!("✅ Withdrawal initiated successfully!");
+                info!("Withdrawal ID: {}", response.id);
+                
+                // Log the withdrawal details
+                info!("╔═══════════════════════════════════════╗");
+                info!("║         💸 WITHDRAWAL DETAILS         ║");
+                info!("╠═══════════════════════════════════════╣");
+                info!("║ Amount: {:>27} ETH ║", actual_withdrawal_amount.round_dp(6));
+                info!("║ Network: {:>26} ║", self.withdrawal_config.network);
+                info!("║ Address: {:>26} ║", format!("{}...{}", 
+                    &self.withdrawal_config.cold_wallet_address[..6],
+                    &self.withdrawal_config.cold_wallet_address[self.withdrawal_config.cold_wallet_address.len()-4..]
+                ));
+                info!("║ Withdrawal ID: {:>21} ║", response.id);
+                info!("╚═══════════════════════════════════════╝");
+                
+                Ok(())
+            }
+            Err(e) => {
+                error!("❌ Failed to initiate withdrawal: {}", e);
+                Err(e)
+            }
+        }
     }
 }

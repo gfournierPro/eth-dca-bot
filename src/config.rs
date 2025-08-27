@@ -7,6 +7,7 @@ pub struct Config {
     pub trading: TradingConfig,
     pub schedule: ScheduleConfig,
     pub notion: NotionConfig,
+    pub withdrawal: WithdrawalConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -37,6 +38,15 @@ pub struct NotionConfig {
     pub cold_wallet_address: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WithdrawalConfig {
+    pub enabled: bool,
+    pub cold_wallet_address: String,
+    pub network: String,
+    pub min_eth_threshold: Decimal,
+    pub withdrawal_amount: Option<Decimal>, // None means withdraw all available ETH
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -59,6 +69,13 @@ impl Default for Config {
                 token: String::new(),
                 database_id: String::new(),
                 cold_wallet_address: "0xa416610975634033374EEdAE26D0FCa7A7360b70".to_string(),
+            },
+            withdrawal: WithdrawalConfig {
+                enabled: false,
+                cold_wallet_address: "0xa416610975634033374EEdAE26D0FCa7A7360b70".to_string(),
+                network: "ARBITRUM".to_string(), // Correct network name for Arbitrum One
+                min_eth_threshold: Decimal::new(3, 4), // 0.0003 ETH minimum
+                withdrawal_amount: None, // Withdraw all available ETH
             },
         }
     }

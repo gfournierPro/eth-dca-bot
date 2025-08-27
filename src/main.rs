@@ -3,6 +3,7 @@ mod config;
 mod dca;
 mod dca_stats_mongo;
 mod notion_integration;
+mod date_utils;
 
 use anyhow::Result;
 use config::Config;
@@ -31,6 +32,7 @@ async fn main() -> Result<()> {
     let dca_trader = DcaTrader::new(
         binance_client, 
         config.trading.clone(),
+        config.withdrawal.clone(),
         Some(&config.notion)
     ).await?;
 
@@ -40,7 +42,13 @@ async fn main() -> Result<()> {
             info!("Current USDC balance: {}", balance);
             dca_trader.show_dca_summary().await.unwrap_or_else(|e| {
                 error!("Failed to load DCA summary: {}", e);
-            })
+            });
+
+            // Check for withdrawal on startup if we're in the right time period
+            info!("🔍 Checking if withdrawal is needed at startup...");
+            dca_trader.check_and_execute_withdrawal().await.unwrap_or_else(|e| {
+                error!("Startup withdrawal check failed: {}", e);
+            });
         }
         Err(e) => {
             error!("Failed to connect to Binance API: {}", e);
@@ -111,7 +119,25 @@ fn load_config() -> Result<Config> {
         config.notion.database_id = database_id;
     }
     if let Ok(cold_wallet) = env::var("COLD_WALLET_ADDRESS") {
-        config.notion.cold_wallet_address = cold_wallet;
+        config.notion.cold_wallet_address = cold_wallet.clone();
+        config.withdrawal.cold_wallet_address = cold_wallet; // Also set for withdrawal
+    }
+
+    // Load Withdrawal configuration
+    if let Ok(enabled) = env::var("WITHDRAWAL_ENABLED") {
+        config.withdrawal.enabled = enabled.parse().unwrap_or(false);
+    }
+    if let Ok(wallet) = env::var("WITHDRAWAL_WALLET_ADDRESS") {
+        config.withdrawal.cold_wallet_address = wallet;
+    }
+    if let Ok(network) = env::var("WITHDRAWAL_NETWORK") {
+        config.withdrawal.network = network;
+    }
+    if let Ok(threshold) = env::var("WITHDRAWAL_MIN_ETH_THRESHOLD") {
+        config.withdrawal.min_eth_threshold = threshold.parse()?;
+    }
+    if let Ok(amount) = env::var("WITHDRAWAL_AMOUNT") {
+        config.withdrawal.withdrawal_amount = Some(amount.parse()?);
     }
 
     Ok(config)
@@ -134,6 +160,27 @@ fn validate_config(config: &Config) -> Result<()> {
     }
     if !config.notion.database_id.is_empty() && config.notion.token.is_empty() {
         return Err(anyhow::anyhow!("NOTION_TOKEN is required when NOTION_DATABASE_ID is provided"));
+    }
+    
+    // Validate Withdrawal configuration if enabled
+    if config.withdrawal.enabled {
+        if config.withdrawal.cold_wallet_address.is_empty() {
+            return Err(anyhow::anyhow!("WITHDRAWAL_WALLET_ADDRESS is required when withdrawal is enabled"));
+        }
+        if config.withdrawal.network.is_empty() {
+            return Err(anyhow::anyhow!("WITHDRAWAL_NETWORK is required when withdrawal is enabled"));
+        }
+        if config.withdrawal.min_eth_threshold < rust_decimal::Decimal::ZERO {
+            return Err(anyhow::anyhow!("WITHDRAWAL_MIN_ETH_THRESHOLD must be positive"));
+        }
+        if let Some(amount) = config.withdrawal.withdrawal_amount {
+            if amount <= rust_decimal::Decimal::ZERO {
+                return Err(anyhow::anyhow!("WITHDRAWAL_AMOUNT must be positive if specified"));
+            }
+        }
+        info!("Withdrawal configuration validated - enabled for {} network", config.withdrawal.network);
+    } else {
+        info!("Withdrawal is disabled");
     }
     
     info!("Configuration validated successfully");

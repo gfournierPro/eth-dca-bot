@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fs;
 
 use anyhow::{Ok, Result, anyhow};
 use chrono::{Utc, Datelike, TimeZone};
@@ -86,6 +87,30 @@ pub struct Order {
     pub update_time: i64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WithdrawResponse {
+    pub id: String,
+    #[serde(rename = "withdrawOrderId")]
+    pub withdraw_order_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WithdrawHistory {
+    #[serde(rename = "withdrawOrderId")]
+    pub withdraw_order_id: String,
+    pub amount: String,
+    #[serde(rename = "transactionFee")]
+    pub transaction_fee: String,
+    pub address: String,
+    pub asset: String,
+    #[serde(rename = "txId")]
+    pub tx_id: String,
+    #[serde(rename = "applyTime")]
+    pub apply_time: i64,
+    pub status: i32,
+    pub network: String,
+}
+
 impl BinanceClient {
     pub fn new(api_key: String, secret_key: String, base_url: String) -> Self {
         Self {
@@ -168,6 +193,20 @@ impl BinanceClient {
             }
         }
         warn!("USDC balance not found, returning 0");
+        Ok(Decimal::ZERO)
+    }
+
+    pub async fn get_eth_balance(&self) -> Result<Decimal> {
+        let account_info = self.get_account_info().await?;
+
+        for balance in account_info.balances {
+            if balance.asset == "ETH" {
+                let free_balance = balance.free.parse::<Decimal>()?;
+                info!("ETH balance: {}", free_balance);
+                return Ok(free_balance);
+            }
+        }
+        warn!("ETH balance not found, returning 0");
         Ok(Decimal::ZERO)
     }
 
@@ -284,6 +323,198 @@ impl BinanceClient {
         
         info!("Found {} DCA purchases from current month on Binance", purchases.len());
         Ok(purchases)
+    }
+
+    pub async fn withdraw_eth(
+        &self,
+        address: &str,
+        amount: Decimal,
+        network: &str,
+    ) -> Result<WithdrawResponse> {
+        let mut params = HashMap::new();
+        params.insert("coin".to_string(), "ETH".to_string());
+        params.insert("address".to_string(), address.to_string());
+        params.insert("amount".to_string(), amount.to_string());
+        params.insert("network".to_string(), network.to_string());
+
+        info!(
+            "Initiating ETH withdrawal: {} ETH to {} on {} network",
+            amount, address, network
+        );
+
+        let result = self.signed_request::<WithdrawResponse>("POST", "/sapi/v1/capital/withdraw/apply", params).await;
+        
+        match result {
+            std::result::Result::Ok(response) => {
+                info!(
+                    "Withdrawal initiated successfully. ID: {}",
+                    response.id
+                );
+                Ok(response)
+            }
+            std::result::Result::Err(e) => {
+                let error_msg = format!("{}", e);
+                if error_msg.contains("-4019") {
+                    error!("❌ ETH withdrawal not available. Possible reasons:");
+                    error!("   • Withdrawals disabled for your account/region");
+                    error!("   • API key lacks withdrawal permissions");
+                    error!("   • Account verification incomplete");
+                    error!("   • Security restrictions (2FA, email confirmation)");
+                    error!("   • Network '{}' not supported for ETH", network);
+                    error!("💡 Check your Binance account settings and API permissions");
+                } else if error_msg.contains("-1013") {
+                    error!("❌ Invalid withdrawal amount or network configuration");
+                } else if error_msg.contains("-4008") {
+                    error!("❌ Withdrawal address not whitelisted");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn get_withdraw_history(
+        &self,
+        coin: &str,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+        limit: Option<u16>,
+    ) -> Result<Vec<WithdrawHistory>> {
+        let mut params = HashMap::new();
+        params.insert("coin".to_string(), coin.to_string());
+        
+        if let Some(start) = start_time {
+            params.insert("startTime".to_string(), start.to_string());
+        }
+        
+        if let Some(end) = end_time {
+            params.insert("endTime".to_string(), end.to_string());
+        }
+        
+        if let Some(lim) = limit {
+            params.insert("limit".to_string(), lim.to_string());
+        }
+
+        info!("Fetching withdrawal history for {}", coin);
+        let withdrawals: Vec<WithdrawHistory> = self
+            .signed_request("GET", "/sapi/v1/capital/withdraw/history", params)
+            .await?;
+        
+        info!("Retrieved {} withdrawal records", withdrawals.len());
+        Ok(withdrawals)
+    }
+
+    pub async fn check_withdrawal_capability(&self, coin: &str) -> Result<bool> {
+        info!("Checking withdrawal capability for {}", coin);
+        
+        let params = HashMap::new();
+        
+        match self.signed_request::<serde_json::Value>("GET", "/sapi/v1/capital/config/getall", params).await {
+            std::result::Result::Ok(response) => {
+                // Parse the response to check if the coin supports withdrawals
+                if let Some(coins) = response.as_array() {
+                    for (index, coin_info) in coins.iter().enumerate() {
+                        if let Some(coin_name) = coin_info.get("coin").and_then(|c| c.as_str()) {
+                            if coin_name == coin {
+                                
+                                // Check the overall withdrawal capability first
+                                if let Some(withdraw_all_enable) = coin_info.get("withdrawAllEnable").and_then(|w| w.as_bool()) {
+                                    if !withdraw_all_enable {
+                                        info!("Withdrawal disabled for {} at coin level", coin);
+                                        return Ok(false);
+                                    }
+                                } else {
+                                    warn!("withdrawAllEnable field not found for {}", coin);
+                                }
+                                
+                                // Check if there are network-specific settings
+                                if let Some(network_list) = coin_info.get("networkList").and_then(|n| n.as_array()) {
+                                    // Log all available networks
+                                    let mut networks = Vec::new();
+                                    for network in network_list {
+                                        if let Some(network_name) = network.get("network").and_then(|n| n.as_str()) {
+                                            if let Some(withdraw_enable) = network.get("withdrawEnable").and_then(|w| w.as_bool()) {
+                                                networks.push(format!("{}: {}", network_name, if withdraw_enable { "✅" } else { "❌" }));
+                                            }
+                                        }
+                                    }
+                                    return Ok(true);
+                                } else {
+                                    // Fallback to the old logic if no networkList
+                                    if let Some(withdraw_enable) = coin_info.get("withdrawEnable").and_then(|w| w.as_bool()) {
+                                        info!("Withdrawal enabled for {}: {}", coin, withdraw_enable);
+                                        return Ok(withdraw_enable);
+                                    } else {
+                                        warn!("No networkList and no withdrawEnable field found for {}", coin);
+                                        return Ok(false);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // If we didn't find the coin, let's list all available coins
+                    info!("🔍 Coin '{}' not found", coin);
+                } else {
+                    warn!("Response is not an array");
+                    info!("Response type: {:?}", response);
+                }
+                
+                warn!("Could not determine withdrawal capability for {}", coin);
+                Ok(false)
+            }
+            std::result::Result::Err(e) => {
+                warn!("Failed to check withdrawal capability: {}", e);
+                // Return false but don't fail completely
+                Ok(false)
+            }
+        }
+    }
+
+    pub async fn check_network_withdrawal_capability(&self, coin: &str, network: &str) -> Result<bool> {
+        let params = HashMap::new();
+        
+        match self.signed_request::<serde_json::Value>("GET", "/sapi/v1/capital/config/getall", params).await {
+            std::result::Result::Ok(response) => {
+                if let Some(coins) = response.as_array() {
+                    for coin_info in coins {
+                        if let Some(coin_name) = coin_info.get("coin").and_then(|c| c.as_str()) {
+                            if coin_name == coin {
+                                // Check network-specific withdrawal capability
+                                if let Some(network_list) = coin_info.get("networkList").and_then(|n| n.as_array()) {
+                                    for network_info in network_list {
+                                        if let Some(network_name) = network_info.get("network").and_then(|n| n.as_str()) {
+                                            if network_name == network {
+                                                if let Some(withdraw_enable) = network_info.get("withdrawEnable").and_then(|w| w.as_bool()) {
+                                                    info!("Network {} withdrawal for {}: {}", network, coin, withdraw_enable);
+                                                    
+                                                    // Also log withdrawal limits and fees
+                                                    if let Some(withdraw_min) = network_info.get("withdrawMin").and_then(|w| w.as_str()) {
+                                                        info!("Minimum withdrawal: {} {}", withdraw_min, coin);
+                                                    }
+                                                    if let Some(withdraw_fee) = network_info.get("withdrawFee").and_then(|w| w.as_str()) {
+                                                        info!("Withdrawal fee: {} {}", withdraw_fee, coin);
+                                                    }
+                                                    
+                                                    return Ok(withdraw_enable);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                warn!("Network {} not found for {}", network, coin);
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+                warn!("Coin {} not found", coin);
+                Ok(false)
+            }
+            std::result::Result::Err(e) => {
+                warn!("Failed to check network withdrawal capability: {}", e);
+                Ok(false)
+            }
+        }
     }
 }
 
