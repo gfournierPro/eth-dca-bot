@@ -2,13 +2,15 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 use anyhow::{Ok, Result, anyhow};
-use chrono::Utc;
+use chrono::{Utc, Datelike, TimeZone};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use sha2::Sha256;
 use tracing::{error, info, warn};
+use crate::dca_stats_mongo::DcaPurchase;
+use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -61,6 +63,27 @@ pub struct Fill {
 pub struct TickerPrice {
     pub symbol: String,
     pub price: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Order {
+    pub symbol: String,
+    #[serde(rename = "orderId")]
+    pub order_id: u64,
+    pub side: String,
+    #[serde(rename = "type")]
+    pub order_type: String,
+    pub status: String,
+    #[serde(rename = "origQty")]
+    pub orig_qty: String,
+    #[serde(rename = "executedQty")]
+    pub executed_qty: String,
+    #[serde(rename = "cummulativeQuoteQty")]
+    pub cummulative_quote_qty: String,
+    pub price: String,
+    pub time: i64,
+    #[serde(rename = "updateTime")]
+    pub update_time: i64,
 }
 
 impl BinanceClient {
@@ -177,6 +200,90 @@ impl BinanceClient {
             order_response.order_id, order_response.status
         );
         Ok(order_response)
+    }
+
+    pub async fn get_order_history(
+        &self,
+        symbol: &str,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+        limit: Option<u16>,
+    ) -> Result<Vec<Order>> {
+        let mut params = HashMap::new();
+        params.insert("symbol".to_string(), symbol.to_string());
+        
+        if let Some(start) = start_time {
+            params.insert("startTime".to_string(), start.to_string());
+        }
+        
+        if let Some(end) = end_time {
+            params.insert("endTime".to_string(), end.to_string());
+        }
+        
+        if let Some(lim) = limit {
+            params.insert("limit".to_string(), lim.to_string());
+        }
+
+        info!("Fetching order history for symbol: {}", symbol);
+        let orders: Vec<Order> = self
+            .signed_request("GET", "/api/v3/allOrders", params)
+            .await?;
+        
+        info!("Retrieved {} orders from Binance", orders.len());
+        Ok(orders)
+    }
+
+    pub async fn get_current_month_purchases(&self, symbol: &str) -> Result<Vec<DcaPurchase>> {
+        let now = Utc::now();
+        let start_of_month = Utc
+            .with_ymd_and_hms(now.year() as i32, now.month(), 1, 0, 0, 0)
+            .unwrap();
+        let start_timestamp = start_of_month.timestamp_millis();
+        
+        let orders = self.get_order_history(
+            symbol,
+            Some(start_timestamp),
+            None,
+            Some(1000), // Limit to 1000 orders
+        ).await?;
+
+        let mut purchases = Vec::new();
+        
+        for order in orders {
+            // Only process filled buy orders
+            if order.status == "FILLED" && order.side == "BUY" {
+                let executed_qty: Decimal = order.executed_qty.parse().unwrap_or(dec!(0));
+                let executed_value: Decimal = order.cummulative_quote_qty.parse().unwrap_or(dec!(0));
+                
+                if executed_qty > dec!(0) && executed_value > dec!(0) {
+                    let average_price = executed_value / executed_qty;
+                    let timestamp = Utc.timestamp_millis_opt(order.time).unwrap();
+                    
+                    // Estimate fees as 0.1% of trade value since we don't have fill details
+                    let estimated_fees = executed_value * dec!(0.001);
+                    
+                    let purchase = DcaPurchase {
+                        id: Uuid::new_v4().to_string(),
+                        timestamp,
+                        symbol: order.symbol.clone(),
+                        usdc_amount: executed_value,
+                        eth_amount: executed_qty,
+                        eth_price: average_price,
+                        fees_usdc: estimated_fees,
+                        order_id: order.order_id,
+                        status: order.status.clone(),
+                    };
+                    
+                    purchases.push(purchase);
+                }
+            }
+        }
+        
+        // Sort by timestamp in descending order (most recent first)
+        purchases.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        
+        info!("Found {} DCA purchases from current month on Binance", purchases.len());
+        Ok(purchases)
     }
 }
 

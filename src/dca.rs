@@ -169,7 +169,27 @@ impl DcaTrader {
         let summary = self.stats_db.get_summary(current_price).await?;
         print_dca_summary(&summary);
 
-        let recent_purchases = self.stats_db.get_recent_purchases(5).await?;
+        let mut recent_purchases = self.stats_db.get_recent_purchases(5).await?;
+        
+        // If no recent purchases found in database, try to fetch from Binance
+        if recent_purchases.is_empty() {
+            info!("📝 No recent purchases found in database, fetching from Binance...");
+            match self.binance_client.get_current_month_purchases(&self.trading_config.symbol).await {
+                Ok(binance_purchases) => {
+                    if !binance_purchases.is_empty() {
+                        info!("✅ Found {} purchases from current month on Binance", binance_purchases.len());
+                        // Take only the 5 most recent ones
+                        recent_purchases = binance_purchases.into_iter().take(5).collect();
+                    } else {
+                        info!("📝 No purchases found for current month on Binance either");
+                    }
+                }
+                Err(e) => {
+                    warn!("⚠️  Failed to fetch purchases from Binance: {}", e);
+                }
+            }
+        }
+        
         print_recent_purchases(&recent_purchases);
         Ok(())
     }
