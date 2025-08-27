@@ -6,6 +6,7 @@ pub struct Config {
     pub binance: BinanceConfig,
     pub trading: TradingConfig,
     pub schedule: ScheduleConfig,
+    pub notion: NotionConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -29,6 +30,13 @@ pub struct ScheduleConfig {
     pub timezone: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NotionConfig {
+    pub token: String,
+    pub database_id: String,
+    pub cold_wallet_address: String,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -46,6 +54,11 @@ impl Default for Config {
             schedule: ScheduleConfig {
                 cron_expression: "0 30 7 * * MON".to_string(),
                 timezone: "UTC".to_string(),
+            },
+            notion: NotionConfig {
+                token: String::new(),
+                database_id: String::new(),
+                cold_wallet_address: "0xa416610975634033374EEdAE26D0FCa7A7360b70".to_string(),
             },
         }
     }

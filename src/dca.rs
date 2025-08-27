@@ -1,4 +1,4 @@
-use crate::config::TradingConfig;
+use crate::config::{TradingConfig, NotionConfig};
 use crate::dca_stats_mongo::{DcaPurchase, print_dca_summary, print_recent_purchases};
 use crate::notion_integration::NotionDCATracker;
 use crate::{binance::BinanceClient, dca_stats_mongo::DcaStatsDB};
@@ -17,18 +17,32 @@ pub struct DcaTrader {
 }
 
 impl DcaTrader {
-    pub async fn new(binance_client: BinanceClient, trading_config: TradingConfig) -> Result<Self> {
+    pub async fn new(
+        binance_client: BinanceClient, 
+        trading_config: TradingConfig,
+        notion_config: Option<&NotionConfig>
+    ) -> Result<Self> {
         let stats_db = DcaStatsDB::new().await?;
 
-        let notion_tracker = match NotionDCATracker::new() {
-            Ok(tracker) => {
-                info!("Notion integration enabled");
-                Some(tracker)
-            }
-            Err(e) => {
-                warn!("Notion integration disabled: {}", e);
+        let notion_tracker = if let Some(config) = notion_config {
+            if !config.token.is_empty() && !config.database_id.is_empty() {
+                match NotionDCATracker::new(config) {
+                    Ok(tracker) => {
+                        info!("Notion integration enabled");
+                        Some(tracker)
+                    }
+                    Err(e) => {
+                        warn!("Notion integration disabled: {}", e);
+                        None
+                    }
+                }
+            } else {
+                info!("Notion integration disabled: configuration incomplete");
                 None
             }
+        } else {
+            info!("Notion integration disabled: no configuration provided");
+            None
         };
 
         Ok(Self {

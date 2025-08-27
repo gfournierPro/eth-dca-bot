@@ -28,7 +28,11 @@ async fn main() -> Result<()> {
         config.binance.base_url.clone(),
     );
 
-    let dca_trader = DcaTrader::new(binance_client, config.trading.clone()).await?;
+    let dca_trader = DcaTrader::new(
+        binance_client, 
+        config.trading.clone(),
+        Some(&config.notion)
+    ).await?;
 
     info!("Testing Binance API connection...");
     match dca_trader.binance_client.get_usdc_balanc().await {
@@ -99,6 +103,17 @@ fn load_config() -> Result<Config> {
         config.schedule.cron_expression = cron;
     }
 
+    // Load Notion configuration
+    if let Ok(token) = env::var("NOTION_TOKEN") {
+        config.notion.token = token;
+    }
+    if let Ok(database_id) = env::var("NOTION_DATABASE_ID") {
+        config.notion.database_id = database_id;
+    }
+    if let Ok(cold_wallet) = env::var("COLD_WALLET_ADDRESS") {
+        config.notion.cold_wallet_address = cold_wallet;
+    }
+
     Ok(config)
 }
 
@@ -112,6 +127,15 @@ fn validate_config(config: &Config) -> Result<()> {
     if config.trading.min_balance_usdc < rust_decimal::Decimal::ZERO {
         return Err(anyhow::anyhow!("Invalid MIN_BALANCE_USDC"));
     }
+    
+    // Validate Notion configuration if provided
+    if !config.notion.token.is_empty() && config.notion.database_id.is_empty() {
+        return Err(anyhow::anyhow!("NOTION_DATABASE_ID is required when NOTION_TOKEN is provided"));
+    }
+    if !config.notion.database_id.is_empty() && config.notion.token.is_empty() {
+        return Err(anyhow::anyhow!("NOTION_TOKEN is required when NOTION_DATABASE_ID is provided"));
+    }
+    
     info!("Configuration validated successfully");
     Ok(())
 }
