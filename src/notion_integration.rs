@@ -65,7 +65,7 @@ impl NotionDCATracker {
         purchase: &DcaPurchase,
         eur_amount: Decimal,
     ) -> Result<()> {
-        let month_name = self.get_month_name(&purchase.timestamp);
+        let month_name = self.get_month_name(&purchase.timestamp).await?;
         info!("Recording DCA purchase to Notion page: {}", month_name);
 
         let page_id = self
@@ -81,9 +81,68 @@ impl NotionDCATracker {
         Ok(())
     }
 
-    pub fn get_month_name(&self, date: &DateTime<Utc>) -> String {
-        let month_number = date.month0();
-        format!("M{}", month_number)
+    pub async fn get_month_name(&self, date: &DateTime<Utc>) -> Result<String> {
+        // First, check if a page already exists for this month/year
+        let year_month = format!("{}-{:02}", date.year(), date.month());
+        
+        // Get all existing pages to find the highest month number
+        let request = QueryDatabaseRequestBuilder::default();
+        let response = self
+            .client
+            .databases
+            .query_a_database(&self.database_id, request.build().unwrap())
+            .await
+            .map_err(|e| anyhow!("Failed to query Notion database: {}", e))?;
+
+        let mut highest_month_num = 0;
+        let mut existing_month_for_date = None;
+
+        // Look through all pages to find the highest M number and check for existing month
+        for page in response.results {
+            if let Some(title_property) = page.properties.get("Name") {
+                if let PageProperty::Title { title, .. } = title_property {
+                    if let Some(first_text) = title.first() {
+                        if let RichText::Text { text, .. } = first_text {
+                            let title_content = &text.content;
+                            
+                            // Extract month number from titles like "M22", "M1", etc.
+                            if title_content.starts_with('M') {
+                                if let Ok(month_num) = title_content[1..].parse::<u32>() {
+                                    highest_month_num = highest_month_num.max(month_num);
+                                }
+                            }
+                            
+                            // Check if this page is for the same month/year by looking at the When property
+                            if let Some(when_property) = page.properties.get("When") {
+                                if let PageProperty::Date { date: Some(date_prop), .. } = when_property {
+                                    if let Some(DateOrDateTime::Date(page_date)) = &date_prop.start {
+                                        let page_year_month = format!("{}-{:02}", page_date.year(), page_date.month());
+                                        if page_year_month == year_month {
+                                            existing_month_for_date = Some(title_content.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If we found an existing page for this month/year, return its name
+        if let Some(existing_name) = existing_month_for_date {
+            info!("Found existing month name for {}: {}", year_month, existing_name);
+            return Ok(existing_name);
+        }
+
+        // Otherwise, create new month name by incrementing the highest number
+        let new_month_num = highest_month_num + 1;
+        let new_month_name = format!("M{}", new_month_num);
+        
+        info!("Creating new month name for {}: {} (highest was M{})", 
+              year_month, new_month_name, highest_month_num);
+        
+        Ok(new_month_name)
     }
 
     async fn get_or_create_monthtly_page(
