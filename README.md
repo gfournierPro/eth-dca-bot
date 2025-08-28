@@ -4,7 +4,7 @@ A sophisticated Ethereum Dollar-Cost Averaging (DCA) bot built in Rust that auto
 
 ## 🌟 Features
 
-- **Automated DCA Trading**: Schedule regular ETH purchases using USDC on Binance
+- **Automated DCA Trading**: Schedule regular ETH purchases using EUR amounts (automatically converted to USDC) on Binance
 - **Smart Withdrawal System**: Automatically withdraw ETH to cold storage when thresholds are met
 - **MongoDB Integration**: Track all purchases, statistics, and performance metrics
 - **Notion Integration**: Optional integration with Notion for portfolio tracking and management
@@ -53,9 +53,9 @@ BINANCE_API_KEY=your_binance_api_key
 BINANCE_SECRET_KEY=your_binance_secret_key
 
 # Trading Configuration
-DCA_AMOUNT_USDC=50.0
-MIN_BALANCE_USDC=10.0
-SCHEDULE_CRON=0 0 12 * * * *  # Daily at noon
+DCA_AMOUNT_EUR=50.0              # Amount in EUR to purchase ETH with (converted to USDC)
+MIN_BALANCE_USDC=10.0            # Minimum USDC balance to maintain (safety buffer)
+SCHEDULE_CRON=0 0 12 * * * *     # Daily at noon
 
 # Withdrawal Configuration
 WITHDRAWAL_ENABLED=true
@@ -87,7 +87,7 @@ cargo run
 
 ### Trading Parameters
 
-- `DCA_AMOUNT_USDC`: Amount in USDC to purchase ETH with each DCA execution
+- `DCA_AMOUNT_EUR`: Amount in EUR to purchase ETH with each DCA execution (automatically converted to USDC)
 - `MIN_BALANCE_USDC`: Minimum USDC balance to maintain (safety buffer)
 - `SCHEDULE_CRON`: Cron expression for DCA scheduling
 

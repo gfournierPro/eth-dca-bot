@@ -60,6 +60,13 @@ impl DcaTrader {
     pub async fn execute_dca_purchase(&self) -> Result<()> {
         info!("Starting DCA purchase execution");
 
+        // First, get EUR/USDC exchange rate to convert our EUR amount to USDC
+        let eur_usdc_price = self.binance_client.get_symbol_price("EURUSDC").await?;
+        let target_usdc_amount = self.trading_config.buy_amount_eur * eur_usdc_price;
+        
+        info!("EUR/USDC rate: {} - Converting {} EUR to {} USDC", 
+              eur_usdc_price, self.trading_config.buy_amount_eur, target_usdc_amount);
+
         let usdc_balance = self.binance_client.get_usdc_balanc().await?;
         if usdc_balance < self.trading_config.min_balance_usdc {
             let error_msg = format!(
@@ -71,12 +78,12 @@ impl DcaTrader {
         }
 
         let available_balance = usdc_balance - self.trading_config.min_balance_usdc;
-        let purchase_amount = if available_balance >= self.trading_config.buy_amount_usdc {
-            self.trading_config.buy_amount_usdc
+        let purchase_amount = if available_balance >= target_usdc_amount {
+            target_usdc_amount
         } else {
             warn!(
-                "Requested amount {} exceeds available balance {}. Using available balance.",
-                self.trading_config.buy_amount_usdc, available_balance
+                "Requested amount {} USDC (from {} EUR) exceeds available balance {}. Using available balance.",
+                target_usdc_amount, self.trading_config.buy_amount_eur, available_balance
             );
             available_balance
         };
@@ -136,6 +143,10 @@ impl DcaTrader {
             }
         }
 
+        // Calculate EUR amount spent for display purposes
+        let eur_usd_price = self.binance_client.get_symbol_price("EURUSDC").await?;
+        let actual_eur_spent = executed_value / eur_usd_price;
+
         // Print purchase details
         info!("✅ DCA purchase completed successfully!");
         info!("╔═══════════════════════════════════════╗");
@@ -143,10 +154,13 @@ impl DcaTrader {
         info!("╠═══════════════════════════════════════╣");
         info!("║ Order ID: {:>25} ║", order_result.order_id);
         info!("║ Status: {:>27} ║", order_result.status);
+        info!("║ EUR Spent: €{:>23} ║", actual_eur_spent.round_dp(2));
         info!("║ USDC Spent: ${:>22} ║", executed_value.round_dp(2));
         info!("║ ETH Acquired: {:>21} ║", executed_qty.round_dp(6));
         info!("║ ETH Price: ${:>23} ║", average_price.round_dp(2));
         info!("║ Fees Paid: ${:>23} ║", fees_usdc.round_dp(4));
+        info!("║ EUR/USDC Rate: {:>20} ║", eur_usd_price.round_dp(4));
+        info!("╚═══════════════════════════════════════╝");
 
         if current_price > Decimal::ZERO {
             let slippage = ((average_price - current_price) / current_price).abs();

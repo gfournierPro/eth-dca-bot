@@ -101,8 +101,8 @@ fn load_config() -> Result<Config> {
     config.binance.api_key = api_key;
     config.binance.secret_key = secret_key;
 
-    if let Ok(amount) = env::var("DCA_AMOUNT_USDC") {
-        config.trading.buy_amount_usdc = amount.parse()?;
+    if let Ok(amount) = env::var("DCA_AMOUNT_EUR") {
+        config.trading.buy_amount_eur = amount.parse()?;
     }
     if let Ok(min_balance) = env::var("MIN_BALANCE_USDC") {
         config.trading.min_balance_usdc = min_balance.parse()?;
@@ -147,8 +147,8 @@ fn validate_config(config: &Config) -> Result<()> {
     if config.binance.api_key.is_empty() || config.binance.secret_key.is_empty() {
         return Err(anyhow::anyhow!("Invalid Binance API credentials"));
     }
-    if config.trading.buy_amount_usdc <= rust_decimal::Decimal::ZERO {
-        return Err(anyhow::anyhow!("Invalid DCA_AMOUNT_USDC"));
+    if config.trading.buy_amount_eur <= rust_decimal::Decimal::ZERO {
+        return Err(anyhow::anyhow!("Invalid DCA_AMOUNT_EUR"));
     }
     if config.trading.min_balance_usdc < rust_decimal::Decimal::ZERO {
         return Err(anyhow::anyhow!("Invalid MIN_BALANCE_USDC"));

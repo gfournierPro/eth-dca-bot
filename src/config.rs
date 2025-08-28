@@ -20,7 +20,7 @@ pub struct BinanceConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TradingConfig {
     pub symbol: String,
-    pub buy_amount_usdc: Decimal,
+    pub buy_amount_eur: Decimal,
     pub min_balance_usdc: Decimal,
     pub max_slippage: Decimal,
 }
@@ -57,7 +57,7 @@ impl Default for Config {
             },
             trading: TradingConfig {
                 symbol: "ETHUSDC".to_string(),
-                buy_amount_usdc: Decimal::new(100, 0), // Default to $100
+                buy_amount_eur: Decimal::new(100, 0), // Default to €100
                 min_balance_usdc: Decimal::new(50, 0), // Default to $50
                 max_slippage: Decimal::new(1, 2),      // Default to 1%
             },
