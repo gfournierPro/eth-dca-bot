@@ -33,7 +33,8 @@ async fn main() -> Result<()> {
         binance_client, 
         config.trading.clone(),
         config.withdrawal.clone(),
-        Some(&config.notion)
+        Some(&config.notion),
+        config.schedule.timezone.clone()
     ).await?;
 
     info!("Testing Binance API connection...");
@@ -58,29 +59,57 @@ async fn main() -> Result<()> {
 
     let sched = JobScheduler::new().await?;
 
-    let job = Job::new_async(
-        config.schedule.cron_expression.as_str(),
-        move |_uuid, _l| {
-            let trader = dca_trader.clone();
-            Box::pin(async move {
-                info!("Executing scheduled DCA purchase");
-                match trader.execute_dca_purchase().await {
-                    Ok(()) => {
-                        info!("Scheduled DCA purchase completed successfully");
+    // Create timezone-aware job
+    let timezone_str = config.schedule.timezone.clone();
+    let job = if timezone_str == "UTC" || timezone_str.is_empty() {
+        Job::new_async(
+            config.schedule.cron_expression.as_str(),
+            move |_uuid, _l| {
+                let trader = dca_trader.clone();
+                Box::pin(async move {
+                    info!("Executing scheduled DCA purchase");
+                    match trader.execute_dca_purchase().await {
+                        Ok(()) => {
+                            info!("Scheduled DCA purchase completed successfully");
+                        }
+                        Err(e) => {
+                            error!("Scheduled DCA purchase failed: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        error!("Scheduled DCA purchase failed: {}", e);
+                })
+            },
+        )?
+    } else {
+        // Use timezone-aware job
+        use chrono_tz::Tz;
+        use std::str::FromStr;
+        let tz = Tz::from_str(&timezone_str).unwrap_or(chrono_tz::Europe::Berlin);
+        Job::new_async_tz(
+            config.schedule.cron_expression.as_str(),
+            tz,
+            move |_uuid, _l| {
+                let trader = dca_trader.clone();
+                Box::pin(async move {
+                    info!("Executing scheduled DCA purchase");
+                    match trader.execute_dca_purchase().await {
+                        Ok(()) => {
+                            info!("Scheduled DCA purchase completed successfully");
+                        }
+                        Err(e) => {
+                            error!("Scheduled DCA purchase failed: {}", e);
+                        }
                     }
-                }
-            })
-        },
-    )?;
+                })
+            },
+        )?
+    };
 
     sched.add(job).await?;
     sched.start().await?;
     info!(
-        "DCA Bot is running. Scheduled for: {}",
-        config.schedule.cron_expression
+        "DCA Bot is running. Scheduled for: {} (timezone: {})",
+        config.schedule.cron_expression,
+        config.schedule.timezone
     );
     info!("Press Ctrl+C to stop the bot");
 
@@ -109,6 +138,9 @@ fn load_config() -> Result<Config> {
     }
     if let Ok(cron) = env::var("SCHEDULE_CRON") {
         config.schedule.cron_expression = cron;
+    }
+    if let Ok(timezone) = env::var("TIMEZONE") {
+        config.schedule.timezone = timezone;
     }
 
     // Load Notion configuration

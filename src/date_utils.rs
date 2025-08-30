@@ -1,4 +1,23 @@
-use chrono::{Datelike, Duration, NaiveDate, Utc, Weekday};
+use chrono::{Datelike, Duration, NaiveDate, Utc, Weekday, TimeZone};
+use chrono_tz::{Tz, Europe::Berlin};
+use std::str::FromStr;
+
+/// Get the timezone from string, defaulting to UTC+2 (Europe/Berlin)
+pub fn get_timezone(timezone_str: &str) -> Tz {
+    if timezone_str.is_empty() || timezone_str == "UTC" {
+        Berlin // UTC+2 is Europe/Berlin timezone
+    } else {
+        Tz::from_str(timezone_str).unwrap_or(Berlin)
+    }
+}
+
+/// Get current date in the specified timezone
+pub fn now_in_timezone(timezone_str: &str) -> NaiveDate {
+    let tz = get_timezone(timezone_str);
+    let utc_now = Utc::now();
+    let local_time = tz.from_utc_datetime(&utc_now.naive_utc());
+    local_time.date_naive()
+}
 
 /// Check if the given date is the last Monday of its month
 pub fn is_last_monday_of_month(date: NaiveDate) -> bool {
@@ -14,15 +33,15 @@ pub fn is_last_monday_of_month(date: NaiveDate) -> bool {
 }
 
 /// Check if today is the last Monday of the current month
-pub fn is_today_last_monday_of_month() -> bool {
-    let today = Utc::now().date_naive();
+pub fn is_today_last_monday_of_month(timezone_str: &str) -> bool {
+    let today = now_in_timezone(timezone_str);
     is_last_monday_of_month(today)
 }
 
 /// Check if we're in the last week before a new month starts
 /// This returns true if today is within 7 days of the month end and it's Monday or later in the week
-pub fn is_last_week_before_new_month() -> bool {
-    let today = Utc::now().date_naive();
+pub fn is_last_week_before_new_month(timezone_str: &str) -> bool {
+    let today = now_in_timezone(timezone_str);
     let last_day_of_month = get_last_day_of_month(today.year(), today.month());
     let days_until_month_end = (last_day_of_month - today).num_days();
     
@@ -65,8 +84,8 @@ fn get_last_day_of_month(year: i32, month: u32) -> NaiveDate {
 /// This returns true if:
 /// 1. Today is the last Monday of the month, OR
 /// 2. We're in the last week before a new month and the last Monday has already passed
-pub fn should_check_withdrawal() -> bool {
-    is_today_last_monday_of_month() || is_last_week_before_new_month()
+pub fn should_check_withdrawal(timezone_str: &str) -> bool {
+    is_today_last_monday_of_month(timezone_str) || is_last_week_before_new_month(timezone_str)
 }
 
 #[cfg(test)]

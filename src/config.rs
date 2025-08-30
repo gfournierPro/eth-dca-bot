@@ -63,7 +63,7 @@ impl Default for Config {
             },
             schedule: ScheduleConfig {
                 cron_expression: "0 30 7 * * MON".to_string(),
-                timezone: "UTC".to_string(),
+                timezone: "Europe/Berlin".to_string(),
             },
             notion: NotionConfig {
                 token: String::new(),

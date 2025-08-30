@@ -16,6 +16,7 @@ pub struct DcaTrader {
     withdrawal_config: WithdrawalConfig,
     pub stats_db: DcaStatsDB,
     notion_tracker: Option<NotionDCATracker>,
+    timezone: String,
 }
 
 impl DcaTrader {
@@ -23,7 +24,8 @@ impl DcaTrader {
         binance_client: BinanceClient, 
         trading_config: TradingConfig,
         withdrawal_config: WithdrawalConfig,
-        notion_config: Option<&NotionConfig>
+        notion_config: Option<&NotionConfig>,
+        timezone: String,
     ) -> Result<Self> {
         let stats_db = DcaStatsDB::new().await?;
 
@@ -54,6 +56,7 @@ impl DcaTrader {
             withdrawal_config,
             stats_db,
             notion_tracker,
+            timezone,
         })
     }
 
@@ -178,7 +181,7 @@ impl DcaTrader {
         self.show_dca_summary().await?;
 
         // Check if we should perform a withdrawal after the purchase
-        if should_check_withdrawal() {
+        if should_check_withdrawal(&self.timezone) {
             info!("🔍 Checking if withdrawal is needed after DCA purchase...");
             if let Err(e) = self.check_and_execute_withdrawal().await {
                 warn!("Withdrawal check failed: {}", e);
@@ -226,7 +229,7 @@ impl DcaTrader {
             return Ok(());
         }
 
-        if !should_check_withdrawal() {
+        if !should_check_withdrawal(&self.timezone) {
             info!("Not the right time for withdrawal check");
             return Ok(());
         }
