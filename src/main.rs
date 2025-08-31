@@ -13,6 +13,38 @@ use std::env;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{error, info};
 use tracing_subscriber;
+use chrono::Utc;
+use std::str::FromStr;
+
+fn calculate_next_execution(cron_expr: &str) -> Result<String> {
+    use cron::Schedule;
+    
+    let schedule = Schedule::from_str(cron_expr)?;
+    let now = Utc::now();
+    
+    if let Some(next) = schedule.upcoming(Utc).next() {
+        let duration_until = next.signed_duration_since(now);
+        let total_seconds = duration_until.num_seconds();
+        
+        if total_seconds <= 0 {
+            return Ok("Now".to_string());
+        }
+        
+        let hours = total_seconds / 3600;
+        let minutes = (total_seconds % 3600) / 60;
+        let seconds = total_seconds % 60;
+        
+        if hours > 0 {
+            Ok(format!("{}h {}m {}s", hours, minutes, seconds))
+        } else if minutes > 0 {
+            Ok(format!("{}m {}s", minutes, seconds))
+        } else {
+            Ok(format!("{}s", seconds))
+        }
+    } else {
+        Ok("Unable to calculate".to_string())
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -111,6 +143,17 @@ async fn main() -> Result<()> {
         config.schedule.cron_expression,
         config.schedule.timezone
     );
+    
+    // Log when the next DCA batch will happen
+    match calculate_next_execution(&config.schedule.cron_expression) {
+        Ok(time_until) => {
+            info!("⏰ Next DCA batch will execute in: {}", time_until);
+        }
+        Err(e) => {
+            error!("Failed to calculate next execution time: {}", e);
+        }
+    }
+    
     info!("Press Ctrl+C to stop the bot");
 
     // Keep the application running

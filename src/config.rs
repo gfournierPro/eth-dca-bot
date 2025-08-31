@@ -62,7 +62,7 @@ impl Default for Config {
                 max_slippage: Decimal::new(1, 2),      // Default to 1%
             },
             schedule: ScheduleConfig {
-                cron_expression: "0 30 7 * * MON".to_string(),
+                cron_expression: "0 30 5 * * MON".to_string(),
                 timezone: "Europe/Berlin".to_string(),
             },
             notion: NotionConfig {
