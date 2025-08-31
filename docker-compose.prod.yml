@@ -1,0 +1,67 @@
+# Production Docker Compose configuration
+version: '3.8'
+
+services:
+  dca-bot:
+    build: .
+    container_name: eth-dca-bot
+    restart: unless-stopped
+    environment:
+      # Binance API Configuration
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_SECRET_KEY=${BINANCE_SECRET_KEY}
+      - BINANCE_BASE_URL=${BINANCE_BASE_URL:-https://api.binance.com}
+      
+      # Trading Configuration
+      - DCA_AMOUNT_EUR=${DCA_AMOUNT_EUR:-50}
+      - MIN_USDC_BALANCE=${MIN_USDC_BALANCE:-10}
+      - EUR_TO_USDC_RATE=${EUR_TO_USDC_RATE:-1.1}
+      
+      # Withdrawal Configuration
+      - WITHDRAWAL_ADDRESS=${WITHDRAWAL_ADDRESS}
+      - WITHDRAWAL_THRESHOLD=${WITHDRAWAL_THRESHOLD:-0.1}
+      - WITHDRAWAL_START_DAY=${WITHDRAWAL_START_DAY:-25}
+      - WITHDRAWAL_END_DAY=${WITHDRAWAL_END_DAY:-5}
+      
+      # Scheduling
+      - CRON_EXPRESSION=${CRON_EXPRESSION:-0 9 * * MON}
+      - TIMEZONE=${TIMEZONE:-Europe/Berlin}
+      
+      # MongoDB Configuration
+      - MONGODB_URI=mongodb://admin:${MONGO_PASSWORD}@mongodb:27017/dca_bot?authSource=admin
+      
+      # Notion Integration (Optional)
+      - NOTION_TOKEN=${NOTION_TOKEN}
+      - NOTION_DATABASE_ID=${NOTION_DATABASE_ID}
+      
+      # Logging
+      - RUST_LOG=${RUST_LOG:-info}
+    depends_on:
+      - mongodb
+    networks:
+      - dca-network
+    volumes:
+      - ./logs:/app/logs
+
+  mongodb:
+    image: mongo:7.0
+    container_name: dca-bot-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
+      MONGO_INITDB_DATABASE: dca_bot
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    networks:
+      - dca-network
+
+volumes:
+  mongodb_data:
+
+networks:
+  dca-network:
+    driver: bridge
