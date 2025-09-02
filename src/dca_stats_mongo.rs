@@ -72,9 +72,9 @@ impl DcaStatsDB {
                 "$group": {
                     "_id": null,
                     "total_purchases": { "$sum": 1 },
-                    "total_usdc_invested": { "$sum": "$usdc_amount" },
-                    "total_eth_acquired": { "$sum": "$eth_amount" },
-                    "total_fees_paid": { "$sum": "$fees_usdc" },
+                    "total_usdc_invested": { "$sum": { "$toDouble": "$usdc_amount" } },
+                    "total_eth_acquired": { "$sum": { "$toDouble": "$eth_amount" } },
+                    "total_fees_paid": { "$sum": { "$toDouble": "$fees_usdc" } },
                     "first_purchase": { "$min": "$timestamp" },
                     "last_purchase": { "$max": "$timestamp" }
                 }
@@ -85,15 +85,31 @@ impl DcaStatsDB {
 
         if let Some(doc) = cursor.try_next().await? {
             let total_purchases = doc.get_i32("total_purchases").unwrap_or(0) as i64;
-            let total_usdc_invested =
-                Decimal::from_f64_retain(doc.get_f64("total_usdc_invested").unwrap_or(0.0))
-                    .unwrap_or(dec!(0));
-            let total_eth_acquired =
-                Decimal::from_f64_retain(doc.get_f64("total_eth_acquired").unwrap_or(0.0))
-                    .unwrap_or(dec!(0));
-            let total_fees_paid =
-                Decimal::from_f64_retain(doc.get_f64("total_fees_paid").unwrap_or(0.0))
-                    .unwrap_or(dec!(0));
+            
+            // Try multiple field access methods to handle different MongoDB number types
+            let total_usdc_invested = if let Ok(val) = doc.get_f64("total_usdc_invested") {
+                Decimal::from_f64_retain(val).unwrap_or(dec!(0))
+            } else if let Ok(val) = doc.get_str("total_usdc_invested") {
+                val.parse::<Decimal>().unwrap_or(dec!(0))
+            } else {
+                dec!(0)
+            };
+            
+            let total_eth_acquired = if let Ok(val) = doc.get_f64("total_eth_acquired") {
+                Decimal::from_f64_retain(val).unwrap_or(dec!(0))
+            } else if let Ok(val) = doc.get_str("total_eth_acquired") {
+                val.parse::<Decimal>().unwrap_or(dec!(0))
+            } else {
+                dec!(0)
+            };
+            
+            let total_fees_paid = if let Ok(val) = doc.get_f64("total_fees_paid") {
+                Decimal::from_f64_retain(val).unwrap_or(dec!(0))
+            } else if let Ok(val) = doc.get_str("total_fees_paid") {
+                val.parse::<Decimal>().unwrap_or(dec!(0))
+            } else {
+                dec!(0)
+            };
 
             let average_eth_price = if total_eth_acquired > dec!(0) {
                 total_usdc_invested / total_eth_acquired
@@ -159,6 +175,37 @@ impl DcaStatsDB {
         purchases.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
         Ok(purchases)
+    }
+
+    pub async fn has_purchase_in_last_24h(&self) -> Result<bool> {
+        let twenty_four_hours_ago = chrono::Utc::now() - chrono::Duration::hours(24);
+        
+        let filter = doc! {
+            "timestamp": {
+                "$gte": twenty_four_hours_ago.to_rfc3339()
+            },
+            "status": "FILLED"
+        };
+        
+        let count = self.collection.count_documents(filter).await?;
+        Ok(count > 0)
+    }
+
+    pub async fn has_purchase_in_time_window(
+        &self, 
+        start: chrono::DateTime<chrono::Utc>, 
+        end: chrono::DateTime<chrono::Utc>
+    ) -> Result<bool> {
+        let filter = doc! {
+            "timestamp": {
+                "$gte": start.to_rfc3339(),
+                "$lte": end.to_rfc3339()
+            },
+            "status": "FILLED"
+        };
+        
+        let count = self.collection.count_documents(filter).await?;
+        Ok(count > 0)
     }
 }
 

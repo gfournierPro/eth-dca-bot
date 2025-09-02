@@ -66,7 +66,8 @@ async fn main() -> Result<()> {
         config.trading.clone(),
         config.withdrawal.clone(),
         Some(&config.notion),
-        config.schedule.timezone.clone()
+        config.schedule.timezone.clone(),
+        config.schedule.cron_expression.clone(),
     ).await?;
 
     info!("Testing Binance API connection...");
@@ -81,6 +82,12 @@ async fn main() -> Result<()> {
             info!("🔍 Checking if withdrawal is needed at startup...");
             dca_trader.check_and_execute_withdrawal().await.unwrap_or_else(|e| {
                 error!("Startup withdrawal check failed: {}", e);
+            });
+
+            // Check if DCA is needed (no purchase in last 24h)
+            info!("🔍 Checking if startup DCA is needed...");
+            dca_trader.check_and_execute_startup_dca().await.unwrap_or_else(|e| {
+                error!("Startup DCA check failed: {}", e);
             });
         }
         Err(e) => {

@@ -222,14 +222,18 @@ impl BinanceClient {
         symbol: &str,
         quote_order_qty: Decimal,
     ) -> Result<OrderResponse> {
+        // Round quote order quantity to 2 decimal places for USDC pairs
+        // Binance requires specific precision for quote order quantities
+        let rounded_qty = quote_order_qty.round_dp(2);
+        
         let mut params = HashMap::new();
         params.insert("symbol".to_string(), symbol.to_string());
         params.insert("side".to_string(), "BUY".to_string());
         params.insert("type".to_string(), "MARKET".to_string());
-        params.insert("quoteOrderQty".to_string(), quote_order_qty.to_string());
+        params.insert("quoteOrderQty".to_string(), rounded_qty.to_string());
         info!(
-            "Placing market buy order for {} {} worth of {}",
-            quote_order_qty, "USDC", symbol
+            "Placing market buy order for {} {} worth of {} (rounded from {})",
+            rounded_qty, "USDC", symbol, quote_order_qty
         );
         let order_response: OrderResponse =
             self.signed_request("POST", "/api/v3/order", params).await?;

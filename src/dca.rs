@@ -4,10 +4,12 @@ use crate::notion_integration::NotionDCATracker;
 use crate::{binance::BinanceClient, dca_stats_mongo::DcaStatsDB};
 use crate::date_utils::should_check_withdrawal;
 use anyhow::{Result, anyhow};
-use chrono::Utc;
+use chrono::{Utc, DateTime, Duration};
 use rust_decimal::Decimal;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use cron::Schedule;
+use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct DcaTrader {
@@ -17,6 +19,7 @@ pub struct DcaTrader {
     pub stats_db: DcaStatsDB,
     notion_tracker: Option<NotionDCATracker>,
     timezone: String,
+    cron_schedule: String,
 }
 
 impl DcaTrader {
@@ -26,6 +29,7 @@ impl DcaTrader {
         withdrawal_config: WithdrawalConfig,
         notion_config: Option<&NotionConfig>,
         timezone: String,
+        cron_schedule: String,
     ) -> Result<Self> {
         let stats_db = DcaStatsDB::new().await?;
 
@@ -57,6 +61,7 @@ impl DcaTrader {
             stats_db,
             notion_tracker,
             timezone,
+            cron_schedule,
         })
     }
 
@@ -221,6 +226,86 @@ impl DcaTrader {
         
         print_recent_purchases(&recent_purchases);
         Ok(())
+    }
+
+    pub async fn check_and_execute_startup_dca(&self) -> Result<()> {
+        info!("🔍 Checking if a scheduled DCA was missed and needs to be executed...");
+        
+        // Parse the cron schedule
+        let schedule = match Schedule::from_str(&self.cron_schedule) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to parse cron schedule '{}': {}", self.cron_schedule, e);
+                return Err(anyhow!("Invalid cron schedule"));
+            }
+        };
+
+        let now = Utc::now();
+        let twenty_four_hours_ago = now - Duration::hours(24);
+        
+        // Get all scheduled times in the last 24 hours
+        let mut scheduled_times = Vec::new();
+        for scheduled_time in schedule.after(&twenty_four_hours_ago).take(100) {
+            if scheduled_time <= now {
+                scheduled_times.push(scheduled_time);
+            } else {
+                break;
+            }
+        }
+
+        if scheduled_times.is_empty() {
+            info!("✅ No scheduled DCA executions were planned in the last 24 hours");
+            return Ok(());
+        }
+
+        info!("📅 Found {} scheduled DCA time(s) in the last 24 hours", scheduled_times.len());
+        
+        // Check each scheduled time to see if we have a purchase around that time
+        for scheduled_time in scheduled_times {
+            let window_start = scheduled_time - Duration::minutes(30); // 30min before
+            let window_end = scheduled_time + Duration::hours(2);      // 2h after (generous window)
+            
+            // Check if we have any purchase in the window around this scheduled time
+            let has_purchase_for_schedule = self.has_purchase_in_time_window(window_start, window_end).await?;
+            
+            if !has_purchase_for_schedule {
+                info!("❌ Missing DCA purchase for scheduled time: {} (checking window {} to {})", 
+                     scheduled_time.format("%Y-%m-%d %H:%M:%S UTC"),
+                     window_start.format("%Y-%m-%d %H:%M:%S UTC"),
+                     window_end.format("%Y-%m-%d %H:%M:%S UTC"));
+                
+                // Execute the missed DCA
+                info!("🚀 Executing missed DCA for scheduled time: {}", scheduled_time.format("%Y-%m-%d %H:%M:%S UTC"));
+                match self.execute_dca_purchase().await {
+                    Ok(()) => {
+                        info!("✅ Missed DCA purchase completed successfully!");
+                        return Ok(()); // Only execute one missed DCA to avoid multiple purchases
+                    }
+                    Err(e) => {
+                        error!("❌ Missed DCA purchase failed: {}", e);
+                        return Err(e);
+                    }
+                }
+            } else {
+                info!("✅ Found DCA purchase for scheduled time: {}", scheduled_time.format("%Y-%m-%d %H:%M:%S UTC"));
+            }
+        }
+
+        info!("✅ All scheduled DCA executions in the last 24h have been completed");
+        Ok(())
+    }
+
+    async fn has_purchase_in_time_window(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<bool> {
+        // First check database
+        match self.stats_db.has_purchase_in_time_window(start, end).await {
+            Ok(has_purchase) => Ok(has_purchase),
+            Err(e) => {
+                warn!("⚠️  Failed to check purchases in database: {}", e);
+                // Fallback: check from Binance
+                let binance_purchases = self.binance_client.get_current_month_purchases(&self.trading_config.symbol).await?;
+                Ok(binance_purchases.iter().any(|p| p.timestamp >= start && p.timestamp <= end))
+            }
+        }
     }
 
     pub async fn check_and_execute_withdrawal(&self) -> Result<()> {
