@@ -9,7 +9,20 @@ pkg update && pkg upgrade -y
 
 # Install required packages
 echo "🔧 Installing required packages..."
-pkg install -y rust git mongodb openssl-dev pkg-config
+pkg install -y rust git mongodb openssl openssl-tool libcrypt pkg-config clang
+
+# Set up OpenSSL environment variables for Rust compilation
+echo "⚙️ Setting up OpenSSL environment..."
+export OPENSSL_DIR=$PREFIX
+export OPENSSL_LIB_DIR=$PREFIX/lib
+export OPENSSL_INCLUDE_DIR=$PREFIX/include
+export PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig
+
+# Add to shell profile for persistence
+echo "export OPENSSL_DIR=\$PREFIX" >> ~/.bashrc
+echo "export OPENSSL_LIB_DIR=\$PREFIX/lib" >> ~/.bashrc
+echo "export OPENSSL_INCLUDE_DIR=\$PREFIX/include" >> ~/.bashrc
+echo "export PKG_CONFIG_PATH=\$PREFIX/lib/pkgconfig" >> ~/.bashrc
 
 # Create MongoDB directory
 echo "📁 Creating MongoDB data directory..."
