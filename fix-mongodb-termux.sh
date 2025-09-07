@@ -17,17 +17,16 @@ EOF
 
 chmod +x ~/start-mongodb-simple.sh
 
-# Create an alternative with more options (for newer versions)
+# Create an alternative with basic logging only
 echo "🚀 Creating alternative MongoDB startup script..."
 cat > ~/start-mongodb-alt.sh << 'EOF'
 #!/bin/bash
-echo "🍃 Starting MongoDB with alternative configuration..."
+echo "🍃 Starting MongoDB with basic logging..."
 mongod \
   --dbpath ~/mongodb/data \
   --logpath ~/mongodb/logs/mongod.log \
   --port 27017 \
-  --bind_ip 127.0.0.1 \
-  --nojournal
+  --bind_ip 127.0.0.1
 EOF
 
 chmod +x ~/start-mongodb-alt.sh
@@ -46,12 +45,12 @@ else
 fi
 
 echo ""
-echo "Testing with nojournal..."
-if timeout 5 mongod --dbpath ~/mongodb/data --port 27017 --bind_ip 127.0.0.1 --nojournal --help > /dev/null 2>&1; then
-    echo "✅ Configuration with --nojournal works"
+echo "Testing with basic logging..."
+if timeout 5 mongod --dbpath ~/mongodb/data --port 27017 --bind_ip 127.0.0.1 --logpath ~/mongodb/logs/mongod.log --help > /dev/null 2>&1; then
+    echo "✅ Configuration with basic logging works"
     echo "Use: ~/start-mongodb-alt.sh"
 else
-    echo "❌ Configuration with --nojournal failed"
+    echo "❌ Configuration with basic logging failed"
 fi
 
 echo ""
