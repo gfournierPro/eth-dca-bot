@@ -24,8 +24,8 @@ sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "chron
 uuid = { version = "1.18.0", features = ["v4"] }
 
 rust_decimal_macros = "1.37.1"
-# MongoDB with rustls (using correct feature names)
-mongodb = { version = "3.2.5", default-features = false, features = ["rustls-tls"] }
+# MongoDB - keep it simple, it should work with tokio by default
+mongodb = "3.2.5"
 futures = "0.3.31"
 bson = { version = "2.15", features = ["chrono-0_4"] }
 notion-client = "1.0.10"
