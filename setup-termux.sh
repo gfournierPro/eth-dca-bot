@@ -16,34 +16,20 @@ echo "📁 Creating MongoDB data directory..."
 mkdir -p ~/mongodb/data
 mkdir -p ~/mongodb/logs
 
-# Create MongoDB config file
-echo "⚙️ Creating MongoDB configuration..."
-cat > ~/mongodb/mongod.conf << EOF
-# MongoDB configuration for Termux
-storage:
-  dbPath: $HOME/mongodb/data
-  journal:
-    enabled: true
-
-systemLog:
-  destination: file
-  path: $HOME/mongodb/logs/mongod.log
-  logAppend: true
-
-net:
-  port: 27017
-  bindIp: 127.0.0.1
-
-processManagement:
-  fork: false
-EOF
-
-# Create MongoDB startup script
+# Create MongoDB startup script with direct command-line options
 echo "🚀 Creating MongoDB startup script..."
 cat > ~/start-mongodb.sh << 'EOF'
 #!/bin/bash
 echo "🍃 Starting MongoDB..."
-mongod --config ~/mongodb/mongod.conf
+mongod \
+  --dbpath ~/mongodb/data \
+  --logpath ~/mongodb/logs/mongod.log \
+  --logappend \
+  --port 27017 \
+  --bind_ip 127.0.0.1 \
+  --nojournal \
+  --smallfiles \
+  --storageEngine mmapv1
 EOF
 
 chmod +x ~/start-mongodb.sh
