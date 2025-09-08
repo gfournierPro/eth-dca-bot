@@ -14,13 +14,18 @@ pub struct DcaPurchase {
     pub id: String,
     pub timestamp: DateTime<Utc>,
     pub symbol: String,
-    pub side: String, // "BUY" or "SELL"
+    #[serde(default = "default_side")]
+    pub side: String, // "BUY" or "SELL", defaults to "BUY" for backward compatibility
     pub usdc_amount: Decimal,
     pub eth_amount: Decimal,
     pub eth_price: Decimal,
     pub fees_usdc: Decimal,
     pub order_id: u64,
     pub status: String,
+}
+
+fn default_side() -> String {
+    "BUY".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,22 +78,29 @@ impl DcaStatsDB {
                 "$group": {
                     "_id": null,
                     "total_purchases": { "$sum": 1 },
-                    // For BUY orders: add to invested/acquired, for SELL orders: subtract
+                    // For BUY orders: subtract USDC spent (negative cash flow), add ETH acquired (positive ETH balance)
+                    // For SELL orders: add USDC received (positive cash flow), subtract ETH sold (negative ETH balance)
                     "total_usdc_invested": { 
                         "$sum": { 
                             "$cond": [
-                                { "$eq": ["$side", "BUY"] },
-                                { "$toDouble": "$usdc_amount" },
-                                { "$multiply": [{ "$toDouble": "$usdc_amount" }, -1] }
+                                { "$or": [
+                                    { "$eq": ["$side", "BUY"] },
+                                    { "$eq": ["$side", null] }  // Handle missing side field as BUY
+                                ]},
+                                { "$multiply": [{ "$toDouble": "$usdc_amount" }, -1] }, // BUY: subtract USDC spent
+                                { "$toDouble": "$usdc_amount" } // SELL: add USDC received
                             ]
                         }
                     },
                     "total_eth_acquired": { 
                         "$sum": { 
                             "$cond": [
-                                { "$eq": ["$side", "BUY"] },
-                                { "$toDouble": "$eth_amount" },
-                                { "$multiply": [{ "$toDouble": "$eth_amount" }, -1] }
+                                { "$or": [
+                                    { "$eq": ["$side", "BUY"] },
+                                    { "$eq": ["$side", null] }  // Handle missing side field as BUY
+                                ]},
+                                { "$toDouble": "$eth_amount" }, // BUY: add ETH acquired
+                                { "$multiply": [{ "$toDouble": "$eth_amount" }, -1] } // SELL: subtract ETH sold
                             ]
                         }
                     },
@@ -129,16 +141,18 @@ impl DcaStatsDB {
                 dec!(0)
             };
 
+            // Calculate average price based on absolute values
             let average_eth_price = if total_eth_acquired > dec!(0) {
-                total_usdc_invested / total_eth_acquired
+                total_usdc_invested.abs() / total_eth_acquired
             } else {
                 dec!(0)
             };
 
             let current_eth_value = total_eth_acquired * current_eth_price;
-            let unrealized_pnl = current_eth_value - total_usdc_invested;
-            let unrealized_pnl_percentage = if total_usdc_invested > dec!(0) {
-                (unrealized_pnl / total_usdc_invested) * dec!(100)
+            // P&L = current value of ETH + net cash flow (negative cash flow means we spent money)
+            let unrealized_pnl = current_eth_value + total_usdc_invested;
+            let unrealized_pnl_percentage = if total_usdc_invested.abs() > dec!(0) {
+                (unrealized_pnl / total_usdc_invested.abs()) * dec!(100)
             } else {
                 dec!(0)
             };
@@ -388,11 +402,11 @@ pub fn print_dca_summary(summary: &DcaSummary) {
     info!("╠═══════════════════════════════════════╣");
     info!("║ Total Purchases: {:>19} ║", summary.total_purchases);
     info!(
-        "║ Total USDC Invested: ${:>13} ║",
-        summary.total_usdc_invested.round_dp(2)
+        "║ Net USDC Spent: ${:>17} ║",
+        summary.total_usdc_invested.abs().round_dp(2)
     );
     info!(
-        "║ Total ETH Acquired: {:>14} ║",
+        "║ Net ETH Balance: {:>16} ║",
         summary.total_eth_acquired.round_dp(6)
     );
     info!(
