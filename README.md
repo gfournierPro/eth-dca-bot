@@ -137,7 +137,50 @@ struct DcaPurchase {
 }
 ```
 
-## 🔗 Notion Integration
+## � Database Sync Feature
+
+The bot includes a powerful sync feature to recreate/retrieve your MongoDB database by checking trades made on Binance and ensuring they are properly stored in your DCA MongoDB database.
+
+### How to Use Database Sync
+
+To trigger the database sync, set the `SYNC_DATABASE` environment variable to `true`:
+
+```bash
+SYNC_DATABASE=true cargo run --release --bin eth-dca-bot
+```
+
+### What It Does
+
+- **Fetches Historical Data**: Retrieves all ETHUSDC trades (both BUY and SELL orders) from Binance starting from 2025-09-01 08:25:58 (Order ID: 6778085567)
+- **Compares Records**: Checks existing MongoDB records against Binance history
+- **Identifies Missing Orders**: Finds any orders that exist on Binance but not in your database
+- **Syncs Missing Data**: Adds missing orders (purchases and sales) to your MongoDB database 
+- **Provides Detailed Reports**: Shows exactly what was synced with order type information
+
+### Example Output
+
+```
+🔄 Starting database synchronization with Binance...
+📅 Syncing from: 2025-09-01 08:25:58 UTC (Order ID: 6778085567)
+🔍 Verifying database integrity against Binance records...
+📊 Found 15 existing orders in database
+📊 Found 18 orders from Binance
+🔄 Found 3 missing orders to sync
+✅ Added missing purchase: Order ID 6778085567 (BUY) from 2025-09-01 08:25:58 UTC
+✅ Added missing sale: Order ID 6778123456 (SELL) from 2025-09-02 14:30:22 UTC
+🎉 Sync completed! Added 3 missing orders to database
+```
+
+### Safety Features
+
+- **No Duplicates**: Only adds orders that don't already exist
+- **Read-Only**: Uses only read operations on Binance API
+- **Data Validation**: Verifies integrity before and after sync
+- **Comprehensive Logging**: Detailed logs of all operations
+
+For detailed information, see [SYNC_FEATURE.md](SYNC_FEATURE.md).
+
+## �🔗 Notion Integration
 
 The bot can optionally integrate with Notion to track your DCA strategy:
 

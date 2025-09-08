@@ -131,6 +131,7 @@ impl DcaTrader {
             id: Uuid::new_v4().to_string(),
             timestamp: Utc::now(),
             symbol: self.trading_config.symbol.clone(),
+            side: "BUY".to_string(), // This is a DCA purchase, so always BUY
             usdc_amount: executed_value,
             eth_amount: executed_qty,
             eth_price: average_price,

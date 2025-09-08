@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 use anyhow::{Ok, Result, anyhow};
-use chrono::{Utc, Datelike, TimeZone};
+use chrono::{Utc, Datelike, TimeZone, DateTime};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use rust_decimal::Decimal;
@@ -308,6 +308,7 @@ impl BinanceClient {
                         id: Uuid::new_v4().to_string(),
                         timestamp,
                         symbol: order.symbol.clone(),
+                        side: order.side.clone(),
                         usdc_amount: executed_value,
                         eth_amount: executed_qty,
                         eth_price: average_price,
@@ -325,6 +326,81 @@ impl BinanceClient {
         purchases.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         
         info!("Found {} DCA purchases from current month on Binance", purchases.len());
+        Ok(purchases)
+    }
+
+    /// Get all DCA orders (both purchases and sales) from Binance starting from a specific date and optionally from a minimum order ID
+    /// This is useful for syncing historical data with the database
+    pub async fn get_historical_dca_orders(
+        &self,
+        symbol: &str,
+        start_date: DateTime<Utc>,
+        min_order_id: Option<u64>,
+    ) -> Result<Vec<DcaPurchase>> {
+        let start_timestamp = start_date.timestamp_millis();
+        
+        info!("🔍 Fetching historical DCA orders for {} from {}", symbol, start_date.format("%Y-%m-%d %H:%M:%S UTC"));
+        if let Some(min_id) = min_order_id {
+            info!("📋 Filtering orders from minimum order ID: {}", min_id);
+        }
+        
+        let orders = self.get_order_history(
+            symbol,
+            Some(start_timestamp),
+            None,
+            Some(1000), // Limit to 1000 orders
+        ).await?;
+
+        let mut purchases = Vec::new();
+        
+        for order in orders {
+            // Skip orders before the minimum order ID if specified
+            if let Some(min_id) = min_order_id {
+                if order.order_id < min_id {
+                    continue;
+                }
+            }
+            
+            // Process both filled buy and sell orders
+            if order.status == "FILLED" && (order.side == "BUY" || order.side == "SELL") {
+                let executed_qty: Decimal = order.executed_qty.parse().unwrap_or(dec!(0));
+                let executed_value: Decimal = order.cummulative_quote_qty.parse().unwrap_or(dec!(0));
+                
+                if executed_qty > dec!(0) && executed_value > dec!(0) {
+                    let average_price = executed_value / executed_qty;
+                    let timestamp = match Utc.timestamp_millis_opt(order.time) {
+                        chrono::LocalResult::Single(dt) => dt,
+                        _ => {
+                            warn!("Invalid timestamp for order {}, using current time", order.order_id);
+                            Utc::now()
+                        }
+                    };
+                    
+                    // Estimate fees as 0.1% of trade value since we don't have fill details
+                    let estimated_fees = executed_value * dec!(0.001);
+                    
+                    let purchase = DcaPurchase {
+                        id: Uuid::new_v4().to_string(),
+                        timestamp,
+                        symbol: order.symbol.clone(),
+                        side: order.side.clone(),
+                        usdc_amount: executed_value,
+                        eth_amount: executed_qty,
+                        eth_price: average_price,
+                        fees_usdc: estimated_fees,
+                        order_id: order.order_id,
+                        status: order.status.clone(),
+                    };
+                    
+                    purchases.push(purchase);
+                }
+            }
+        }
+        
+        // Sort by timestamp (oldest first for historical sync)
+        purchases.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        
+        info!("✅ Found {} historical DCA orders from Binance", purchases.len());
         Ok(purchases)
     }
 
@@ -415,7 +491,7 @@ impl BinanceClient {
             std::result::Result::Ok(response) => {
                 // Parse the response to check if the coin supports withdrawals
                 if let Some(coins) = response.as_array() {
-                    for (index, coin_info) in coins.iter().enumerate() {
+                    for coin_info in coins.iter() {
                         if let Some(coin_name) = coin_info.get("coin").and_then(|c| c.as_str()) {
                             if coin_name == coin {
                                 

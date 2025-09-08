@@ -163,6 +163,7 @@ async fn main() -> Result<()> {
         id: Uuid::new_v4().to_string(),
         timestamp,
         symbol: replacement_order.symbol.clone(),
+        side: replacement_order.side.clone(),
         usdc_amount: executed_value,
         eth_amount: executed_qty,
         eth_price: average_price,

@@ -7,13 +7,14 @@ use mongodb::{Client, Collection, bson::Document};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn, error};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DcaPurchase {
     pub id: String,
     pub timestamp: DateTime<Utc>,
     pub symbol: String,
+    pub side: String, // "BUY" or "SELL"
     pub usdc_amount: Decimal,
     pub eth_amount: Decimal,
     pub eth_price: Decimal,
@@ -72,8 +73,25 @@ impl DcaStatsDB {
                 "$group": {
                     "_id": null,
                     "total_purchases": { "$sum": 1 },
-                    "total_usdc_invested": { "$sum": { "$toDouble": "$usdc_amount" } },
-                    "total_eth_acquired": { "$sum": { "$toDouble": "$eth_amount" } },
+                    // For BUY orders: add to invested/acquired, for SELL orders: subtract
+                    "total_usdc_invested": { 
+                        "$sum": { 
+                            "$cond": [
+                                { "$eq": ["$side", "BUY"] },
+                                { "$toDouble": "$usdc_amount" },
+                                { "$multiply": [{ "$toDouble": "$usdc_amount" }, -1] }
+                            ]
+                        }
+                    },
+                    "total_eth_acquired": { 
+                        "$sum": { 
+                            "$cond": [
+                                { "$eq": ["$side", "BUY"] },
+                                { "$toDouble": "$eth_amount" },
+                                { "$multiply": [{ "$toDouble": "$eth_amount" }, -1] }
+                            ]
+                        }
+                    },
                     "total_fees_paid": { "$sum": { "$toDouble": "$fees_usdc" } },
                     "first_purchase": { "$min": "$timestamp" },
                     "last_purchase": { "$max": "$timestamp" }
@@ -225,6 +243,142 @@ impl DcaStatsDB {
         let result = self.collection.delete_one(filter).await?;
         Ok(result.deleted_count > 0)
     }
+
+    /// Get all existing order IDs from the database
+    pub async fn get_all_order_ids(&self) -> Result<Vec<u64>> {
+        use futures::StreamExt;
+        
+        let pipeline = vec![
+            Document::from(doc! {
+                "$project": {
+                    "order_id": 1,
+                    "_id": 0
+                }
+            })
+        ];
+
+        let mut cursor = self.collection.aggregate(pipeline).await?;
+        let mut order_ids = Vec::new();
+
+        while let Some(doc) = cursor.next().await {
+            if let Ok(doc) = doc {
+                if let Ok(order_id_str) = doc.get_str("order_id") {
+                    if let Ok(order_id) = order_id_str.parse::<u64>() {
+                        order_ids.push(order_id);
+                    }
+                }
+            }
+        }
+
+        Ok(order_ids)
+    }
+
+    /// Sync missing orders (both purchases and sales) from Binance to MongoDB
+    /// Returns the number of orders added
+    pub async fn sync_missing_orders_from_binance(
+        &self,
+        binance_client: &crate::binance::BinanceClient,
+        symbol: &str,
+        start_date: chrono::DateTime<chrono::Utc>,
+        min_order_id: Option<u64>,
+    ) -> Result<usize> {
+        info!("🔄 Starting sync of missing orders from Binance...");
+        
+        // Get all historical orders from Binance
+        let binance_orders = binance_client
+            .get_historical_dca_orders(symbol, start_date, min_order_id)
+            .await?;
+        
+        if binance_orders.is_empty() {
+            info!("📝 No orders found on Binance for the specified criteria");
+            return Ok(0);
+        }
+        
+        // Get all existing order IDs from database
+        let existing_order_ids = self.get_all_order_ids().await?;
+        let existing_ids_set: std::collections::HashSet<u64> = existing_order_ids.into_iter().collect();
+        
+        info!("📊 Found {} existing orders in database", existing_ids_set.len());
+        info!("📊 Found {} orders from Binance", binance_orders.len());
+        
+        // Filter out orders that already exist in database
+        let missing_orders: Vec<&DcaPurchase> = binance_orders
+            .iter()
+            .filter(|order| !existing_ids_set.contains(&order.order_id))
+            .collect();
+        
+        if missing_orders.is_empty() {
+            info!("✅ All Binance orders are already in the database - no sync needed");
+            return Ok(0);
+        }
+        
+        info!("🔄 Found {} missing orders to sync", missing_orders.len());
+        
+        // Add missing orders to database
+        let mut added_count = 0;
+        for order in missing_orders {
+            match self.record_purchase(order).await {
+                Ok(()) => {
+                    added_count += 1;
+                    let order_type = if order.side == "BUY" { "purchase" } else { "sale" };
+                    info!("✅ Added missing {}: Order ID {} ({}) from {}", 
+                          order_type,
+                          order.order_id, 
+                          order.side,
+                          order.timestamp.format("%Y-%m-%d %H:%M:%S UTC"));
+                }
+                Err(e) => {
+                    error!("❌ Failed to add order {}: {}", order.order_id, e);
+                }
+            }
+        }
+        
+        info!("🎉 Sync completed! Added {} missing orders to database", added_count);
+        Ok(added_count)
+    }
+
+    /// Verify database integrity by checking if all recent Binance trades are in the database
+    /// Returns a summary of missing orders
+    pub async fn verify_database_integrity(
+        &self,
+        binance_client: &crate::binance::BinanceClient,
+        symbol: &str,
+        start_date: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(usize, usize, Vec<u64>)> {
+        info!("🔍 Verifying database integrity against Binance records...");
+        
+        // Get all orders from Binance since start date
+        let binance_orders = binance_client
+            .get_historical_dca_orders(symbol, start_date, None)
+            .await?;
+        
+        // Get all existing order IDs from database
+        let existing_order_ids = self.get_all_order_ids().await?;
+        let existing_ids_set: std::collections::HashSet<u64> = existing_order_ids.into_iter().collect();
+        
+        // Find missing order IDs
+        let missing_order_ids: Vec<u64> = binance_orders
+            .iter()
+            .map(|order| order.order_id)
+            .filter(|order_id| !existing_ids_set.contains(order_id))
+            .collect();
+        
+        let total_binance_orders = binance_orders.len();
+        let missing_count = missing_order_ids.len();
+        
+        info!("📊 Database Integrity Report:");
+        info!("   Total Binance orders since {}: {}", start_date.format("%Y-%m-%d"), total_binance_orders);
+        info!("   Orders in database: {}", existing_ids_set.len());
+        info!("   Missing orders: {}", missing_count);
+        
+        if !missing_order_ids.is_empty() {
+            warn!("⚠️  Missing order IDs: {:?}", missing_order_ids);
+        } else {
+            info!("✅ Database is in sync with Binance records");
+        }
+        
+        Ok((total_binance_orders, missing_count, missing_order_ids))
+    }
 }
 
 // Include the same print functions from the SQLite version
@@ -303,12 +457,23 @@ pub fn print_recent_purchases(purchases: &[DcaPurchase]) {
         if i > 0 {
             info!("║                                                                ║");
         }
+        
+        let side_emoji = if purchase.side == "BUY" { "🟢" } else { "🔴" };
+        
         info!(
             "║ Date: {:>55} ║",
             purchase.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
         );
-        info!("║ USDC Spent: ${:>47} ║", purchase.usdc_amount.round_dp(2));
-        info!("║ ETH Acquired: {:>45} ║", purchase.eth_amount.round_dp(6));
+        info!("║ Type: {} {:>53} ║", side_emoji, purchase.side);
+        
+        if purchase.side == "BUY" {
+            info!("║ USDC Spent: ${:>47} ║", purchase.usdc_amount.round_dp(2));
+            info!("║ ETH Acquired: {:>45} ║", purchase.eth_amount.round_dp(6));
+        } else {
+            info!("║ USDC Received: ${:>44} ║", purchase.usdc_amount.round_dp(2));
+            info!("║ ETH Sold: {:>49} ║", purchase.eth_amount.round_dp(6));
+        }
+        
         info!("║ ETH Price: ${:>48} ║", purchase.eth_price.round_dp(2));
         info!("║ Fees: ${:>53} ║", purchase.fees_usdc.round_dp(4));
         info!("║ Order ID: {:>49} ║", purchase.order_id);
