@@ -32,6 +32,8 @@ jobs:
       run: cargo install cross --git https://github.com/cross-rs/cross
     
     - name: Cross compile for Android
+      env:
+        CROSS_NO_WARNINGS: "0"
       run: cross build --target aarch64-linux-android --release
     
     - name: Upload Android binary
