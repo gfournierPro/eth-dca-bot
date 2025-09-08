@@ -2,7 +2,7 @@ name: Cross-compile for Android
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, feature/* ]  # Run on main and all feature branches
   pull_request:
     branches: [ main ]
   workflow_dispatch:  # Allow manual triggering
