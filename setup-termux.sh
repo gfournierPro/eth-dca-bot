@@ -116,8 +116,12 @@ if pgrep mongod > /dev/null; then
     echo "🔍 Connection test:"
     if command -v mongosh >/dev/null 2>&1; then
         timeout 5 mongosh --eval "db.adminCommand('ping')" --quiet 2>/dev/null && echo "✅ Connection: OK" || echo "❌ Connection: FAILED"
+    elif command -v mongo >/dev/null 2>&1; then
+        timeout 5 mongo --eval "db.adminCommand('ping')" --quiet 2>/dev/null && echo "✅ Connection: OK" || echo "❌ Connection: FAILED"
+    elif command -v nc >/dev/null 2>&1; then
+        nc -z localhost 27017 2>/dev/null && echo "✅ Port 27017: OPEN" || echo "❌ Port 27017: CLOSED"
     else
-        echo "⚠️  mongosh not found - install with: pkg install mongodb"
+        echo "⚠️  No connection testing tools available"
     fi
 else
     echo "❌ Status: NOT RUNNING"
@@ -160,6 +164,89 @@ db.dca_purchases.createIndex({ "order_id": 1 }, { unique: true });
 print("✅ Database and user created successfully!");
 EOF
 
+# Create alternative initialization methods
+echo "🔄 Creating database initialization script..."
+cat > ~/init-database.sh << 'EOF'
+#!/bin/bash
+echo "🔧 Initializing DCA Bot database..."
+
+# Method 1: Try mongosh (if available)
+if command -v mongosh >/dev/null 2>&1; then
+    echo "Using mongosh..."
+    mongosh < ~/init-dca-db.js
+elif command -v mongo >/dev/null 2>&1; then
+    echo "Using mongo shell..."
+    mongo < ~/init-dca-db.js
+else
+    echo "⚠️  No MongoDB shell found. Initializing manually..."
+    
+    # Wait for MongoDB to be ready
+    echo "Waiting for MongoDB to start..."
+    for i in {1..30}; do
+        if nc -z localhost 27017 2>/dev/null; then
+            echo "✅ MongoDB is ready"
+            break
+        fi
+        echo "Waiting... ($i/30)"
+        sleep 1
+    done
+    
+    if ! nc -z localhost 27017 2>/dev/null; then
+        echo "❌ MongoDB not responding on port 27017"
+        echo "💡 Make sure MongoDB is running: ~/start-mongodb.sh"
+        exit 1
+    fi
+    
+    # Try to connect using available tools
+    echo "🔧 Creating database using available tools..."
+    
+    # Create a simple connection test
+    if command -v python >/dev/null 2>&1; then
+        echo "Using Python to initialize database..."
+        python3 - << 'PYTHON_EOF'
+try:
+    import pymongo
+    
+    # Connect to MongoDB
+    client = pymongo.MongoClient('mongodb://localhost:27017/')
+    db = client['dca_bot']
+    
+    # Create user (this might fail if auth is not enabled, which is fine)
+    try:
+        db.command('createUser', 'dca_user', pwd='dca_password', 
+                  roles=[{'role': 'readWrite', 'db': 'dca_bot'}])
+        print("✅ User created")
+    except Exception as e:
+        print(f"ℹ️  User creation skipped: {e}")
+    
+    # Create collection and indexes
+    collection = db['dca_purchases']
+    collection.create_index([('timestamp', -1)])
+    collection.create_index([('symbol', 1)])
+    collection.create_index([('order_id', 1)], unique=True)
+    
+    print("✅ Database and indexes created successfully!")
+    client.close()
+    
+except ImportError:
+    print("❌ pymongo not available. Install with: pip install pymongo")
+except Exception as e:
+    print(f"❌ Database initialization failed: {e}")
+PYTHON_EOF
+    else
+        echo "⚠️  Python not available for database initialization"
+        echo "💡 You'll need to manually create the database or install a MongoDB shell"
+        echo ""
+        echo "📝 Manual setup steps:"
+        echo "1. Install pymongo: pip install pymongo"
+        echo "2. Run this script again: ~/init-database.sh"
+        echo "3. Or install mongo shell manually"
+    fi
+fi
+EOF
+
+chmod +x ~/init-database.sh
+
 # Create environment template
 echo "📝 Creating environment template..."
 cat > .env.termux << 'EOF'
@@ -195,8 +282,10 @@ echo ""
 echo "1. 🚀 Start MongoDB:"
 echo "   ~/start-mongodb.sh"
 echo ""
-echo "2. 🔧 Initialize database (in another terminal):"
-echo "   mongosh < ~/init-dca-db.js"
+echo "2. 🔧 Initialize database:"
+echo "   ~/init-database.sh"
+echo "   # Alternative: install pymongo first if needed"
+echo "   # pip install pymongo"
 echo ""
 echo "3. ⚙️  Configure environment:"
 echo "   cp .env.termux .env"
