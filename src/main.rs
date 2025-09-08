@@ -202,9 +202,10 @@ async fn sync_database_with_binance(dca_trader: &DcaTrader) -> Result<()> {
     
     info!("🔄 Starting database synchronization with Binance...");
     
-    // Define the start date and first order ID as specified by the user
-    let start_date = Utc.with_ymd_and_hms(2025, 9, 1, 8, 25, 58).unwrap();
-    let first_order_id = 6778085567_u64;
+    // Define the start date and first order ID as specified by the user  
+    // Include the August 25th order (6683992267) which is also part of DCA history
+    let start_date = Utc.with_ymd_and_hms(2025, 8, 25, 18, 11, 41).unwrap();
+    let first_order_id = 6683992267_u64; // Start from the earliest DCA order
     
     info!("📅 Syncing from: {} (Order ID: {})", start_date.format("%Y-%m-%d %H:%M:%S UTC"), first_order_id);
     
