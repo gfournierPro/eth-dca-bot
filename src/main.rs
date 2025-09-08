@@ -16,14 +16,29 @@ use tracing_subscriber;
 use chrono::Utc;
 use std::str::FromStr;
 
-fn calculate_next_execution(cron_expr: &str) -> Result<String> {
+fn calculate_next_execution(cron_expr: &str, timezone_str: &str) -> Result<String> {
     use cron::Schedule;
+    use chrono_tz::Tz;
+    use chrono::TimeZone;
+    
+    // Parse timezone
+    let tz = if timezone_str == "UTC" || timezone_str.is_empty() {
+        chrono_tz::UTC
+    } else {
+        Tz::from_str(timezone_str).unwrap_or(chrono_tz::Europe::Paris)
+    };
     
     let schedule = Schedule::from_str(cron_expr)?;
-    let now = Utc::now();
+    let now_utc = Utc::now();
     
-    if let Some(next) = schedule.upcoming(Utc).next() {
-        let duration_until = next.signed_duration_since(now);
+    // For timezone-aware scheduling, we use the timezone directly with the cron library
+    let mut upcoming = schedule.upcoming(tz);
+    
+    if let Some(next_local) = upcoming.next() {
+        // Convert to UTC for duration calculation
+        let next_utc = next_local.with_timezone(&Utc);
+        
+        let duration_until = next_utc.signed_duration_since(now_utc);
         let total_seconds = duration_until.num_seconds();
         
         if total_seconds <= 0 {
@@ -34,13 +49,15 @@ fn calculate_next_execution(cron_expr: &str) -> Result<String> {
         let minutes = (total_seconds % 3600) / 60;
         let seconds = total_seconds % 60;
         
-        if hours > 0 {
-            Ok(format!("{}h {}m {}s", hours, minutes, seconds))
+        let time_str = if hours > 0 {
+            format!("{}h {}m {}s", hours, minutes, seconds)
         } else if minutes > 0 {
-            Ok(format!("{}m {}s", minutes, seconds))
+            format!("{}m {}s", minutes, seconds)
         } else {
-            Ok(format!("{}s", seconds))
-        }
+            format!("{}s", seconds)
+        };
+        
+        Ok(format!("{} (next: {} {})", time_str, next_local.format("%Y-%m-%d %H:%M:%S"), timezone_str))
     } else {
         Ok("Unable to calculate".to_string())
     }
@@ -152,7 +169,7 @@ async fn main() -> Result<()> {
     );
     
     // Log when the next DCA batch will happen
-    match calculate_next_execution(&config.schedule.cron_expression) {
+    match calculate_next_execution(&config.schedule.cron_expression, &config.schedule.timezone) {
         Ok(time_until) => {
             info!("⏰ Next DCA batch will execute in: {}", time_until);
         }

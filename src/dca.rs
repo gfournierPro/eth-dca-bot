@@ -262,8 +262,8 @@ impl DcaTrader {
         
         // Check each scheduled time to see if we have a purchase around that time
         for scheduled_time in scheduled_times {
-            let window_start = scheduled_time - Duration::minutes(30); // 30min before
-            let window_end = scheduled_time + Duration::hours(2);      // 2h after (generous window)
+            let window_start = scheduled_time - Duration::hours(4); // 30min before
+            let window_end = scheduled_time + Duration::hours(4);      // 2h after (generous window)
             
             // Check if we have any purchase in the window around this scheduled time
             let has_purchase_for_schedule = self.has_purchase_in_time_window(window_start, window_end).await?;

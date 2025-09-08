@@ -1,0 +1,24 @@
+[target.aarch64-linux-android]
+# Use the official cross-rs Docker image with Android NDK
+image = "ghcr.io/cross-rs/aarch64-linux-android:main"
+
+[build.env]
+passthrough = [
+    "RUST_LOG",
+]
+
+# Environment variables for Android cross-compilation
+[target.aarch64-linux-android.env]
+# Use vendored OpenSSL to avoid system dependency issues
+OPENSSL_STATIC = "1"
+OPENSSL_VENDOR = "1"
+OPENSSL_NO_PKG_CONFIG = "1"
+
+# Disable pkg-config to force vendored builds
+PKG_CONFIG_ALLOW_CROSS = "0"
+
+# Set compiler and linker for Android
+CC_aarch64_linux_android = "aarch64-linux-android21-clang"
+CXX_aarch64_linux_android = "aarch64-linux-android21-clang++"
+AR_aarch64_linux_android = "aarch64-linux-android-ar"
+CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = "aarch64-linux-android21-clang"

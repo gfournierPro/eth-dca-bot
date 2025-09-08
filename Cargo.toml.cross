@@ -1,30 +1,32 @@
 [package]
 name = "eth-dca-bot"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 anyhow = "1.0.99"
-chrono = {version = "0.4.41",  features = ["serde"]}
+chrono = { version = "0.4.41", features = ["serde"] }
 chrono-tz = "0.10.0"
 dotenv = "0.15.0"
 hex = "0.4.3"
 hmac = "0.12.1"
+# Force rustls for all HTTP
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
 rust_decimal = "1.37.2"
-serde = "1.0.219"
+serde = { version = "1.0.219", features = ["derive"] }
 sha2 = "0.10.9"
 tokio-cron-scheduler = "0.14.0"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 tokio = { version = "1.47.1", features = ["full"] }
+# Use SQLite instead of MongoDB for better cross-compilation
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "chrono", "bigdecimal"] }
 uuid = { version = "1.18.0", features = ["v4"] }
-
 rust_decimal_macros = "1.37.1"
-mongodb = "3.2.5"
+# Remove MongoDB and notion-client - they cause OpenSSL issues
+# mongodb = "3.2.5"  # We'll use SQLite instead
 futures = "0.3.31"
 bson = { version = "2.15", features = ["chrono-0_4"] }
-notion-client = "1.0.10"
+# notion-client = "1.0.10"  # We'll implement this with reqwest directly
 serde_json = "1.0.143"
 cron = "0.15.0"
