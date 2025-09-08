@@ -40,6 +40,24 @@ jobs:
         PKG_CONFIG_ALLOW_CROSS: "0"
       run: cross build --target aarch64-linux-android --release
     
+    - name: Create binaries directory
+      run: mkdir -p binaries/android
+    
+    - name: Copy Android binary
+      run: cp target/aarch64-linux-android/release/eth-dca-bot binaries/android/eth-dca-bot-android
+    
+    - name: Commit and push binary to repository
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add binaries/android/eth-dca-bot-android
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "🤖 Auto-update Android binary [skip ci]"
+          git push
+        fi
+    
     - name: Upload Android binary
       uses: actions/upload-artifact@v4
       with:
