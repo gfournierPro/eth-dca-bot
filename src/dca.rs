@@ -296,16 +296,21 @@ impl DcaTrader {
     }
 
     async fn has_purchase_in_time_window(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<bool> {
-        // First check database
-        match self.stats_db.has_purchase_in_time_window(start, end).await {
-            Ok(has_purchase) => Ok(has_purchase),
-            Err(e) => {
-                warn!("⚠️  Failed to check purchases in database: {}", e);
-                // Fallback: check from Binance
-                let binance_purchases = self.binance_client.get_current_month_purchases(&self.trading_config.symbol).await?;
-                Ok(binance_purchases.iter().any(|p| p.timestamp >= start && p.timestamp <= end))
-            }
+        // Check Binance directly for purchases in the time window
+        info!("🔍 Checking Binance for purchases in time window {} to {}", 
+              start.format("%Y-%m-%d %H:%M:%S UTC"), 
+              end.format("%Y-%m-%d %H:%M:%S UTC"));
+        
+        let binance_purchases = self.binance_client.get_current_month_purchases(&self.trading_config.symbol).await?;
+        let has_purchase = binance_purchases.iter().any(|p| p.timestamp >= start && p.timestamp <= end);
+        
+        if has_purchase {
+            info!("✅ Found purchase(s) in Binance for the specified time window");
+        } else {
+            info!("❌ No purchases found in Binance for the specified time window");
         }
+        
+        Ok(has_purchase)
     }
 
     pub async fn check_and_execute_withdrawal(&self) -> Result<()> {
