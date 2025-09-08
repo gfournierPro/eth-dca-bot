@@ -15,13 +15,14 @@ rust_decimal = "1.37.2"
 rust_decimal_macros = "1.37.1"
 serde = "1.0.219"
 sha2 = "0.10.9"
-tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 uuid = { version = "1.18.0", features = ["v4"] }
 serde_json = "1.0.143"
 cron = "0.15.0"
 futures = "0.3.31"
+tokio-cron-scheduler = "0.14.0"
 
 # HTTP client with rustls (no OpenSSL)
 reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"] }
@@ -35,7 +36,7 @@ openssl-sys = { version = "0.9", features = ["vendored"] }
 
 # Simplified MongoDB and Notion for Android (with rustls)
 bson = { version = "2.15", features = ["chrono-0_4"] }
-mongodb = { version = "3.2.5", default-features = false, features = ["rustls-tls"] }
+mongodb = { version = "3.3.0", default-features = false, features = ["rustls-tls", "bson-2", "compat-3-3-0"] }
 notion-client = { version = "1.0.10", default-features = false }
 
 # Note: tokio-cron-scheduler might be heavy, consider implementing simple scheduling

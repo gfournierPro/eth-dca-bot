@@ -207,6 +207,24 @@ impl DcaStatsDB {
         let count = self.collection.count_documents(filter).await?;
         Ok(count > 0)
     }
+
+    pub async fn get_purchase_by_order_id(&self, order_id: u64) -> Result<Option<DcaPurchase>> {
+        let filter = doc! {
+            "order_id": order_id.to_string()
+        };
+        
+        let purchase = self.collection.find_one(filter).await?;
+        Ok(purchase)
+    }
+
+    pub async fn remove_purchase_by_order_id(&self, order_id: u64) -> Result<bool> {
+        let filter = doc! {
+            "order_id": order_id.to_string()
+        };
+        
+        let result = self.collection.delete_one(filter).await?;
+        Ok(result.deleted_count > 0)
+    }
 }
 
 // Include the same print functions from the SQLite version
