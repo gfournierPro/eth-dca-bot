@@ -3,8 +3,20 @@ name: Cross-compile for Android
 on:
   push:
     branches: [ main, feature/* ]  # Run on main and all feature branches
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Cross.toml'
+      - '.github/workflows/cross-compile.yml'
   pull_request:
     branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Cross.toml'
+      - '.github/workflows/cross-compile.yml'
   workflow_dispatch:  # Allow manual triggering
 
 permissions:
