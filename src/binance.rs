@@ -11,6 +11,8 @@ use sha2::Sha256;
 use tracing::{error, info, warn};
 use crate::dca_stats_mongo::DcaPurchase;
 use uuid::Uuid;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -20,6 +22,7 @@ pub struct BinanceClient {
     api_key: String,
     secret_key: String,
     base_url: String,
+    time_offset: Arc<RwLock<i64>>, // Offset in milliseconds between local time and server time
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +113,12 @@ pub struct WithdrawHistory {
     pub network: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ServerTime {
+    #[serde(rename = "serverTime")]
+    pub server_time: i64,
+}
+
 impl BinanceClient {
     pub fn new(api_key: String, secret_key: String, base_url: String) -> Self {
         Self {
@@ -117,7 +126,40 @@ impl BinanceClient {
             api_key,
             secret_key,
             base_url,
+            time_offset: Arc::new(RwLock::new(0)),
         }
+    }
+
+    async fn get_server_time(&self) -> Result<i64> {
+        let url = format!("{}/api/v3/time", self.base_url);
+        let response = self.client.get(&url).send().await?;
+        
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            return Err(anyhow!("Failed to get server time: {}", error_text));
+        }
+        
+        let server_time: ServerTime = response.json().await?;
+        Ok(server_time.server_time)
+    }
+
+    pub async fn sync_time(&self) -> Result<()> {
+        info!("Synchronizing time with Binance servers...");
+        let server_time = self.get_server_time().await?;
+        let local_time = Utc::now().timestamp_millis();
+        let offset = server_time - local_time;
+        
+        info!("Time sync - Server: {}, Local: {}, Offset: {}ms", 
+              server_time, local_time, offset);
+        
+        *self.time_offset.write().await = offset;
+        Ok(())
+    }
+
+    async fn get_synchronized_timestamp(&self) -> i64 {
+        let local_time = Utc::now().timestamp_millis();
+        let offset = *self.time_offset.read().await;
+        local_time + offset
     }
 
     fn create_signature(&self, query_string: &str) -> String {
@@ -135,7 +177,7 @@ impl BinanceClient {
         let mut params = params;
         params.insert(
             "timestamp".to_string(),
-            Utc::now().timestamp_millis().to_string(),
+            self.get_synchronized_timestamp().await.to_string(),
         );
 
         let query_string = params

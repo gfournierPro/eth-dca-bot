@@ -87,6 +87,9 @@ async fn main() -> Result<()> {
         config.schedule.cron_expression.clone(),
     ).await?;
 
+    // Synchronize time with Binance servers before any API calls
+    dca_trader.binance_client.sync_time().await?;
+
     info!("Testing Binance API connection...");
     match dca_trader.binance_client.get_usdc_balanc().await {
         Ok(balance) => {
