@@ -213,8 +213,8 @@ impl DcaTrader {
                 Ok(binance_purchases) => {
                     if !binance_purchases.is_empty() {
                         info!("✅ Found {} purchases from current month on Binance", binance_purchases.len());
-                        // Take only the 5 most recent ones
-                        recent_purchases = binance_purchases.into_iter().take(5).collect();
+                        // Take only the 1 most recent ones
+                        recent_purchases = binance_purchases.into_iter().take(1).collect();
                     } else {
                         info!("📝 No purchases found for current month on Binance either");
                     }
