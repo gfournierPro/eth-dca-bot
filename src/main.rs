@@ -5,7 +5,6 @@ mod dca_stats_mongo;
 mod notion_integration;
 mod date_utils;
 mod market_indicators;
-mod demo;
 
 use anyhow::Result;
 use config::Config;
@@ -68,12 +67,6 @@ fn calculate_next_execution(cron_expr: &str, timezone_str: &str) -> Result<Strin
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     dotenv().ok();
-
-    // Check if demo mode is requested
-    if env::var("DEMO_DCA").unwrap_or_default().to_lowercase() == "true" {
-        demo::simulate_current_dca_calculation().await;
-        return Ok(());
-    }
 
     info!("Starting ETH DCA Bot...");
     let config = load_config()?;
