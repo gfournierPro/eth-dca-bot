@@ -6,7 +6,6 @@ mod notion_integration;
 mod date_utils;
 mod market_indicators;
 mod demo;
-mod dca_evolution;
 
 use anyhow::Result;
 use config::Config;
@@ -22,7 +21,6 @@ use std::str::FromStr;
 fn calculate_next_execution(cron_expr: &str, timezone_str: &str) -> Result<String> {
     use cron::Schedule;
     use chrono_tz::Tz;
-    use chrono::TimeZone;
     
     // Parse timezone
     let tz = if timezone_str == "UTC" || timezone_str.is_empty() {
@@ -74,12 +72,6 @@ async fn main() -> Result<()> {
     // Check if demo mode is requested
     if env::var("DEMO_DCA").unwrap_or_default().to_lowercase() == "true" {
         demo::simulate_current_dca_calculation().await;
-        return Ok(());
-    }
-
-    // Check if evolution analysis is requested
-    if env::var("EVOLUTION_DCA").unwrap_or_default().to_lowercase() == "true" {
-        dca_evolution::simulate_weekly_dca_evolution().await;
         return Ok(());
     }
 

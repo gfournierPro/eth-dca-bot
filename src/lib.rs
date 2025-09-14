@@ -6,4 +6,3 @@ pub mod notion_integration;
 pub mod date_utils;
 pub mod market_indicators;
 pub mod demo;
-pub mod dca_evolution;

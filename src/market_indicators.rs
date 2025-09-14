@@ -3,8 +3,10 @@ use chrono::{DateTime, Utc};
 use anyhow::Result;
 use crate::binance::BinanceClient;
 use crate::dca_stats_mongo::DcaStatsDB;
-use tracing::{info, debug};
+use tracing::{info, debug, warn};
 use std::collections::VecDeque;
+use reqwest;
+use serde_json::Value;
 
 /// Market indicators configuration for dynamic DCA sizing
 #[derive(Debug, Clone)]
@@ -178,7 +180,26 @@ impl MarketIndicators {
         binance_client: &BinanceClient,
         symbol: &str,
     ) -> Result<()> {
-        // Get current price
+        // If we have insufficient historical data, fetch from external API
+        let max_period = self.config.volatility_period
+            .max(self.config.rsi_period)
+            .max(self.config.moving_average_period)
+            .max(self.config.momentum_period);
+        
+        if self.price_history.len() < max_period as usize {
+            info!("Insufficient historical data, fetching from external API...");
+            match self.fetch_historical_prices(symbol, max_period + 5).await {
+                Ok(historical_data) => {
+                    info!("Successfully fetched {} historical price points", historical_data.len());
+                    self.price_history = historical_data.into();
+                }
+                Err(e) => {
+                    warn!("Failed to fetch historical data: {}, using current price only", e);
+                }
+            }
+        }
+        
+        // Always add current price from Binance
         let current_price = binance_client.get_symbol_price(symbol).await?;
         let current_time = Utc::now();
         
@@ -186,22 +207,92 @@ impl MarketIndicators {
         self.price_history.push_back(PriceData {
             timestamp: current_time,
             price: current_price,
-            volume: None, // TODO: Add volume data if needed
+            volume: None,
         });
         
         // Keep only the data we need (max period + some buffer)
-        let max_period = self.config.volatility_period
-            .max(self.config.rsi_period)
-            .max(self.config.moving_average_period)
-            .max(self.config.momentum_period);
-        
         let max_history_size = (max_period * 2) as usize; // 2x buffer
         
         while self.price_history.len() > max_history_size {
             self.price_history.pop_front();
         }
         
+        debug!("Price history updated, size: {}", self.price_history.len());
         Ok(())
+    }
+
+    /// Fetch historical price data from external API (CoinGecko)
+    async fn fetch_historical_prices(&self, symbol: &str, days: u32) -> Result<Vec<PriceData>> {
+        let client = reqwest::Client::new();
+        
+        // Map symbol to CoinGecko format
+        let coin_id = match symbol {
+            "ETHUSDC" | "ETHUSDT" | "ETH" => "ethereum",
+            "BTCUSDC" | "BTCUSDT" | "BTC" => "bitcoin",
+            _ => {
+                return Err(anyhow::anyhow!("Unsupported symbol for historical data: {}", symbol));
+            }
+        };
+        
+        let url = format!(
+            "https://api.coingecko.com/api/v3/coins/{}/market_chart?vs_currency=usd&days={}&interval=daily",
+            coin_id, days
+        );
+        
+        debug!("Fetching historical data from: {}", url);
+        
+        let response: Value = client.get(&url)
+            .header("User-Agent", "eth-dca-bot/1.0")
+            .send()
+            .await?
+            .json()
+            .await?;
+        
+        let mut price_data = Vec::new();
+        
+        if let Some(prices) = response["prices"].as_array() {
+            for price_point in prices.iter() {
+                if let Some(price_array) = price_point.as_array() {
+                    if let (Some(timestamp), Some(price)) = (
+                        price_array.get(0).and_then(|t| t.as_f64()),
+                        price_array.get(1).and_then(|p| p.as_f64())
+                    ) {
+                        let datetime = DateTime::from_timestamp(timestamp as i64 / 1000, 0)
+                            .unwrap_or_else(|| Utc::now());
+                        
+                        let price_decimal = Decimal::try_from(price)
+                            .unwrap_or(Decimal::new(0, 0));
+                        
+                        price_data.push(PriceData {
+                            timestamp: datetime,
+                            price: price_decimal,
+                            volume: None,
+                        });
+                    }
+                }
+            }
+        }
+        
+        // Sort by timestamp (oldest first)
+        price_data.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        
+        if price_data.is_empty() {
+            return Err(anyhow::anyhow!("No historical price data received"));
+        }
+        
+        debug!("Fetched {} historical price points from {} to {}", 
+               price_data.len(),
+               price_data.first().map(|p| p.timestamp.format("%Y-%m-%d").to_string()).unwrap_or_default(),
+               price_data.last().map(|p| p.timestamp.format("%Y-%m-%d").to_string()).unwrap_or_default());
+        
+        Ok(price_data)
+    }
+
+    /// Fetch current EUR/USD exchange rate from Binance
+    pub async fn fetch_eur_usd_rate(binance_client: &BinanceClient) -> Result<Decimal> {
+        let rate = binance_client.get_symbol_price("EURUSDC").await?;
+        debug!("Current EUR/USD rate: {}", rate);
+        Ok(rate)
     }
 
     /// Calculate volatility-based multiplier
