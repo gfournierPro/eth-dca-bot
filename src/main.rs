@@ -4,6 +4,9 @@ mod dca;
 mod dca_stats_mongo;
 mod notion_integration;
 mod date_utils;
+mod market_indicators;
+mod demo;
+mod dca_evolution;
 
 use anyhow::Result;
 use config::Config;
@@ -68,6 +71,18 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     dotenv().ok();
 
+    // Check if demo mode is requested
+    if env::var("DEMO_DCA").unwrap_or_default().to_lowercase() == "true" {
+        demo::simulate_current_dca_calculation().await;
+        return Ok(());
+    }
+
+    // Check if evolution analysis is requested
+    if env::var("EVOLUTION_DCA").unwrap_or_default().to_lowercase() == "true" {
+        dca_evolution::simulate_weekly_dca_evolution().await;
+        return Ok(());
+    }
+
     info!("Starting ETH DCA Bot...");
     let config = load_config()?;
     validate_config(&config)?;
@@ -78,11 +93,12 @@ async fn main() -> Result<()> {
         config.binance.base_url.clone(),
     );
 
-    let dca_trader = DcaTrader::new(
+    let mut dca_trader = DcaTrader::new(
         binance_client, 
         config.trading.clone(),
         config.withdrawal.clone(),
         Some(&config.notion),
+        Some(&config.market_indicators),
         config.schedule.timezone.clone(),
         config.schedule.cron_expression.clone(),
     ).await?;
@@ -132,7 +148,7 @@ async fn main() -> Result<()> {
         Job::new_async(
             config.schedule.cron_expression.as_str(),
             move |_uuid, _l| {
-                let trader = dca_trader.clone();
+                let mut trader = dca_trader.clone();
                 Box::pin(async move {
                     info!("Executing scheduled DCA purchase");
                     match trader.execute_dca_purchase().await {
@@ -155,7 +171,7 @@ async fn main() -> Result<()> {
             config.schedule.cron_expression.as_str(),
             tz,
             move |_uuid, _l| {
-                let trader = dca_trader.clone();
+                let mut trader = dca_trader.clone();
                 Box::pin(async move {
                     info!("Executing scheduled DCA purchase");
                     match trader.execute_dca_purchase().await {

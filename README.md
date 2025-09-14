@@ -5,6 +5,7 @@ A sophisticated Ethereum Dollar-Cost Averaging (DCA) bot built in Rust that auto
 ## 🌟 Features
 
 - **Automated DCA Trading**: Schedule regular ETH purchases using EUR amounts (automatically converted to USDC) on Binance
+- **Dynamic DCA Sizing**: Smart purchase amount adjustments based on market conditions (volatility, RSI, moving averages, momentum)
 - **Smart Withdrawal System**: Automatically withdraw ETH to cold storage when thresholds are met
 - **MongoDB Integration**: Track all purchases, statistics, and performance metrics
 - **Notion Integration**: Optional integration with Notion for portfolio tracking and management
@@ -12,6 +13,22 @@ A sophisticated Ethereum Dollar-Cost Averaging (DCA) bot built in Rust that auto
 - **Safety Checks**: Multiple validation layers and minimum balance protection
 - **Comprehensive Logging**: Detailed tracing and error handling
 - **Docker Support**: Easy deployment with MongoDB using Docker Compose
+
+## 🧠 Dynamic DCA Sizing
+
+The bot now includes advanced market-based DCA amount adjustments:
+
+### Market Indicators
+- **Volatility-based Scaling**: Increases purchase amounts by up to 10% during high volatility periods (2+ standard deviations)
+- **RSI-based Adjustments**: Buys 7% more when RSI < 30 (oversold conditions)
+- **Price Deviation Strategy**: Increases amounts by 5% when price is >5% below 20-day moving average
+- **Momentum-based Adjustments**: Buys 8% more during negative momentum periods (-5% over 7 days)
+
+### Safety Features
+- **Maximum Multiplier**: Caps total multiplier at 1.3x to limit increases to +30% maximum
+- **Minimum Multiplier**: Ensures at least 0.8x purchase occurs (minimum -20% reduction)
+- **Individual Controls**: Each indicator can be enabled/disabled independently
+- **Configurable Thresholds**: All parameters are customizable via configuration
 
 ## 🏗️ Architecture
 
@@ -99,6 +116,38 @@ cargo run
 - `WITHDRAWAL_MIN_ETH_THRESHOLD`: Minimum ETH balance to trigger withdrawal
 - `WITHDRAWAL_AMOUNT`: Optional fixed withdrawal amount (if not set, withdraws all available ETH)
 
+### Market Indicators Configuration
+
+All market indicators are configurable and can be enabled/disabled independently:
+
+#### Volatility-based Scaling
+- `volatility_scaling_enabled`: Enable volatility-based purchase scaling (default: true)
+- `volatility_period`: Lookback period in days for volatility calculation (default: 30)
+- `high_volatility_multiplier`: Purchase multiplier during high volatility (default: 1.1)
+- `volatility_threshold`: Standard deviation threshold for "high" volatility (default: 2.0)
+
+#### RSI-based Adjustments
+- `rsi_enabled`: Enable RSI-based purchase adjustments (default: true)
+- `rsi_period`: Period for RSI calculation (default: 14)
+- `rsi_oversold_threshold`: RSI level considered oversold (default: 30)
+- `rsi_oversold_multiplier`: Purchase multiplier when oversold (default: 1.07)
+
+#### Price Deviation Strategy
+- `price_deviation_enabled`: Enable moving average deviation strategy (default: true)
+- `moving_average_period`: Period for moving average calculation (default: 20)
+- `deviation_threshold_percent`: Percentage below MA to trigger increase (default: 5%)
+- `below_ma_multiplier`: Purchase multiplier when below MA (default: 1.05)
+
+#### Momentum-based Adjustments
+- `momentum_enabled`: Enable momentum-based adjustments (default: true)
+- `momentum_period`: Period for momentum calculation (default: 7)
+- `negative_momentum_threshold`: Negative momentum threshold (default: -5%)
+- `negative_momentum_multiplier`: Purchase multiplier during negative momentum (default: 1.08)
+
+#### Safety Limits
+- `max_total_multiplier`: Maximum combined multiplier to prevent excessive purchases (default: 1.3)
+- `min_total_multiplier`: Minimum multiplier to ensure some purchase occurs (default: 0.8)
+
 ### Cron Expression Examples
 
 ```bash
@@ -113,6 +162,28 @@ cargo run
 
 # Every 6 hours
 "0 0 */6 * * * *"
+```
+
+## 💡 Dynamic DCA Example
+
+Here's how the dynamic sizing works in practice:
+
+**Base Setup**: 100 EUR DCA amount
+- **Normal conditions**: Buys 100 EUR worth of ETH (multiplier: 1.0)
+- **High volatility + RSI oversold**: Buys 117.7 EUR worth (1.1 × 1.07 = 1.177 multiplier)
+- **Price 8% below MA + negative momentum**: Buys 113.4 EUR worth (1.05 × 1.08 = 1.134 multiplier)
+- **All conditions triggered**: Buys 133.8 EUR worth (1.1 × 1.07 × 1.05 × 1.08 = 1.338 multiplier, capped at 1.3)
+- **Maximum increase**: Capped at 130 EUR maximum (1.3x safety limit, +30% from base)
+- **Market confidence low**: Minimum 80 EUR (0.8x safety floor, -20% from base)
+
+The bot logs each multiplier calculation:
+```
+[INFO] Volatility multiplier: 1.1
+[INFO] RSI multiplier: 1.07
+[INFO] Price deviation multiplier: 1.0
+[INFO] Momentum multiplier: 1.08
+[INFO] Final DCA multiplier: 1.3 (capped from 1.338)
+[INFO] Dynamic DCA multiplier: 1.30 - Adjusted target amount: 130.0 USDC
 ```
 
 ## 📊 MongoDB Schema

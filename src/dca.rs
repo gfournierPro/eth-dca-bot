@@ -1,8 +1,9 @@
-use crate::config::{TradingConfig, NotionConfig, WithdrawalConfig};
+use crate::config::{TradingConfig, NotionConfig, WithdrawalConfig, MarketIndicatorsConfig};
 use crate::dca_stats_mongo::{DcaPurchase, print_dca_summary, print_recent_purchases};
 use crate::notion_integration::NotionDCATracker;
 use crate::{binance::BinanceClient, dca_stats_mongo::DcaStatsDB};
 use crate::date_utils::should_check_withdrawal;
+use crate::market_indicators;
 use anyhow::{Result, anyhow};
 use chrono::{Utc, DateTime, Duration};
 use rust_decimal::Decimal;
@@ -20,6 +21,7 @@ pub struct DcaTrader {
     notion_tracker: Option<NotionDCATracker>,
     timezone: String,
     cron_schedule: String,
+    market_indicators: Option<market_indicators::MarketIndicators>,
 }
 
 impl DcaTrader {
@@ -28,6 +30,7 @@ impl DcaTrader {
         trading_config: TradingConfig,
         withdrawal_config: WithdrawalConfig,
         notion_config: Option<&NotionConfig>,
+        market_indicators_config: Option<&MarketIndicatorsConfig>,
         timezone: String,
         cron_schedule: String,
     ) -> Result<Self> {
@@ -54,6 +57,43 @@ impl DcaTrader {
             None
         };
 
+        let market_indicators = if let Some(config) = market_indicators_config {
+            info!("Dynamic DCA sizing enabled with market indicators");
+            // Convert config to the market_indicators module format
+            let mi_config = market_indicators::MarketIndicatorsConfig {
+                volatility_scaling_enabled: config.volatility_scaling_enabled,
+                volatility_period: config.volatility_period,
+                high_volatility_multiplier: config.high_volatility_multiplier,
+                volatility_threshold: config.volatility_threshold,
+                low_volatility_multiplier: config.low_volatility_multiplier,
+                low_volatility_threshold: config.low_volatility_threshold,
+                rsi_enabled: config.rsi_enabled,
+                rsi_period: config.rsi_period,
+                rsi_oversold_threshold: config.rsi_oversold_threshold,
+                rsi_oversold_multiplier: config.rsi_oversold_multiplier,
+                rsi_overbought_threshold: config.rsi_overbought_threshold,
+                rsi_overbought_multiplier: config.rsi_overbought_multiplier,
+                price_deviation_enabled: config.price_deviation_enabled,
+                moving_average_period: config.moving_average_period,
+                deviation_threshold_percent: config.deviation_threshold_percent,
+                below_ma_multiplier: config.below_ma_multiplier,
+                above_ma_threshold_percent: config.above_ma_threshold_percent,
+                above_ma_multiplier: config.above_ma_multiplier,
+                momentum_enabled: config.momentum_enabled,
+                momentum_period: config.momentum_period,
+                negative_momentum_threshold: config.negative_momentum_threshold,
+                negative_momentum_multiplier: config.negative_momentum_multiplier,
+                positive_momentum_threshold: config.positive_momentum_threshold,
+                positive_momentum_multiplier: config.positive_momentum_multiplier,
+                max_total_multiplier: config.max_total_multiplier,
+                min_total_multiplier: config.min_total_multiplier,
+            };
+            Some(market_indicators::MarketIndicators::new(mi_config))
+        } else {
+            info!("Market indicators configuration not provided, using fixed DCA amounts");
+            None
+        };
+
         Ok(Self {
             binance_client,
             trading_config,
@@ -62,18 +102,34 @@ impl DcaTrader {
             notion_tracker,
             timezone,
             cron_schedule,
+            market_indicators,
         })
     }
 
-    pub async fn execute_dca_purchase(&self) -> Result<()> {
+    pub async fn execute_dca_purchase(&mut self) -> Result<()> {
         info!("Starting DCA purchase execution");
 
         // First, get EUR/USDC exchange rate to convert our EUR amount to USDC
         let eur_usdc_price = self.binance_client.get_symbol_price("EURUSDC").await?;
-        let target_usdc_amount = self.trading_config.buy_amount_eur * eur_usdc_price;
+        let base_target_usdc_amount = self.trading_config.buy_amount_eur * eur_usdc_price;
         
-        info!("EUR/USDC rate: {} - Converting {} EUR to {} USDC", 
-              eur_usdc_price, self.trading_config.buy_amount_eur, target_usdc_amount);
+        // Calculate dynamic multiplier if market indicators are enabled
+        let dca_multiplier = if let Some(ref mut market_indicators) = self.market_indicators {
+            market_indicators.calculate_dca_multiplier(
+                &self.binance_client,
+                &self.stats_db,
+                &self.trading_config.symbol,
+            ).await?
+        } else {
+            Decimal::ONE
+        };
+        
+        let target_usdc_amount = base_target_usdc_amount * dca_multiplier;
+        
+        info!("EUR/USDC rate: {} - Converting {} EUR to {} USDC (base amount)", 
+              eur_usdc_price, self.trading_config.buy_amount_eur, base_target_usdc_amount);
+        info!("Dynamic DCA multiplier: {} - Adjusted target amount: {} USDC", 
+              dca_multiplier, target_usdc_amount);
 
         let usdc_balance = self.binance_client.get_usdc_balanc().await?;
         if usdc_balance < self.trading_config.min_balance_usdc {
@@ -229,7 +285,7 @@ impl DcaTrader {
         Ok(())
     }
 
-    pub async fn check_and_execute_startup_dca(&self) -> Result<()> {
+    pub async fn check_and_execute_startup_dca(&mut self) -> Result<()> {
         info!("🔍 Checking if a scheduled DCA was missed and needs to be executed...");
         
         // Parse the cron schedule
