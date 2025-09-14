@@ -188,15 +188,29 @@ impl MarketIndicators {
         
         if self.price_history.len() < max_period as usize {
             info!("Insufficient historical data, fetching from external API...");
-            match self.fetch_historical_prices(symbol, max_period + 5).await {
-                Ok(historical_data) => {
-                    info!("Successfully fetched {} historical price points", historical_data.len());
-                    self.price_history = historical_data.into();
+            
+            // Try to fetch granular data first for better analysis
+            let historical_data = if max_period <= 7 {
+                // For short periods, use granular hourly data
+                match self.fetch_granular_market_data(symbol, max_period * 24).await {
+                    Ok(data) => {
+                        info!("Successfully fetched {} granular data points", data.len());
+                        data
+                    }
+                    Err(e) => {
+                        warn!("Granular data fetch failed: {}, trying daily data", e);
+                        self.fetch_historical_prices(symbol, max_period + 5).await?
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to fetch historical data: {}, using current price only", e);
-                }
-            }
+            } else {
+                // For longer periods, use daily data
+                self.fetch_historical_prices(symbol, max_period + 5).await?
+            };
+            
+            // Replace entire history with fetched data
+            self.price_history = historical_data.into();
+            
+            info!("Historical data loaded, {} price points available", self.price_history.len());
         }
         
         // Always add current price from Binance
@@ -217,12 +231,100 @@ impl MarketIndicators {
             self.price_history.pop_front();
         }
         
-        debug!("Price history updated, size: {}", self.price_history.len());
+        debug!("Price history updated, size: {}, latest price: {}", 
+               self.price_history.len(), current_price);
         Ok(())
     }
 
-    /// Fetch historical price data from external API (CoinGecko)
+    /// Fetch historical price data from external APIs (Binance primary, CoinGecko fallback)
     async fn fetch_historical_prices(&self, symbol: &str, days: u32) -> Result<Vec<PriceData>> {
+        // Try Binance first for better data quality and performance
+        if let Ok(binance_data) = self.fetch_binance_historical_data(symbol, days).await {
+            debug!("Successfully fetched historical data from Binance");
+            return Ok(binance_data);
+        }
+        
+        warn!("Binance historical data failed, falling back to CoinGecko");
+        
+        // Fallback to CoinGecko
+        self.fetch_coingecko_historical_data(symbol, days).await
+    }
+
+    /// Fetch historical data from Binance Klines API
+    async fn fetch_binance_historical_data(&self, symbol: &str, days: u32) -> Result<Vec<PriceData>> {
+        let client = reqwest::Client::new();
+        
+        // Convert symbol to Binance format if needed
+        let binance_symbol = match symbol {
+            "ETH" => "ETHUSDT",
+            "BTC" => "BTCUSDT", 
+            _ => symbol,
+        };
+        
+        // Calculate start time (days ago)
+        let end_time = Utc::now().timestamp_millis();
+        let start_time = end_time - (days as i64 * 24 * 60 * 60 * 1000);
+        
+        // Use daily intervals for historical data
+        let url = format!(
+            "https://api.binance.com/api/v3/klines?symbol={}&interval=1d&startTime={}&endTime={}&limit=1000",
+            binance_symbol, start_time, end_time
+        );
+        
+        debug!("Fetching Binance historical data from: {}", url);
+        
+        let response: Value = client.get(&url)
+            .header("User-Agent", "eth-dca-bot/1.0")
+            .send()
+            .await?
+            .json()
+            .await?;
+        
+        let mut price_data = Vec::new();
+        
+        if let Some(klines) = response.as_array() {
+            for kline in klines.iter() {
+                if let Some(kline_array) = kline.as_array() {
+                    if let (Some(timestamp), Some(close_price), Some(volume)) = (
+                        kline_array.get(0).and_then(|t| t.as_i64()),
+                        kline_array.get(4).and_then(|c| c.as_str()),
+                        kline_array.get(5).and_then(|v| v.as_str()),
+                    ) {
+                        let datetime = DateTime::from_timestamp_millis(timestamp)
+                            .unwrap_or_else(|| Utc::now());
+                        
+                        let price_decimal = close_price.parse::<f64>()
+                            .map(|p| Decimal::try_from(p).unwrap_or(Decimal::ZERO))
+                            .unwrap_or(Decimal::ZERO);
+                        
+                        let volume_decimal = volume.parse::<f64>()
+                            .map(|v| Decimal::try_from(v).unwrap_or(Decimal::ZERO))
+                            .ok();
+                        
+                        price_data.push(PriceData {
+                            timestamp: datetime,
+                            price: price_decimal,
+                            volume: volume_decimal,
+                        });
+                    }
+                }
+            }
+        }
+        
+        if price_data.is_empty() {
+            return Err(anyhow::anyhow!("No historical data received from Binance"));
+        }
+        
+        debug!("Fetched {} Binance historical price points from {} to {}", 
+               price_data.len(),
+               price_data.first().map(|p| p.timestamp.format("%Y-%m-%d").to_string()).unwrap_or_default(),
+               price_data.last().map(|p| p.timestamp.format("%Y-%m-%d").to_string()).unwrap_or_default());
+        
+        Ok(price_data)
+    }
+
+    /// Fetch historical data from CoinGecko API (fallback)
+    async fn fetch_coingecko_historical_data(&self, symbol: &str, days: u32) -> Result<Vec<PriceData>> {
         let client = reqwest::Client::new();
         
         // Map symbol to CoinGecko format
@@ -230,19 +332,23 @@ impl MarketIndicators {
             "ETHUSDC" | "ETHUSDT" | "ETH" => "ethereum",
             "BTCUSDC" | "BTCUSDT" | "BTC" => "bitcoin",
             _ => {
-                return Err(anyhow::anyhow!("Unsupported symbol for historical data: {}", symbol));
+                return Err(anyhow::anyhow!("Unsupported symbol for CoinGecko historical data: {}", symbol));
             }
         };
         
+        // Use appropriate interval based on days requested
+        let interval = if days <= 1 { "5m" } else if days <= 30 { "hourly" } else { "daily" };
+        
         let url = format!(
-            "https://api.coingecko.com/api/v3/coins/{}/market_chart?vs_currency=usd&days={}&interval=daily",
-            coin_id, days
+            "https://api.coingecko.com/api/v3/coins/{}/market_chart?vs_currency=usd&days={}&interval={}",
+            coin_id, days, interval
         );
         
-        debug!("Fetching historical data from: {}", url);
+        debug!("Fetching CoinGecko historical data from: {}", url);
         
         let response: Value = client.get(&url)
             .header("User-Agent", "eth-dca-bot/1.0")
+            .timeout(std::time::Duration::from_secs(30))
             .send()
             .await?
             .json()
@@ -261,12 +367,28 @@ impl MarketIndicators {
                             .unwrap_or_else(|| Utc::now());
                         
                         let price_decimal = Decimal::try_from(price)
-                            .unwrap_or(Decimal::new(0, 0));
+                            .unwrap_or(Decimal::ZERO);
+                        
+                        // Extract volume if available
+                        let volume = response["total_volumes"].as_array()
+                            .and_then(|volumes| {
+                                volumes.iter().find(|v| {
+                                    v.as_array()
+                                        .and_then(|arr| arr.get(0))
+                                        .and_then(|t| t.as_f64())
+                                        .map(|t| (t as i64 / 1000) == datetime.timestamp())
+                                        .unwrap_or(false)
+                                })
+                            })
+                            .and_then(|v| v.as_array())
+                            .and_then(|arr| arr.get(1))
+                            .and_then(|vol| vol.as_f64())
+                            .and_then(|v| Decimal::try_from(v).ok());
                         
                         price_data.push(PriceData {
                             timestamp: datetime,
                             price: price_decimal,
-                            volume: None,
+                            volume,
                         });
                     }
                 }
@@ -277,10 +399,10 @@ impl MarketIndicators {
         price_data.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         
         if price_data.is_empty() {
-            return Err(anyhow::anyhow!("No historical price data received"));
+            return Err(anyhow::anyhow!("No historical price data received from CoinGecko"));
         }
         
-        debug!("Fetched {} historical price points from {} to {}", 
+        debug!("Fetched {} CoinGecko historical price points from {} to {}", 
                price_data.len(),
                price_data.first().map(|p| p.timestamp.format("%Y-%m-%d").to_string()).unwrap_or_default(),
                price_data.last().map(|p| p.timestamp.format("%Y-%m-%d").to_string()).unwrap_or_default());
@@ -293,6 +415,85 @@ impl MarketIndicators {
         let rate = binance_client.get_symbol_price("EURUSDC").await?;
         debug!("Current EUR/USD rate: {}", rate);
         Ok(rate)
+    }
+
+    /// Fetch high-frequency data for more accurate technical analysis
+    pub async fn fetch_granular_market_data(&self, symbol: &str, hours: u32) -> Result<Vec<PriceData>> {
+        let client = reqwest::Client::new();
+        
+        // Convert symbol to Binance format
+        let binance_symbol = match symbol {
+            "ETH" => "ETHUSDT",
+            "BTC" => "BTCUSDT",
+            _ => symbol,
+        };
+        
+        // Use appropriate interval based on time range
+        let (interval, limit) = if hours <= 24 {
+            ("5m", std::cmp::min(hours * 12, 1000)) // 5-minute intervals, max 1000
+        } else if hours <= 168 { // 1 week
+            ("1h", std::cmp::min(hours, 1000)) // 1-hour intervals
+        } else {
+            ("4h", std::cmp::min(hours / 4, 1000)) // 4-hour intervals
+        };
+        
+        let end_time = Utc::now().timestamp_millis();
+        let start_time = end_time - (hours as i64 * 60 * 60 * 1000);
+        
+        let url = format!(
+            "https://api.binance.com/api/v3/klines?symbol={}&interval={}&startTime={}&endTime={}&limit={}",
+            binance_symbol, interval, start_time, end_time, limit
+        );
+        
+        debug!("Fetching granular Binance data: {} intervals over {} hours", interval, hours);
+        
+        let response: Value = client.get(&url)
+            .header("User-Agent", "eth-dca-bot/1.0")
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await?
+            .json()
+            .await?;
+        
+        let mut price_data = Vec::new();
+        
+        if let Some(klines) = response.as_array() {
+            for kline in klines.iter() {
+                if let Some(kline_array) = kline.as_array() {
+                    // Binance kline format: [timestamp, open, high, low, close, volume, ...]
+                    if let (Some(timestamp), Some(close), Some(volume)) = (
+                        kline_array.get(0).and_then(|t| t.as_i64()),
+                        kline_array.get(4).and_then(|c| c.as_str()),
+                        kline_array.get(5).and_then(|v| v.as_str()),
+                    ) {
+                        let datetime = DateTime::from_timestamp_millis(timestamp)
+                            .unwrap_or_else(|| Utc::now());
+                        
+                        // Use close price for consistency
+                        let price_decimal = close.parse::<f64>()
+                            .map(|p| Decimal::try_from(p).unwrap_or(Decimal::ZERO))
+                            .unwrap_or(Decimal::ZERO);
+                        
+                        let volume_decimal = volume.parse::<f64>()
+                            .map(|v| Decimal::try_from(v).unwrap_or(Decimal::ZERO))
+                            .ok();
+                        
+                        price_data.push(PriceData {
+                            timestamp: datetime,
+                            price: price_decimal,
+                            volume: volume_decimal,
+                        });
+                    }
+                }
+            }
+        }
+        
+        if price_data.is_empty() {
+            return Err(anyhow::anyhow!("No granular market data received from Binance"));
+        }
+        
+        debug!("Fetched {} granular price points over {} hours", price_data.len(), hours);
+        Ok(price_data)
     }
 
     /// Calculate volatility-based multiplier
