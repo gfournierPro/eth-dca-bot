@@ -129,11 +129,11 @@ impl Default for Config {
             notion: NotionConfig {
                 token: String::new(),
                 database_id: String::new(),
-                cold_wallet_address: "0xa416610975634033374EEdAE26D0FCa7A7360b70".to_string(),
+                cold_wallet_address: "0x48AE396B932D062B559B11d8fC4D973E730af1eB".to_string(),
             },
             withdrawal: WithdrawalConfig {
                 enabled: false,
-                cold_wallet_address: "0xa416610975634033374EEdAE26D0FCa7A7360b70".to_string(),
+                cold_wallet_address: "0x48AE396B932D062B559B11d8fC4D973E730af1eB".to_string(),
                 network: "ARBITRUM".to_string(), // Correct network name for Arbitrum One
                 min_eth_threshold: Decimal::new(3, 4), // 0.0003 ETH minimum
                 withdrawal_amount: None, // Withdraw all available ETH
