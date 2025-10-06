@@ -12,7 +12,7 @@ use dca::DcaTrader;
 use dotenv::dotenv;
 use std::env;
 use tokio_cron_scheduler::{Job, JobScheduler};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber;
 use chrono::Utc;
 use std::str::FromStr;
@@ -111,13 +111,11 @@ async fn main() -> Result<()> {
                 error!("Startup DCA check failed: {}", e);
             });
 
-            // Check if database sync is requested
-            if env::var("SYNC_DATABASE").unwrap_or_default().to_lowercase() == "true" {
-                info!("🔄 Database sync requested, starting sync process...");
-                sync_database_with_binance(&dca_trader).await.unwrap_or_else(|e| {
-                    error!("Database sync failed: {}", e);
-                });
-            }
+            // Always check database integrity on startup
+            info!("� Verifying database integrity with Binance records...");
+            check_and_sync_database(&dca_trader).await.unwrap_or_else(|e| {
+                error!("Database integrity check failed: {}", e);
+            });
         }
         Err(e) => {
             error!("Failed to connect to Binance API: {}", e);
@@ -199,8 +197,64 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Check database integrity and sync if needed
+async fn check_and_sync_database(dca_trader: &DcaTrader) -> Result<()> {
+    use chrono::{TimeZone, Utc};
+    
+    info!("🔍 Checking database integrity...");
+    
+    // Define the start date and first order ID as specified by the user  
+    // Include the August 25th order (6683992267) which is also part of DCA history
+    let start_date = Utc.with_ymd_and_hms(2025, 8, 25, 18, 11, 41).unwrap();
+    let first_order_id = 6683992267_u64; // Start from the earliest DCA order
+    
+    info!("📅 Checking from: {} (Order ID: {})", start_date.format("%Y-%m-%d %H:%M:%S UTC"), first_order_id);
+    
+    // Verify database integrity
+    let (total_binance, missing_count, missing_ids) = dca_trader.stats_db
+        .verify_database_integrity(&dca_trader.binance_client, "ETHUSDC", start_date)
+        .await?;
+    
+    if missing_count == 0 {
+        info!("✅ Database is in sync with Binance - no missing trades found");
+        return Ok(());
+    }
+    
+    // Missing trades found - automatically sync
+    warn!("⚠️  Found {} missing trade(s) in database", missing_count);
+    info!("🔄 Starting automatic sync of missing trades...");
+    
+    let added_count = dca_trader.stats_db
+        .sync_missing_orders_from_binance(
+            &dca_trader.binance_client,
+            "ETHUSDC", 
+            start_date,
+            Some(first_order_id)
+        )
+        .await?;
+    
+    info!("🎉 Database sync completed successfully!");
+    info!("📊 Summary:");
+    info!("   - Total Binance orders: {}", total_binance);
+    info!("   - Missing orders found: {}", missing_count);
+    info!("   - Orders added to database: {}", added_count);
+    
+    if !missing_ids.is_empty() {
+        info!("📋 Synced order IDs: {:?}", missing_ids);
+    }
+    
+    // Show updated DCA summary
+    info!("📈 Updated DCA summary after sync:");
+    dca_trader.show_dca_summary().await.unwrap_or_else(|e| {
+        error!("Failed to show updated DCA summary: {}", e);
+    });
+    
+    Ok(())
+}
+
 /// Sync the database with Binance historical data
 /// This will check for missing trades from the first DCA order onwards
+/// NOTE: This function is kept for backward compatibility but check_and_sync_database is now called automatically
 async fn sync_database_with_binance(dca_trader: &DcaTrader) -> Result<()> {
     use chrono::{TimeZone, Utc};
     
