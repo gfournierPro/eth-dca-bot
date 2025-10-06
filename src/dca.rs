@@ -298,12 +298,20 @@ impl DcaTrader {
         };
 
         let now = Utc::now();
-        let twenty_four_hours_ago = now - Duration::hours(24);
+        // Look back 48 hours to be safe (in case of timezone issues or longer downtimes)
+        let lookback_time = now - Duration::hours(48);
         
-        // Get all scheduled times in the last 24 hours
+        info!("🕐 Current time: {} UTC", now.format("%Y-%m-%d %H:%M:%S"));
+        info!("🔍 Looking for scheduled times between {} UTC and {} UTC", 
+              lookback_time.format("%Y-%m-%d %H:%M:%S"),
+              now.format("%Y-%m-%d %H:%M:%S"));
+        info!("📋 Cron schedule: '{}'", self.cron_schedule);
+        
+        // Get all scheduled times in the lookback period
         let mut scheduled_times = Vec::new();
-        for scheduled_time in schedule.after(&twenty_four_hours_ago).take(100) {
+        for scheduled_time in schedule.after(&lookback_time).take(200) {
             if scheduled_time <= now {
+                info!("📅 Found scheduled time: {} UTC", scheduled_time.format("%Y-%m-%d %H:%M:%S"));
                 scheduled_times.push(scheduled_time);
             } else {
                 break;
@@ -311,11 +319,13 @@ impl DcaTrader {
         }
 
         if scheduled_times.is_empty() {
-            info!("✅ No scheduled DCA executions were planned in the last 24 hours");
+            info!("✅ No scheduled DCA executions were planned in the lookback period");
+            info!("💡 Note: Cron schedules are evaluated in UTC. Your schedule '{}' in timezone '{}' might need adjustment.", 
+                  self.cron_schedule, self.timezone);
             return Ok(());
         }
 
-        info!("📅 Found {} scheduled DCA time(s) in the last 24 hours", scheduled_times.len());
+        info!("📅 Found {} scheduled DCA time(s) in the lookback period", scheduled_times.len());
         
         // Check each scheduled time to see if we have a purchase around that time
         for scheduled_time in scheduled_times {
@@ -348,7 +358,7 @@ impl DcaTrader {
             }
         }
 
-        info!("✅ All scheduled DCA executions in the last 24h have been completed");
+        info!("✅ All scheduled DCA executions in the lookback period have been completed");
         Ok(())
     }
 
