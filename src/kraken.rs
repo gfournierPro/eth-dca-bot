@@ -203,7 +203,11 @@ impl KrakenClient {
         let response = self.client.get(&url).query(query).send().await?;
         if !response.status().is_success() {
             let text = response.text().await?;
-            return Err(anyhow!("Kraken public request to {} failed: {}", endpoint, text));
+            return Err(anyhow!(
+                "Kraken public request to {} failed: {}",
+                endpoint,
+                text
+            ));
         }
         let env: KrakenEnvelope<T> = response.json().await?;
         if !env.error.is_empty() {
@@ -241,7 +245,11 @@ impl KrakenClient {
 
         if !response.status().is_success() {
             let text = response.text().await?;
-            return Err(anyhow!("Kraken private request to {} failed: {}", endpoint, text));
+            return Err(anyhow!(
+                "Kraken private request to {} failed: {}",
+                endpoint,
+                text
+            ));
         }
 
         let env: KrakenEnvelope<T> = response.json().await?;
@@ -454,8 +462,8 @@ impl KrakenClient {
             match resting.clone() {
                 None => {
                     let remaining = quote_usdc - acc_value;
-                    let volume = (remaining / book.bid)
-                        .round_dp_with_strategy(8, RoundingStrategy::ToZero);
+                    let volume =
+                        (remaining / book.bid).round_dp_with_strategy(8, RoundingStrategy::ToZero);
                     if volume <= Decimal::ZERO {
                         break;
                     }
@@ -502,7 +510,10 @@ impl KrakenClient {
                             if q > Decimal::ZERO {
                                 filled_txids.push(txid.clone());
                             }
-                            info!("Bid moved {} -> {}, re-pegging (filled {} so far)", price, book.bid, q);
+                            info!(
+                                "Bid moved {} -> {}, re-pegging (filled {} so far)",
+                                price, book.bid, q
+                            );
                             resting = None;
                         }
                     }
@@ -605,7 +616,11 @@ impl Exchange for KrakenClient {
             .into_values()
             .next()
             .ok_or_else(|| anyhow!("Kraken returned no ticker for USDCEUR"))?;
-        let eur_per_usdc = info.c.first().map(|s| parse_dec(s)).unwrap_or(Decimal::ZERO);
+        let eur_per_usdc = info
+            .c
+            .first()
+            .map(|s| parse_dec(s))
+            .unwrap_or(Decimal::ZERO);
         if eur_per_usdc <= Decimal::ZERO {
             return Err(anyhow!("Invalid USDCEUR price from Kraken"));
         }
@@ -620,11 +635,18 @@ impl Exchange for KrakenClient {
         // overshooting the intended spend.
         let price = self.get_price(symbol).await?;
         if price <= Decimal::ZERO {
-            return Err(anyhow!("Cannot size order: non-positive price for {}", symbol));
+            return Err(anyhow!(
+                "Cannot size order: non-positive price for {}",
+                symbol
+            ));
         }
         let volume = (quote_usdc / price).round_dp_with_strategy(8, RoundingStrategy::ToZero);
         if volume <= Decimal::ZERO {
-            return Err(anyhow!("Computed order volume is zero for {} at {}", symbol, price));
+            return Err(anyhow!(
+                "Computed order volume is zero for {} at {}",
+                symbol,
+                price
+            ));
         }
 
         info!(
@@ -683,7 +705,10 @@ impl Exchange for KrakenClient {
             }
         }
 
-        Err(anyhow!("Timed out waiting for Kraken order {} to fill", txid))
+        Err(anyhow!(
+            "Timed out waiting for Kraken order {} to fill",
+            txid
+        ))
     }
 
     async fn place_limit_buy(
@@ -712,10 +737,7 @@ impl Exchange for KrakenClient {
 
         let mut purchases = Vec::new();
         for (txid, order) in result.closed {
-            if order.status != "closed"
-                || order.descr.otype != "buy"
-                || order.descr.pair != pair
-            {
+            if order.status != "closed" || order.descr.otype != "buy" || order.descr.pair != pair {
                 continue;
             }
             let executed_qty = parse_dec(&order.vol_exec);
@@ -747,7 +769,10 @@ impl Exchange for KrakenClient {
         }
 
         purchases.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        info!("Found {} DCA purchases from current month on Kraken", purchases.len());
+        info!(
+            "Found {} DCA purchases from current month on Kraken",
+            purchases.len()
+        );
         Ok(purchases)
     }
 
@@ -780,7 +805,10 @@ impl Exchange for KrakenClient {
                 Ok(true)
             }
             std::result::Result::Err(e) => {
-                warn!("Kraken withdrawal not available for {} via key '{}': {}", asset, destination, e);
+                warn!(
+                    "Kraken withdrawal not available for {} via key '{}': {}",
+                    asset, destination, e
+                );
                 Ok(false)
             }
         }
@@ -827,7 +855,8 @@ mod tests {
             "https://api.kraken.com".to_string(),
         );
         let nonce = "1616492376594";
-        let postdata = "nonce=1616492376594&ordertype=limit&pair=XBTUSD&price=37500&type=buy&volume=1.25";
+        let postdata =
+            "nonce=1616492376594&ordertype=limit&pair=XBTUSD&price=37500&type=buy&volume=1.25";
         let sig = client.sign("/0/private/AddOrder", nonce, postdata).unwrap();
         assert_eq!(
             sig,

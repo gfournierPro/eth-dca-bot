@@ -74,7 +74,10 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = env::args().collect();
     if args.len() != 3 {
-        eprintln!("Usage: {} <order_id_to_remove> <order_id_to_replace_with>", args[0]);
+        eprintln!(
+            "Usage: {} <order_id_to_remove> <order_id_to_replace_with>",
+            args[0]
+        );
         eprintln!("Example: {} 6863767683 OQCLML-BW3P3-BUCMWZ", args[0]);
         std::process::exit(1);
     }
@@ -93,11 +96,17 @@ async fn main() -> Result<()> {
     info!("Using exchange backend: {}", exchange.name());
 
     // Step 1: Remove the existing purchase from MongoDB if present.
-    info!("🔍 Checking if order {} exists in MongoDB...", order_id_to_remove);
+    info!(
+        "🔍 Checking if order {} exists in MongoDB...",
+        order_id_to_remove
+    );
     let removed_purchase = match db.get_purchase_by_order_id(&order_id_to_remove).await? {
         Some(purchase) => {
             info!("✅ Found existing purchase: {:?}", purchase);
-            info!("🗑️  Removing purchase with order ID: {}", order_id_to_remove);
+            info!(
+                "🗑️  Removing purchase with order ID: {}",
+                order_id_to_remove
+            );
             if !db.remove_purchase_by_order_id(&order_id_to_remove).await? {
                 return Err(anyhow::anyhow!(
                     "Failed to remove purchase with order ID: {}",
@@ -107,7 +116,10 @@ async fn main() -> Result<()> {
             Some(purchase)
         }
         None => {
-            info!("⚠️  No existing purchase found with order ID: {}", order_id_to_remove);
+            info!(
+                "⚠️  No existing purchase found with order ID: {}",
+                order_id_to_remove
+            );
             None
         }
     };
@@ -168,25 +180,31 @@ async fn main() -> Result<()> {
         let notion_client = NotionDCATracker::new(&config.notion, "ETH", exchange.name())?;
         // Approximate EUR using a default rate; adjust if precise EUR is needed.
         let eur_amount = new_purchase.usdc_amount * dec!(0.85);
-        notion_client.record_dca_purchase(&new_purchase, eur_amount).await?;
+        notion_client
+            .record_dca_purchase(&new_purchase, eur_amount)
+            .await?;
         info!("✅ Notion updated successfully");
     }
 
     // Step 6: Summary.
     info!("🎉 Purchase replacement completed successfully!");
     if let Some(removed) = &removed_purchase {
-        info!("REMOVED: order {} — {} USDC / {} {}",
+        info!(
+            "REMOVED: order {} — {} USDC / {} {}",
             removed.order_id,
             removed.usdc_amount.round_dp(2),
             removed.eth_amount.round_dp(6),
-            removed.symbol);
+            removed.symbol
+        );
     }
-    info!("ADDED: order {} — {} USDC / {} at ${} (fees ${})",
+    info!(
+        "ADDED: order {} — {} USDC / {} at ${} (fees ${})",
         new_purchase.order_id,
         new_purchase.usdc_amount.round_dp(2),
         new_purchase.eth_amount.round_dp(6),
         new_purchase.eth_price.round_dp(2),
-        new_purchase.fees_usdc.round_dp(4));
+        new_purchase.fees_usdc.round_dp(4)
+    );
 
     Ok(())
 }

@@ -34,9 +34,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().init();
     dotenv::dotenv().ok();
 
-    let api_key = env::var("KRAKEN_API_KEY").map_err(|_| anyhow::anyhow!("KRAKEN_API_KEY not set"))?;
-    let secret = env::var("KRAKEN_SECRET_KEY").map_err(|_| anyhow::anyhow!("KRAKEN_SECRET_KEY not set"))?;
-    let base_url = env::var("KRAKEN_BASE_URL").unwrap_or_else(|_| "https://api.kraken.com".to_string());
+    let api_key =
+        env::var("KRAKEN_API_KEY").map_err(|_| anyhow::anyhow!("KRAKEN_API_KEY not set"))?;
+    let secret =
+        env::var("KRAKEN_SECRET_KEY").map_err(|_| anyhow::anyhow!("KRAKEN_SECRET_KEY not set"))?;
+    let base_url =
+        env::var("KRAKEN_BASE_URL").unwrap_or_else(|_| "https://api.kraken.com".to_string());
 
     let client = KrakenClient::new(api_key, secret, base_url);
     let symbol = "ETHUSDC";

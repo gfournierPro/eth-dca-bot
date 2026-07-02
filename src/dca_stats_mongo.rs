@@ -145,7 +145,7 @@ impl DcaStatsDB {
 
         if let Some(doc) = cursor.try_next().await? {
             let total_purchases = doc.get_i32("total_purchases").unwrap_or(0) as i64;
-            
+
             // Try multiple field access methods to handle different MongoDB number types
             let total_usdc_invested = if let Ok(val) = doc.get_f64("total_usdc_invested") {
                 Decimal::from_f64_retain(val).unwrap_or(dec!(0))
@@ -154,7 +154,7 @@ impl DcaStatsDB {
             } else {
                 dec!(0)
             };
-            
+
             let total_eth_acquired = if let Ok(val) = doc.get_f64("total_eth_acquired") {
                 Decimal::from_f64_retain(val).unwrap_or(dec!(0))
             } else if let Ok(val) = doc.get_str("total_eth_acquired") {
@@ -162,7 +162,7 @@ impl DcaStatsDB {
             } else {
                 dec!(0)
             };
-            
+
             let total_fees_paid = if let Ok(val) = doc.get_f64("total_fees_paid") {
                 Decimal::from_f64_retain(val).unwrap_or(dec!(0))
             } else if let Ok(val) = doc.get_str("total_fees_paid") {
@@ -239,22 +239,22 @@ impl DcaStatsDB {
 
     pub async fn has_purchase_in_last_24h(&self) -> Result<bool> {
         let twenty_four_hours_ago = chrono::Utc::now() - chrono::Duration::hours(24);
-        
+
         let filter = doc! {
             "timestamp": {
                 "$gte": twenty_four_hours_ago.to_rfc3339()
             },
             "status": "FILLED"
         };
-        
+
         let count = self.collection.count_documents(filter).await?;
         Ok(count > 0)
     }
 
     pub async fn has_purchase_in_time_window(
-        &self, 
-        start: chrono::DateTime<chrono::Utc>, 
-        end: chrono::DateTime<chrono::Utc>
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool> {
         let filter = doc! {
             "timestamp": {
@@ -263,7 +263,7 @@ impl DcaStatsDB {
             },
             "status": "FILLED"
         };
-        
+
         let count = self.collection.count_documents(filter).await?;
         Ok(count > 0)
     }
@@ -353,8 +353,16 @@ pub fn print_recent_purchases(asset: &str, purchases: &[DcaPurchase]) {
             purchase.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
         );
         info!("║ USDC Spent: ${:>47} ║", purchase.usdc_amount.round_dp(2));
-        info!("║ {:>3} Acquired: {:>45} ║", asset, purchase.eth_amount.round_dp(6));
-        info!("║ {:>3} Price: ${:>48} ║", asset, purchase.eth_price.round_dp(2));
+        info!(
+            "║ {:>3} Acquired: {:>45} ║",
+            asset,
+            purchase.eth_amount.round_dp(6)
+        );
+        info!(
+            "║ {:>3} Price: ${:>48} ║",
+            asset,
+            purchase.eth_price.round_dp(2)
+        );
         info!("║ Fees: ${:>53} ║", purchase.fees_usdc.round_dp(4));
         info!("║ Order ID: {:>49} ║", purchase.order_id);
     }

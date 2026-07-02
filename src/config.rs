@@ -112,7 +112,7 @@ impl Default for Config {
                 symbol: "ETHUSDC".to_string(),
                 buy_amount_eur: Decimal::new(100, 0), // Default to €100
                 min_balance_usdc: Decimal::new(50, 0), // Default to $50
-                max_slippage: Decimal::new(1, 2),      // Default to 1%
+                max_slippage: Decimal::new(1, 2),     // Default to 1%
             },
             schedule: ScheduleConfig {
                 cron_expression: "0 30 5 * * MON".to_string(),
@@ -128,7 +128,7 @@ impl Default for Config {
                 cold_wallet_address: "0xa416610975634033374EEdAE26D0FCa7A7360b70".to_string(),
                 network: "ARBITRUM".to_string(), // Correct network name for Arbitrum One
                 min_eth_threshold: Decimal::new(3, 4), // 0.0003 ETH minimum
-                withdrawal_amount: None, // Withdraw all available ETH
+                withdrawal_amount: None,         // Withdraw all available ETH
             },
             btc: None,
         }
@@ -177,7 +177,7 @@ impl AssetDcaConfig {
                 cold_wallet_address: String::new(),
                 network: "BTC".to_string(), // Native Bitcoin network
                 min_eth_threshold: Decimal::new(1, 4), // 0.0001 BTC minimum (field name is generic threshold)
-                withdrawal_amount: None, // Withdraw all available BTC
+                withdrawal_amount: None,               // Withdraw all available BTC
             },
         }
     }

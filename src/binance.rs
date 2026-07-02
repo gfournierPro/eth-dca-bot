@@ -1,17 +1,17 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 
+use crate::dca_stats_mongo::DcaPurchase;
+use crate::exchange::{Exchange, OrderOutcome};
 use anyhow::{Ok, Result, anyhow};
 use async_trait::async_trait;
-use chrono::{Utc, Datelike, TimeZone};
+use chrono::{Datelike, TimeZone, Utc};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use sha2::Sha256;
 use tracing::{error, info, warn};
-use crate::dca_stats_mongo::DcaPurchase;
-use crate::exchange::{Exchange, OrderOutcome};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -128,7 +128,7 @@ impl BinanceClient {
         mac.update(query_string.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
-    
+
     async fn signed_request<T: for<'de> Deserialize<'de>>(
         &self,
         method: &str,
@@ -220,7 +220,7 @@ impl BinanceClient {
         info!("Current {} price {}", symbol, price);
         Ok(price)
     }
-    
+
     pub async fn place_market_buy_order(
         &self,
         symbol: &str,
@@ -229,7 +229,7 @@ impl BinanceClient {
         // Round quote order quantity to 2 decimal places for USDC pairs
         // Binance requires specific precision for quote order quantities
         let rounded_qty = quote_order_qty.round_dp(2);
-        
+
         let mut params = HashMap::new();
         params.insert("symbol".to_string(), symbol.to_string());
         params.insert("side".to_string(), "BUY".to_string());
@@ -257,15 +257,15 @@ impl BinanceClient {
     ) -> Result<Vec<Order>> {
         let mut params = HashMap::new();
         params.insert("symbol".to_string(), symbol.to_string());
-        
+
         if let Some(start) = start_time {
             params.insert("startTime".to_string(), start.to_string());
         }
-        
+
         if let Some(end) = end_time {
             params.insert("endTime".to_string(), end.to_string());
         }
-        
+
         if let Some(lim) = limit {
             params.insert("limit".to_string(), lim.to_string());
         }
@@ -274,7 +274,7 @@ impl BinanceClient {
         let orders: Vec<Order> = self
             .signed_request("GET", "/api/v3/allOrders", params)
             .await?;
-        
+
         info!("Retrieved {} orders from Binance", orders.len());
         Ok(orders)
     }
@@ -285,29 +285,32 @@ impl BinanceClient {
             .with_ymd_and_hms(now.year() as i32, now.month(), 1, 0, 0, 0)
             .unwrap();
         let start_timestamp = start_of_month.timestamp_millis();
-        
-        let orders = self.get_order_history(
-            symbol,
-            Some(start_timestamp),
-            None,
-            Some(1000), // Limit to 1000 orders
-        ).await?;
+
+        let orders = self
+            .get_order_history(
+                symbol,
+                Some(start_timestamp),
+                None,
+                Some(1000), // Limit to 1000 orders
+            )
+            .await?;
 
         let mut purchases = Vec::new();
-        
+
         for order in orders {
             // Only process filled buy orders
             if order.status == "FILLED" && order.side == "BUY" {
                 let executed_qty: Decimal = order.executed_qty.parse().unwrap_or(dec!(0));
-                let executed_value: Decimal = order.cummulative_quote_qty.parse().unwrap_or(dec!(0));
-                
+                let executed_value: Decimal =
+                    order.cummulative_quote_qty.parse().unwrap_or(dec!(0));
+
                 if executed_qty > dec!(0) && executed_value > dec!(0) {
                     let average_price = executed_value / executed_qty;
                     let timestamp = Utc.timestamp_millis_opt(order.time).unwrap();
-                    
+
                     // Estimate fees as 0.1% of trade value since we don't have fill details
                     let estimated_fees = executed_value * dec!(0.001);
-                    
+
                     let purchase = DcaPurchase {
                         id: Uuid::new_v4().to_string(),
                         timestamp,
@@ -319,16 +322,19 @@ impl BinanceClient {
                         order_id: order.order_id.to_string(),
                         status: order.status.clone(),
                     };
-                    
+
                     purchases.push(purchase);
                 }
             }
         }
-        
+
         // Sort by timestamp in descending order (most recent first)
         purchases.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        
-        info!("Found {} DCA purchases from current month on Binance", purchases.len());
+
+        info!(
+            "Found {} DCA purchases from current month on Binance",
+            purchases.len()
+        );
         Ok(purchases)
     }
 
@@ -350,14 +356,13 @@ impl BinanceClient {
             coin, amount, coin, address, network
         );
 
-        let result = self.signed_request::<WithdrawResponse>("POST", "/sapi/v1/capital/withdraw/apply", params).await;
-        
+        let result = self
+            .signed_request::<WithdrawResponse>("POST", "/sapi/v1/capital/withdraw/apply", params)
+            .await;
+
         match result {
             std::result::Result::Ok(response) => {
-                info!(
-                    "Withdrawal initiated successfully. ID: {}",
-                    response.id
-                );
+                info!("Withdrawal initiated successfully. ID: {}", response.id);
                 Ok(response)
             }
             std::result::Result::Err(e) => {
@@ -382,19 +387,23 @@ impl BinanceClient {
 
     pub async fn check_withdrawal_capability(&self, coin: &str) -> Result<bool> {
         info!("Checking withdrawal capability for {}", coin);
-        
+
         let params = HashMap::new();
-        
-        match self.signed_request::<serde_json::Value>("GET", "/sapi/v1/capital/config/getall", params).await {
+
+        match self
+            .signed_request::<serde_json::Value>("GET", "/sapi/v1/capital/config/getall", params)
+            .await
+        {
             std::result::Result::Ok(response) => {
                 // Parse the response to check if the coin supports withdrawals
                 if let Some(coins) = response.as_array() {
                     for (index, coin_info) in coins.iter().enumerate() {
                         if let Some(coin_name) = coin_info.get("coin").and_then(|c| c.as_str()) {
                             if coin_name == coin {
-                                
                                 // Check the overall withdrawal capability first
-                                if let Some(withdraw_all_enable) = coin_info.get("withdrawAllEnable").and_then(|w| w.as_bool()) {
+                                if let Some(withdraw_all_enable) =
+                                    coin_info.get("withdrawAllEnable").and_then(|w| w.as_bool())
+                                {
                                     if !withdraw_all_enable {
                                         info!("Withdrawal disabled for {} at coin level", coin);
                                         return Ok(false);
@@ -402,40 +411,59 @@ impl BinanceClient {
                                 } else {
                                     warn!("withdrawAllEnable field not found for {}", coin);
                                 }
-                                
+
                                 // Check if there are network-specific settings
-                                if let Some(network_list) = coin_info.get("networkList").and_then(|n| n.as_array()) {
+                                if let Some(network_list) =
+                                    coin_info.get("networkList").and_then(|n| n.as_array())
+                                {
                                     // Log all available networks
                                     let mut networks = Vec::new();
                                     for network in network_list {
-                                        if let Some(network_name) = network.get("network").and_then(|n| n.as_str()) {
-                                            if let Some(withdraw_enable) = network.get("withdrawEnable").and_then(|w| w.as_bool()) {
-                                                networks.push(format!("{}: {}", network_name, if withdraw_enable { "✅" } else { "❌" }));
+                                        if let Some(network_name) =
+                                            network.get("network").and_then(|n| n.as_str())
+                                        {
+                                            if let Some(withdraw_enable) = network
+                                                .get("withdrawEnable")
+                                                .and_then(|w| w.as_bool())
+                                            {
+                                                networks.push(format!(
+                                                    "{}: {}",
+                                                    network_name,
+                                                    if withdraw_enable { "✅" } else { "❌" }
+                                                ));
                                             }
                                         }
                                     }
                                     return Ok(true);
                                 } else {
                                     // Fallback to the old logic if no networkList
-                                    if let Some(withdraw_enable) = coin_info.get("withdrawEnable").and_then(|w| w.as_bool()) {
-                                        info!("Withdrawal enabled for {}: {}", coin, withdraw_enable);
+                                    if let Some(withdraw_enable) =
+                                        coin_info.get("withdrawEnable").and_then(|w| w.as_bool())
+                                    {
+                                        info!(
+                                            "Withdrawal enabled for {}: {}",
+                                            coin, withdraw_enable
+                                        );
                                         return Ok(withdraw_enable);
                                     } else {
-                                        warn!("No networkList and no withdrawEnable field found for {}", coin);
+                                        warn!(
+                                            "No networkList and no withdrawEnable field found for {}",
+                                            coin
+                                        );
                                         return Ok(false);
                                     }
                                 }
                             }
                         }
                     }
-                    
+
                     // If we didn't find the coin, let's list all available coins
                     info!("🔍 Coin '{}' not found", coin);
                 } else {
                     warn!("Response is not an array");
                     info!("Response type: {:?}", response);
                 }
-                
+
                 warn!("Could not determine withdrawal capability for {}", coin);
                 Ok(false)
             }
@@ -447,31 +475,60 @@ impl BinanceClient {
         }
     }
 
-    pub async fn check_network_withdrawal_capability(&self, coin: &str, network: &str) -> Result<bool> {
+    pub async fn check_network_withdrawal_capability(
+        &self,
+        coin: &str,
+        network: &str,
+    ) -> Result<bool> {
         let params = HashMap::new();
-        
-        match self.signed_request::<serde_json::Value>("GET", "/sapi/v1/capital/config/getall", params).await {
+
+        match self
+            .signed_request::<serde_json::Value>("GET", "/sapi/v1/capital/config/getall", params)
+            .await
+        {
             std::result::Result::Ok(response) => {
                 if let Some(coins) = response.as_array() {
                     for coin_info in coins {
                         if let Some(coin_name) = coin_info.get("coin").and_then(|c| c.as_str()) {
                             if coin_name == coin {
                                 // Check network-specific withdrawal capability
-                                if let Some(network_list) = coin_info.get("networkList").and_then(|n| n.as_array()) {
+                                if let Some(network_list) =
+                                    coin_info.get("networkList").and_then(|n| n.as_array())
+                                {
                                     for network_info in network_list {
-                                        if let Some(network_name) = network_info.get("network").and_then(|n| n.as_str()) {
+                                        if let Some(network_name) =
+                                            network_info.get("network").and_then(|n| n.as_str())
+                                        {
                                             if network_name == network {
-                                                if let Some(withdraw_enable) = network_info.get("withdrawEnable").and_then(|w| w.as_bool()) {
-                                                    info!("Network {} withdrawal for {}: {}", network, coin, withdraw_enable);
-                                                    
+                                                if let Some(withdraw_enable) = network_info
+                                                    .get("withdrawEnable")
+                                                    .and_then(|w| w.as_bool())
+                                                {
+                                                    info!(
+                                                        "Network {} withdrawal for {}: {}",
+                                                        network, coin, withdraw_enable
+                                                    );
+
                                                     // Also log withdrawal limits and fees
-                                                    if let Some(withdraw_min) = network_info.get("withdrawMin").and_then(|w| w.as_str()) {
-                                                        info!("Minimum withdrawal: {} {}", withdraw_min, coin);
+                                                    if let Some(withdraw_min) = network_info
+                                                        .get("withdrawMin")
+                                                        .and_then(|w| w.as_str())
+                                                    {
+                                                        info!(
+                                                            "Minimum withdrawal: {} {}",
+                                                            withdraw_min, coin
+                                                        );
                                                     }
-                                                    if let Some(withdraw_fee) = network_info.get("withdrawFee").and_then(|w| w.as_str()) {
-                                                        info!("Withdrawal fee: {} {}", withdraw_fee, coin);
+                                                    if let Some(withdraw_fee) = network_info
+                                                        .get("withdrawFee")
+                                                        .and_then(|w| w.as_str())
+                                                    {
+                                                        info!(
+                                                            "Withdrawal fee: {} {}",
+                                                            withdraw_fee, coin
+                                                        );
                                                     }
-                                                    
+
                                                     return Ok(withdraw_enable);
                                                 }
                                             }
@@ -557,7 +614,8 @@ impl Exchange for BinanceClient {
         if !coin_ok {
             return Ok(false);
         }
-        self.check_network_withdrawal_capability(asset, network).await
+        self.check_network_withdrawal_capability(asset, network)
+            .await
     }
 
     async fn withdraw(
@@ -567,7 +625,9 @@ impl Exchange for BinanceClient {
         amount: Decimal,
         network: &str,
     ) -> Result<String> {
-        let response = self.withdraw_asset(asset, destination, amount, network).await?;
+        let response = self
+            .withdraw_asset(asset, destination, amount, network)
+            .await?;
         Ok(response.id)
     }
 }

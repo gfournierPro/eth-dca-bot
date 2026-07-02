@@ -1,17 +1,17 @@
-use crate::config::{TradingConfig, NotionConfig, WithdrawalConfig};
+use crate::config::{NotionConfig, TradingConfig, WithdrawalConfig};
+use crate::date_utils::should_check_withdrawal;
+use crate::dca_stats_mongo::DcaStatsDB;
 use crate::dca_stats_mongo::{DcaPurchase, print_dca_summary, print_recent_purchases};
 use crate::exchange::{Exchange, LimitBuyConfig};
 use crate::notion_integration::NotionDCATracker;
-use crate::dca_stats_mongo::DcaStatsDB;
-use crate::date_utils::should_check_withdrawal;
 use anyhow::{Result, anyhow};
-use chrono::{Utc, DateTime, Duration};
-use rust_decimal::Decimal;
-use tracing::{error, info, warn};
-use uuid::Uuid;
+use chrono::{DateTime, Duration, Utc};
 use cron::Schedule;
+use rust_decimal::Decimal;
 use std::str::FromStr;
 use std::sync::Arc;
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct DcaTrader {
@@ -52,11 +52,17 @@ impl DcaTrader {
                     }
                 }
             } else {
-                info!("[{}] Notion integration disabled: configuration incomplete", asset);
+                info!(
+                    "[{}] Notion integration disabled: configuration incomplete",
+                    asset
+                );
                 None
             }
         } else {
-            info!("[{}] Notion integration disabled: no configuration provided", asset);
+            info!(
+                "[{}] Notion integration disabled: no configuration provided",
+                asset
+            );
             None
         };
 
@@ -79,8 +85,10 @@ impl DcaTrader {
         let eur_usdc_price = self.exchange.get_usdc_per_eur().await?;
         let target_usdc_amount = self.trading_config.buy_amount_eur * eur_usdc_price;
 
-        info!("EUR/USDC rate: {} - Converting {} EUR to {} USDC",
-              eur_usdc_price, self.trading_config.buy_amount_eur, target_usdc_amount);
+        info!(
+            "EUR/USDC rate: {} - Converting {} EUR to {} USDC",
+            eur_usdc_price, self.trading_config.buy_amount_eur, target_usdc_amount
+        );
 
         let usdc_balance = self.exchange.get_usdc_balance().await?;
         if usdc_balance < self.trading_config.min_balance_usdc {
@@ -108,10 +116,7 @@ impl DcaTrader {
             return Err(anyhow!(error_msg));
         }
 
-        let current_price = self
-            .exchange
-            .get_price(&self.trading_config.symbol)
-            .await?;
+        let current_price = self.exchange.get_price(&self.trading_config.symbol).await?;
 
         let estimated_eth = purchase_amount / current_price;
         info!("Current {} price: {} USDC", self.asset, current_price);
@@ -175,8 +180,16 @@ impl DcaTrader {
         info!("║ Status: {:>27} ║", order_result.status);
         info!("║ EUR Spent: €{:>23} ║", actual_eur_spent.round_dp(2));
         info!("║ USDC Spent: ${:>22} ║", executed_value.round_dp(2));
-        info!("║ {:>3} Acquired: {:>21} ║", self.asset, executed_qty.round_dp(6));
-        info!("║ {:>3} Price: ${:>23} ║", self.asset, average_price.round_dp(2));
+        info!(
+            "║ {:>3} Acquired: {:>21} ║",
+            self.asset,
+            executed_qty.round_dp(6)
+        );
+        info!(
+            "║ {:>3} Price: ${:>23} ║",
+            self.asset,
+            average_price.round_dp(2)
+        );
         info!("║ Fees Paid: ${:>23} ║", fees_usdc.round_dp(4));
         info!("║ EUR/USDC Rate: {:>20} ║", eur_usd_price.round_dp(4));
         info!("╚═══════════════════════════════════════╝");
@@ -207,10 +220,7 @@ impl DcaTrader {
         Ok(())
     }
     pub async fn show_dca_summary(&self) -> Result<()> {
-        let current_price = self
-            .exchange
-            .get_price(&self.trading_config.symbol)
-            .await?;
+        let current_price = self.exchange.get_price(&self.trading_config.symbol).await?;
         let summary = self.stats_db.get_summary(current_price).await?;
         print_dca_summary(&self.asset, &summary);
 
@@ -219,15 +229,29 @@ impl DcaTrader {
         // If no recent purchases found in database, try to fetch from the exchange
         if recent_purchases.is_empty() {
             let source = self.exchange.name();
-            info!("📝 No recent purchases found in database, fetching from {}...", source);
-            match self.exchange.get_current_month_purchases(&self.trading_config.symbol).await {
+            info!(
+                "📝 No recent purchases found in database, fetching from {}...",
+                source
+            );
+            match self
+                .exchange
+                .get_current_month_purchases(&self.trading_config.symbol)
+                .await
+            {
                 Ok(exchange_purchases) => {
                     if !exchange_purchases.is_empty() {
-                        info!("✅ Found {} purchases from current month on {}", exchange_purchases.len(), source);
+                        info!(
+                            "✅ Found {} purchases from current month on {}",
+                            exchange_purchases.len(),
+                            source
+                        );
                         // Take only the 5 most recent ones
                         recent_purchases = exchange_purchases.into_iter().take(5).collect();
                     } else {
-                        info!("📝 No purchases found for current month on {} either", source);
+                        info!(
+                            "📝 No purchases found for current month on {} either",
+                            source
+                        );
                     }
                 }
                 Err(e) => {
@@ -242,19 +266,22 @@ impl DcaTrader {
 
     pub async fn check_and_execute_startup_dca(&self) -> Result<()> {
         info!("🔍 Checking if a scheduled DCA was missed and needs to be executed...");
-        
+
         // Parse the cron schedule
         let schedule = match Schedule::from_str(&self.cron_schedule) {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to parse cron schedule '{}': {}", self.cron_schedule, e);
+                error!(
+                    "Failed to parse cron schedule '{}': {}",
+                    self.cron_schedule, e
+                );
                 return Err(anyhow!("Invalid cron schedule"));
             }
         };
 
         let now = Utc::now();
         let twenty_four_hours_ago = now - Duration::hours(24);
-        
+
         // Get all scheduled times in the last 24 hours
         let mut scheduled_times = Vec::new();
         for scheduled_time in schedule.after(&twenty_four_hours_ago).take(100) {
@@ -270,24 +297,34 @@ impl DcaTrader {
             return Ok(());
         }
 
-        info!("📅 Found {} scheduled DCA time(s) in the last 24 hours", scheduled_times.len());
-        
+        info!(
+            "📅 Found {} scheduled DCA time(s) in the last 24 hours",
+            scheduled_times.len()
+        );
+
         // Check each scheduled time to see if we have a purchase around that time
         for scheduled_time in scheduled_times {
             let window_start = scheduled_time - Duration::hours(4); // 30min before
-            let window_end = scheduled_time + Duration::hours(4);      // 2h after (generous window)
-            
+            let window_end = scheduled_time + Duration::hours(4); // 2h after (generous window)
+
             // Check if we have any purchase in the window around this scheduled time
-            let has_purchase_for_schedule = self.has_purchase_in_time_window(window_start, window_end).await?;
-            
+            let has_purchase_for_schedule = self
+                .has_purchase_in_time_window(window_start, window_end)
+                .await?;
+
             if !has_purchase_for_schedule {
-                info!("❌ Missing DCA purchase for scheduled time: {} (checking window {} to {})", 
-                     scheduled_time.format("%Y-%m-%d %H:%M:%S UTC"),
-                     window_start.format("%Y-%m-%d %H:%M:%S UTC"),
-                     window_end.format("%Y-%m-%d %H:%M:%S UTC"));
-                
+                info!(
+                    "❌ Missing DCA purchase for scheduled time: {} (checking window {} to {})",
+                    scheduled_time.format("%Y-%m-%d %H:%M:%S UTC"),
+                    window_start.format("%Y-%m-%d %H:%M:%S UTC"),
+                    window_end.format("%Y-%m-%d %H:%M:%S UTC")
+                );
+
                 // Execute the missed DCA
-                info!("🚀 Executing missed DCA for scheduled time: {}", scheduled_time.format("%Y-%m-%d %H:%M:%S UTC"));
+                info!(
+                    "🚀 Executing missed DCA for scheduled time: {}",
+                    scheduled_time.format("%Y-%m-%d %H:%M:%S UTC")
+                );
                 match self.execute_dca_purchase().await {
                     Ok(()) => {
                         info!("✅ Missed DCA purchase completed successfully!");
@@ -299,7 +336,10 @@ impl DcaTrader {
                     }
                 }
             } else {
-                info!("✅ Found DCA purchase for scheduled time: {}", scheduled_time.format("%Y-%m-%d %H:%M:%S UTC"));
+                info!(
+                    "✅ Found DCA purchase for scheduled time: {}",
+                    scheduled_time.format("%Y-%m-%d %H:%M:%S UTC")
+                );
             }
         }
 
@@ -307,15 +347,24 @@ impl DcaTrader {
         Ok(())
     }
 
-    async fn has_purchase_in_time_window(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<bool> {
+    async fn has_purchase_in_time_window(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<bool> {
         // First check database
         match self.stats_db.has_purchase_in_time_window(start, end).await {
             Ok(has_purchase) => Ok(has_purchase),
             Err(e) => {
                 warn!("⚠️  Failed to check purchases in database: {}", e);
                 // Fallback: check from the exchange
-                let exchange_purchases = self.exchange.get_current_month_purchases(&self.trading_config.symbol).await?;
-                Ok(exchange_purchases.iter().any(|p| p.timestamp >= start && p.timestamp <= end))
+                let exchange_purchases = self
+                    .exchange
+                    .get_current_month_purchases(&self.trading_config.symbol)
+                    .await?;
+                Ok(exchange_purchases
+                    .iter()
+                    .any(|p| p.timestamp >= start && p.timestamp <= end))
             }
         }
     }
@@ -347,7 +396,9 @@ impl DcaTrader {
             return Ok(());
         }
 
-        let withdrawal_amount = self.withdrawal_config.withdrawal_amount
+        let withdrawal_amount = self
+            .withdrawal_config
+            .withdrawal_amount
             .unwrap_or(asset_balance);
 
         if withdrawal_amount > asset_balance {
@@ -361,20 +412,32 @@ impl DcaTrader {
 
         // Verify the withdrawal is possible before attempting it. On Binance this
         // checks coin/network availability; on Kraken it validates the withdrawal key.
-        match self.exchange.verify_withdrawal(
-            coin,
-            destination,
-            &self.withdrawal_config.network,
-            actual_withdrawal_amount,
-        ).await {
+        match self
+            .exchange
+            .verify_withdrawal(
+                coin,
+                destination,
+                &self.withdrawal_config.network,
+                actual_withdrawal_amount,
+            )
+            .await
+        {
             Ok(true) => {
-                info!("Withdrawal of {} {} verified as available", actual_withdrawal_amount, coin);
+                info!(
+                    "Withdrawal of {} {} verified as available",
+                    actual_withdrawal_amount, coin
+                );
             }
             Ok(false) => {
-                warn!("⚠️  {} withdrawals are not currently available for this destination", coin);
+                warn!(
+                    "⚠️  {} withdrawals are not currently available for this destination",
+                    coin
+                );
                 warn!("💡 Please check:");
                 warn!("   • API key withdrawal permissions");
-                warn!("   • That the destination address/withdrawal key is registered on the exchange");
+                warn!(
+                    "   • That the destination address/withdrawal key is registered on the exchange"
+                );
                 warn!("   • Regional restrictions and account security settings");
                 return Ok(());
             }
@@ -384,14 +447,21 @@ impl DcaTrader {
             }
         }
 
-        info!("💸 Initiating withdrawal of {} {} to cold wallet", actual_withdrawal_amount, coin);
+        info!(
+            "💸 Initiating withdrawal of {} {} to cold wallet",
+            actual_withdrawal_amount, coin
+        );
 
-        match self.exchange.withdraw(
-            coin,
-            destination,
-            actual_withdrawal_amount,
-            &self.withdrawal_config.network,
-        ).await {
+        match self
+            .exchange
+            .withdraw(
+                coin,
+                destination,
+                actual_withdrawal_amount,
+                &self.withdrawal_config.network,
+            )
+            .await
+        {
             Ok(withdrawal_id) => {
                 info!("✅ Withdrawal initiated successfully!");
                 info!("Withdrawal ID: {}", withdrawal_id);
@@ -400,19 +470,27 @@ impl DcaTrader {
                 info!("╔═══════════════════════════════════════╗");
                 info!("║         💸 WITHDRAWAL DETAILS         ║");
                 info!("╠═══════════════════════════════════════╣");
-                info!("║ Amount: {:>23} {:>3} ║", actual_withdrawal_amount.round_dp(6), coin);
+                info!(
+                    "║ Amount: {:>23} {:>3} ║",
+                    actual_withdrawal_amount.round_dp(6),
+                    coin
+                );
                 info!("║ Network: {:>26} ║", self.withdrawal_config.network);
                 // `destination` is a raw address on Binance or a withdrawal-key name on
                 // Kraken; only abbreviate when it's long enough to be a real address.
                 let dest_display = if destination.len() > 12 {
-                    format!("{}...{}", &destination[..6], &destination[destination.len() - 4..])
+                    format!(
+                        "{}...{}",
+                        &destination[..6],
+                        &destination[destination.len() - 4..]
+                    )
                 } else {
                     destination.to_string()
                 };
                 info!("║ Destination: {:>22} ║", dest_display);
                 info!("║ Withdrawal ID: {:>21} ║", withdrawal_id);
                 info!("╚═══════════════════════════════════════╝");
-                
+
                 Ok(())
             }
             Err(e) => {
