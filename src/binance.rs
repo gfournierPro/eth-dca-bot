@@ -126,6 +126,7 @@ impl BinanceClient {
         mac.update(query_string.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
+    
     async fn signed_request<T: for<'de> Deserialize<'de>>(
         &self,
         method: &str,
@@ -195,17 +196,17 @@ impl BinanceClient {
         Ok(Decimal::ZERO)
     }
 
-    pub async fn get_eth_balance(&self) -> Result<Decimal> {
+    pub async fn get_asset_balance(&self, asset: &str) -> Result<Decimal> {
         let account_info = self.get_account_info().await?;
 
         for balance in account_info.balances {
-            if balance.asset == "ETH" {
+            if balance.asset == asset {
                 let free_balance = balance.free.parse::<Decimal>()?;
-                info!("ETH balance: {}", free_balance);
+                info!("{} balance: {}", asset, free_balance);
                 return Ok(free_balance);
             }
         }
-        warn!("ETH balance not found, returning 0");
+        warn!("{} balance not found, returning 0", asset);
         Ok(Decimal::ZERO)
     }
 
@@ -217,6 +218,7 @@ impl BinanceClient {
         info!("Current {} price {}", symbol, price);
         Ok(price)
     }
+    
     pub async fn place_market_buy_order(
         &self,
         symbol: &str,
@@ -328,21 +330,22 @@ impl BinanceClient {
         Ok(purchases)
     }
 
-    pub async fn withdraw_eth(
+    pub async fn withdraw_asset(
         &self,
+        coin: &str,
         address: &str,
         amount: Decimal,
         network: &str,
     ) -> Result<WithdrawResponse> {
         let mut params = HashMap::new();
-        params.insert("coin".to_string(), "ETH".to_string());
+        params.insert("coin".to_string(), coin.to_string());
         params.insert("address".to_string(), address.to_string());
         params.insert("amount".to_string(), amount.to_string());
         params.insert("network".to_string(), network.to_string());
 
         info!(
-            "Initiating ETH withdrawal: {} ETH to {} on {} network",
-            amount, address, network
+            "Initiating {} withdrawal: {} {} to {} on {} network",
+            coin, amount, coin, address, network
         );
 
         let result = self.signed_request::<WithdrawResponse>("POST", "/sapi/v1/capital/withdraw/apply", params).await;
@@ -358,12 +361,12 @@ impl BinanceClient {
             std::result::Result::Err(e) => {
                 let error_msg = format!("{}", e);
                 if error_msg.contains("-4019") {
-                    error!("❌ ETH withdrawal not available. Possible reasons:");
+                    error!("❌ {} withdrawal not available. Possible reasons:", coin);
                     error!("   • Withdrawals disabled for your account/region");
                     error!("   • API key lacks withdrawal permissions");
                     error!("   • Account verification incomplete");
                     error!("   • Security restrictions (2FA, email confirmation)");
-                    error!("   • Network '{}' not supported for ETH", network);
+                    error!("   • Network '{}' not supported for {}", network, coin);
                     error!("💡 Check your Binance account settings and API permissions");
                 } else if error_msg.contains("-1013") {
                     error!("❌ Invalid withdrawal amount or network configuration");
@@ -373,37 +376,6 @@ impl BinanceClient {
                 Err(e)
             }
         }
-    }
-
-    pub async fn get_withdraw_history(
-        &self,
-        coin: &str,
-        start_time: Option<i64>,
-        end_time: Option<i64>,
-        limit: Option<u16>,
-    ) -> Result<Vec<WithdrawHistory>> {
-        let mut params = HashMap::new();
-        params.insert("coin".to_string(), coin.to_string());
-        
-        if let Some(start) = start_time {
-            params.insert("startTime".to_string(), start.to_string());
-        }
-        
-        if let Some(end) = end_time {
-            params.insert("endTime".to_string(), end.to_string());
-        }
-        
-        if let Some(lim) = limit {
-            params.insert("limit".to_string(), lim.to_string());
-        }
-
-        info!("Fetching withdrawal history for {}", coin);
-        let withdrawals: Vec<WithdrawHistory> = self
-            .signed_request("GET", "/sapi/v1/capital/withdraw/history", params)
-            .await?;
-        
-        info!("Retrieved {} withdrawal records", withdrawals.len());
-        Ok(withdrawals)
     }
 
     pub async fn check_withdrawal_capability(&self, coin: &str) -> Result<bool> {
@@ -522,25 +494,22 @@ impl BinanceClient {
 }
 
 impl OrderResponse {
-    pub fn calculate_total_fees_in_usdc(&self, eth_price: Decimal) -> Decimal {
+    /// Sum trading fees in USDC. Commissions paid in the base asset (ETH/BTC) are
+    /// converted using `asset_price`; commissions paid in USDC are taken as-is.
+    pub fn calculate_total_fees_in_usdc(&self, asset: &str, asset_price: Decimal) -> Decimal {
         if let Some(fills) = &self.fills {
             let mut total_fee_usdc = dec!(0);
 
             for fill in fills {
                 let commission: Decimal = fill.commission.parse().unwrap_or(dec!(0));
 
-                match fill.commission_asset.as_str() {
-                    "USDC" => total_fee_usdc += commission,
-                    "ETH" => total_fee_usdc += commission * eth_price,
-                    "BNB" => {
-                        // You might want to get BNB price and convert
-                        // For now, we'll estimate BNB at ~$300 (update as needed)
-                        total_fee_usdc += commission * dec!(300);
-                    }
-                    _ => {
-                        // Unknown asset, log warning
-                        tracing::warn!("Unknown commission asset: {}", fill.commission_asset);
-                    }
+                if fill.commission_asset == "USDC" {
+                    total_fee_usdc += commission;
+                } else if fill.commission_asset == asset {
+                    total_fee_usdc += commission * asset_price;
+                } else {
+                    // Unknown asset, log warning
+                    tracing::warn!("Unknown commission asset: {}", fill.commission_asset);
                 }
             }
             total_fee_usdc

@@ -37,10 +37,11 @@ pub struct NotionDCATracker {
     client: NotionClient,
     database_id: String,
     cold_wallet_address: String,
+    asset: String,
 }
 
 impl NotionDCATracker {
-    pub fn new(config: &NotionConfig) -> Result<Self> {
+    pub fn new(config: &NotionConfig, asset: &str) -> Result<Self> {
         if config.token.is_empty() {
             return Err(anyhow!("Notion token is required"));
         }
@@ -49,7 +50,7 @@ impl NotionDCATracker {
         }
 
         let client = NotionClient::new(config.token.clone(), None)?;
-        info!("Notion integration initialized");
+        info!("Notion integration initialized for {}", asset);
         info!("Database ID: {}", &config.database_id[..8]);
         info!("Cold wallet: {}", config.cold_wallet_address);
 
@@ -57,6 +58,7 @@ impl NotionDCATracker {
             client,
             database_id: config.database_id.clone(),
             cold_wallet_address: config.cold_wallet_address.clone(),
+            asset: asset.to_string(),
         })
     }
 
@@ -351,8 +353,8 @@ impl NotionDCATracker {
         let new_currency_eth = current_data.currency_eth + purchase.eth_amount;
         let new_eur_amount = current_data.eur + eur_amount;
 
-        // Generate Arbitrum link placeholder (you'll need to implement actual transfer tracking)
-        let arbitrum_link = format!("https://arbiscan.io/address/{}", self.cold_wallet_address);
+        // Generate cold-wallet explorer link (placeholder until transfer tracking exists)
+        let arbitrum_link = self.explorer_link();
 
         let update_request = UpdatePagePropertiesRequest {
             properties: {
@@ -421,13 +423,24 @@ impl NotionDCATracker {
 
         info!(" Updated monthly accumulation:");
         info!(
-            "    Total ETH this month: {} ETH",
-            new_currency_eth.round_dp(6)
+            "    Total {} this month: {} {}",
+            self.asset,
+            new_currency_eth.round_dp(6),
+            self.asset
         );
         info!("    Total EUR spent: €{}", new_eur_amount.round_dp(2));
-        info!("     Total trading fees: {} ETH", new_trading_fee.round_dp(6));
+        info!("     Total trading fees: {} {}", new_trading_fee.round_dp(6), self.asset);
 
         Ok(())
+    }
+
+    /// Cold-wallet explorer URL appropriate for the asset's settlement network.
+    fn explorer_link(&self) -> String {
+        match self.asset.as_str() {
+            "BTC" => format!("https://mempool.space/address/{}", self.cold_wallet_address),
+            // ETH (and other EVM assets) default to the Arbitrum explorer used today.
+            _ => format!("https://arbiscan.io/address/{}", self.cold_wallet_address),
+        }
     }
 
     async fn get_current_page_data(&self, page_id: &str) -> Result<MonthlyDCAData> {
@@ -500,13 +513,15 @@ impl NotionDCATracker {
         
         // Format the purchase details with real data
         let title_line = format!("📈 DCA Purchase - {}", purchase.timestamp.format("%Y-%m-%d %H:%M UTC"));
-        let amount_line = format!("💰 Amount: ${} USDC → {} ETH", 
-            purchase.usdc_amount.round_dp(2), 
-            purchase.eth_amount.round_dp(6)
+        let amount_line = format!("💰 Amount: ${} USDC → {} {}",
+            purchase.usdc_amount.round_dp(2),
+            purchase.eth_amount.round_dp(6),
+            self.asset
         );
-        let price_line = format!("🏷️ ETH Price: ${}", purchase.eth_price.round_dp(2));
-        let fees_line = format!("💸 Trading Fee: {} ETH (${} USDC)", 
-            trading_fee_eth.round_dp(6), 
+        let price_line = format!("🏷️ {} Price: ${}", self.asset, purchase.eth_price.round_dp(2));
+        let fees_line = format!("💸 Trading Fee: {} {} (${} USDC)",
+            trading_fee_eth.round_dp(6),
+            self.asset,
             purchase.fees_usdc.round_dp(4)
         );
         let eur_line = format!("🇪🇺 EUR Equivalent: €{}", eur_amount.round_dp(2));

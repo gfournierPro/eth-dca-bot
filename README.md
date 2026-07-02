@@ -5,7 +5,8 @@ A sophisticated Ethereum Dollar-Cost Averaging (DCA) bot built in Rust that auto
 ## 🌟 Features
 
 - **Automated DCA Trading**: Schedule regular ETH purchases using EUR amounts (automatically converted to USDC) on Binance
-- **Smart Withdrawal System**: Automatically withdraw ETH to cold storage when thresholds are met
+- **Multi-Asset Support**: Optionally run a BTC DCA workflow alongside ETH in the same process, with independent schedules, stats, and withdrawals (see [BTC DCA Workflow](#btc-dca-workflow-optional))
+- **Smart Withdrawal System**: Automatically withdraw ETH/BTC to cold storage when thresholds are met
 - **MongoDB Integration**: Track all purchases, statistics, and performance metrics
 - **Notion Integration**: Optional integration with Notion for portfolio tracking and management
 - **Configurable Scheduling**: Flexible cron-based scheduling for DCA purchases
@@ -98,6 +99,35 @@ cargo run
 - `WITHDRAWAL_NETWORK`: Network for withdrawal (e.g., "ETH")
 - `WITHDRAWAL_MIN_ETH_THRESHOLD`: Minimum ETH balance to trigger withdrawal
 - `WITHDRAWAL_AMOUNT`: Optional fixed withdrawal amount (if not set, withdraws all available ETH)
+
+### BTC DCA Workflow (Optional)
+
+The bot can run a **BTC DCA workflow alongside ETH** in the same process. It mirrors
+the ETH workflow exactly (scheduled buys, missed-run catch-up, withdrawals, MongoDB
+stats, Notion tracking) but is fully independent: BTC buys `BTCUSDC`, stores its
+purchases in a **separate MongoDB collection** (`btc_purchases`), and uses its **own
+Notion database**, so ETH and BTC statistics never mix.
+
+Enable it by setting `BTC_DCA_ENABLED=true`. All other `BTC_*` variables are optional
+and fall back to the defaults below:
+
+- `BTC_DCA_ENABLED`: Set to `true` to activate the BTC workflow (default `false`)
+- `BTC_DCA_AMOUNT_EUR`: EUR amount per BTC purchase (default `100`)
+- `BTC_MIN_BALANCE_USDC`: Minimum USDC balance to maintain (default `50`)
+- `BTC_SCHEDULE_CRON`: Cron expression for BTC purchases (default `0 30 5 * * MON`)
+- `BTC_TIMEZONE`: Timezone for the BTC schedule (defaults to the global `TIMEZONE`)
+- `BTC_MONGO_COLLECTION`: MongoDB collection for BTC purchases (default `btc_purchases`)
+- `BTC_NOTION_TOKEN`: Notion token for BTC (defaults to `NOTION_TOKEN` if unset)
+- `BTC_NOTION_DATABASE_ID`: Separate Notion database for BTC tracking
+- `BTC_COLD_WALLET_ADDRESS`: BTC cold wallet address (used for Notion + withdrawals)
+- `BTC_WITHDRAWAL_ENABLED`: Enable/disable automatic BTC withdrawals (default `false`)
+- `BTC_WITHDRAWAL_WALLET_ADDRESS`: Target BTC cold wallet address
+- `BTC_WITHDRAWAL_NETWORK`: Withdrawal network for BTC (default `BTC` — native Bitcoin)
+- `BTC_WITHDRAWAL_MIN_THRESHOLD`: Minimum BTC balance to trigger a withdrawal (default `0.0001`)
+- `BTC_WITHDRAWAL_AMOUNT`: Optional fixed withdrawal amount (otherwise withdraws all available BTC)
+
+> **Note:** The BTC Notion database must use the same property schema as the ETH one
+> (`Name`, `From`, `When`, `Currency`, `eur`, `Network Fee`, `Trading Fee`, `Link`).
 
 ### Cron Expression Examples
 

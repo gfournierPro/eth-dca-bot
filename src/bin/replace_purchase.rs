@@ -184,7 +184,7 @@ async fn main() -> Result<()> {
         info!("📝 Updating Notion...");
         
         // Initialize Notion client
-        let notion_client = NotionDCATracker::new(&config.notion)?;
+        let notion_client = NotionDCATracker::new(&config.notion, "ETH")?;
         
         // We need to calculate EUR amount for Notion
         // For simplicity, using a default EUR/USD rate of 0.85 (you might want to fetch this from an API)

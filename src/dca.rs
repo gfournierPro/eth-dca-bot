@@ -13,6 +13,7 @@ use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct DcaTrader {
+    pub asset: String,
     pub binance_client: BinanceClient,
     trading_config: TradingConfig,
     withdrawal_config: WithdrawalConfig,
@@ -24,37 +25,40 @@ pub struct DcaTrader {
 
 impl DcaTrader {
     pub async fn new(
-        binance_client: BinanceClient, 
+        asset: String,
+        mongo_collection: &str,
+        binance_client: BinanceClient,
         trading_config: TradingConfig,
         withdrawal_config: WithdrawalConfig,
         notion_config: Option<&NotionConfig>,
         timezone: String,
         cron_schedule: String,
     ) -> Result<Self> {
-        let stats_db = DcaStatsDB::new().await?;
+        let stats_db = DcaStatsDB::with_collection(mongo_collection).await?;
 
         let notion_tracker = if let Some(config) = notion_config {
             if !config.token.is_empty() && !config.database_id.is_empty() {
-                match NotionDCATracker::new(config) {
+                match NotionDCATracker::new(config, &asset) {
                     Ok(tracker) => {
-                        info!("Notion integration enabled");
+                        info!("[{}] Notion integration enabled", asset);
                         Some(tracker)
                     }
                     Err(e) => {
-                        warn!("Notion integration disabled: {}", e);
+                        warn!("[{}] Notion integration disabled: {}", asset, e);
                         None
                     }
                 }
             } else {
-                info!("Notion integration disabled: configuration incomplete");
+                info!("[{}] Notion integration disabled: configuration incomplete", asset);
                 None
             }
         } else {
-            info!("Notion integration disabled: no configuration provided");
+            info!("[{}] Notion integration disabled: no configuration provided", asset);
             None
         };
 
         Ok(Self {
+            asset,
             binance_client,
             trading_config,
             withdrawal_config,
@@ -66,7 +70,7 @@ impl DcaTrader {
     }
 
     pub async fn execute_dca_purchase(&self) -> Result<()> {
-        info!("Starting DCA purchase execution");
+        info!("Starting {} DCA purchase execution", self.asset);
 
         // First, get EUR/USDC exchange rate to convert our EUR amount to USDC
         let eur_usdc_price = self.binance_client.get_symbol_price("EURUSDC").await?;
@@ -107,10 +111,10 @@ impl DcaTrader {
             .await?;
 
         let estimated_eth = purchase_amount / current_price;
-        info!("Current ETH price: {} USDC", current_price);
+        info!("Current {} price: {} USDC", self.asset, current_price);
         info!(
-            "Purchasing {} USDC worth of ETH (≈ {} ETH)",
-            purchase_amount, estimated_eth
+            "Purchasing {} USDC worth of {} (≈ {} {})",
+            purchase_amount, self.asset, estimated_eth, self.asset
         );
 
         let order_result = self
@@ -125,7 +129,7 @@ impl DcaTrader {
         } else {
             Decimal::ZERO
         };
-        let fees_usdc = order_result.calculate_total_fees_in_usdc(current_price);
+        let fees_usdc = order_result.calculate_total_fees_in_usdc(&self.asset, current_price);
 
         let purchase = DcaPurchase {
             id: Uuid::new_v4().to_string(),
@@ -156,7 +160,7 @@ impl DcaTrader {
         let actual_eur_spent = executed_value / eur_usd_price;
 
         // Print purchase details
-        info!("✅ DCA purchase completed successfully!");
+        info!("✅ {} DCA purchase completed successfully!", self.asset);
         info!("╔═══════════════════════════════════════╗");
         info!("║           💰 PURCHASE DETAILS         ║");
         info!("╠═══════════════════════════════════════╣");
@@ -164,8 +168,8 @@ impl DcaTrader {
         info!("║ Status: {:>27} ║", order_result.status);
         info!("║ EUR Spent: €{:>23} ║", actual_eur_spent.round_dp(2));
         info!("║ USDC Spent: ${:>22} ║", executed_value.round_dp(2));
-        info!("║ ETH Acquired: {:>21} ║", executed_qty.round_dp(6));
-        info!("║ ETH Price: ${:>23} ║", average_price.round_dp(2));
+        info!("║ {:>3} Acquired: {:>21} ║", self.asset, executed_qty.round_dp(6));
+        info!("║ {:>3} Price: ${:>23} ║", self.asset, average_price.round_dp(2));
         info!("║ Fees Paid: ${:>23} ║", fees_usdc.round_dp(4));
         info!("║ EUR/USDC Rate: {:>20} ║", eur_usd_price.round_dp(4));
         info!("╚═══════════════════════════════════════╝");
@@ -201,7 +205,7 @@ impl DcaTrader {
             .get_symbol_price(&self.trading_config.symbol)
             .await?;
         let summary = self.stats_db.get_summary(current_price).await?;
-        print_dca_summary(&summary);
+        print_dca_summary(&self.asset, &summary);
 
         let mut recent_purchases = self.stats_db.get_recent_purchases(5).await?;
         
@@ -224,7 +228,7 @@ impl DcaTrader {
             }
         }
         
-        print_recent_purchases(&recent_purchases);
+        print_recent_purchases(&self.asset, &recent_purchases);
         Ok(())
     }
 
@@ -320,12 +324,14 @@ impl DcaTrader {
         }
 
         info!("🔍 Checking if withdrawal is needed (last Monday of month)...");
-        
-        // First check if withdrawals are available for ETH
-        match self.binance_client.check_withdrawal_capability("ETH").await {
+
+        let coin = self.asset.as_str();
+
+        // First check if withdrawals are available for this coin
+        match self.binance_client.check_withdrawal_capability(coin).await {
             Ok(can_withdraw) => {
                 if !can_withdraw {
-                    warn!("⚠️  ETH withdrawals are not enabled for your account");
+                    warn!("⚠️  {} withdrawals are not enabled for your account", coin);
                     warn!("💡 Please check:");
                     warn!("   • Account verification status");
                     warn!("   • API key withdrawal permissions");
@@ -341,50 +347,47 @@ impl DcaTrader {
         }
 
         // Also check the specific network
-        match self.binance_client.check_network_withdrawal_capability("ETH", &self.withdrawal_config.network).await {
+        match self.binance_client.check_network_withdrawal_capability(coin, &self.withdrawal_config.network).await {
             Ok(network_available) => {
                 if !network_available {
-                    warn!("⚠️  Network '{}' is not available for ETH withdrawals", self.withdrawal_config.network);
-                    warn!("💡 Try these network names instead:");
-                    warn!("   • ARBITRUM (for Arbitrum One)");
-                    warn!("   • ETH (for Ethereum mainnet)");
-                    warn!("   • BSC (for Binance Smart Chain)");
-                    warn!("   • OPTIMISM (for Optimism)");
+                    warn!("⚠️  Network '{}' is not available for {} withdrawals", self.withdrawal_config.network, coin);
+                    warn!("💡 Double-check the WITHDRAWAL_NETWORK value matches a network Binance lists for {}", coin);
                     return Ok(());
                 }
-                info!("Network '{}' is available for ETH withdrawals", self.withdrawal_config.network);
+                info!("Network '{}' is available for {} withdrawals", self.withdrawal_config.network, coin);
             }
             Err(e) => {
                 warn!("Could not verify network capability: {}", e);
             }
         }
-        
-        let eth_balance = self.binance_client.get_eth_balance().await?;
-        info!("Current ETH balance: {} ETH", eth_balance);
 
-        if eth_balance < self.withdrawal_config.min_eth_threshold {
+        let asset_balance = self.binance_client.get_asset_balance(coin).await?;
+        info!("Current {} balance: {} {}", coin, asset_balance, coin);
+
+        if asset_balance < self.withdrawal_config.min_eth_threshold {
             info!(
-                "ETH balance {} is below minimum threshold {}. No withdrawal needed.",
-                eth_balance, self.withdrawal_config.min_eth_threshold
+                "{} balance {} is below minimum threshold {}. No withdrawal needed.",
+                coin, asset_balance, self.withdrawal_config.min_eth_threshold
             );
             return Ok(());
         }
 
         let withdrawal_amount = self.withdrawal_config.withdrawal_amount
-            .unwrap_or(eth_balance);
+            .unwrap_or(asset_balance);
 
-        if withdrawal_amount > eth_balance {
+        if withdrawal_amount > asset_balance {
             warn!(
                 "Requested withdrawal amount {} exceeds available balance {}. Using available balance.",
-                withdrawal_amount, eth_balance
+                withdrawal_amount, asset_balance
             );
         }
 
-        let actual_withdrawal_amount = withdrawal_amount.min(eth_balance);
+        let actual_withdrawal_amount = withdrawal_amount.min(asset_balance);
 
-        info!("💸 Initiating withdrawal of {} ETH to cold wallet", actual_withdrawal_amount);
-        
-        match self.binance_client.withdraw_eth(
+        info!("💸 Initiating withdrawal of {} {} to cold wallet", actual_withdrawal_amount, coin);
+
+        match self.binance_client.withdraw_asset(
+            coin,
             &self.withdrawal_config.cold_wallet_address,
             actual_withdrawal_amount,
             &self.withdrawal_config.network,
@@ -397,7 +400,7 @@ impl DcaTrader {
                 info!("╔═══════════════════════════════════════╗");
                 info!("║         💸 WITHDRAWAL DETAILS         ║");
                 info!("╠═══════════════════════════════════════╣");
-                info!("║ Amount: {:>27} ETH ║", actual_withdrawal_amount.round_dp(6));
+                info!("║ Amount: {:>23} {:>3} ║", actual_withdrawal_amount.round_dp(6), coin);
                 info!("║ Network: {:>26} ║", self.withdrawal_config.network);
                 info!("║ Address: {:>26} ║", format!("{}...{}", 
                     &self.withdrawal_config.cold_wallet_address[..6],

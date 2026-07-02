@@ -72,117 +72,129 @@ async fn main() -> Result<()> {
     let config = load_config()?;
     validate_config(&config)?;
 
-    let binance_client = binance::BinanceClient::new(
-        config.binance.api_key.clone(),
-        config.binance.secret_key.clone(),
-        config.binance.base_url.clone(),
-    );
-
-    let dca_trader = DcaTrader::new(
-        binance_client, 
-        config.trading.clone(),
-        config.withdrawal.clone(),
-        Some(&config.notion),
-        config.schedule.timezone.clone(),
-        config.schedule.cron_expression.clone(),
-    ).await?;
-
-    info!("Testing Binance API connection...");
-    match dca_trader.binance_client.get_usdc_balanc().await {
-        Ok(balance) => {
-            info!("Current USDC balance: {}", balance);
-            dca_trader.show_dca_summary().await.unwrap_or_else(|e| {
-                error!("Failed to load DCA summary: {}", e);
-            });
-
-            // Check for withdrawal on startup if we're in the right time period
-            info!("🔍 Checking if withdrawal is needed at startup...");
-            dca_trader.check_and_execute_withdrawal().await.unwrap_or_else(|e| {
-                error!("Startup withdrawal check failed: {}", e);
-            });
-
-            // Check if DCA is needed (no purchase in last 24h)
-            info!("🔍 Checking if startup DCA is needed...");
-            dca_trader.check_and_execute_startup_dca().await.unwrap_or_else(|e| {
-                error!("Startup DCA check failed: {}", e);
-            });
-        }
-        Err(e) => {
-            error!("Failed to connect to Binance API: {}", e);
-            return Err(e);
-        }
-    };
-
     let sched = JobScheduler::new().await?;
 
-    // Create timezone-aware job
-    let timezone_str = config.schedule.timezone.clone();
-    let job = if timezone_str == "UTC" || timezone_str.is_empty() {
-        Job::new_async(
-            config.schedule.cron_expression.as_str(),
-            move |_uuid, _l| {
-                let trader = dca_trader.clone();
-                Box::pin(async move {
-                    info!("Executing scheduled DCA purchase");
-                    match trader.execute_dca_purchase().await {
-                        Ok(()) => {
-                            info!("Scheduled DCA purchase completed successfully");
-                        }
-                        Err(e) => {
-                            error!("Scheduled DCA purchase failed: {}", e);
-                        }
-                    }
-                })
-            },
-        )?
-    } else {
-        // Use timezone-aware job
-        use chrono_tz::Tz;
-        use std::str::FromStr;
-        let tz = Tz::from_str(&timezone_str).unwrap_or(chrono_tz::Europe::Berlin);
-        Job::new_async_tz(
-            config.schedule.cron_expression.as_str(),
-            tz,
-            move |_uuid, _l| {
-                let trader = dca_trader.clone();
-                Box::pin(async move {
-                    info!("Executing scheduled DCA purchase");
-                    match trader.execute_dca_purchase().await {
-                        Ok(()) => {
-                            info!("Scheduled DCA purchase completed successfully");
-                        }
-                        Err(e) => {
-                            error!("Scheduled DCA purchase failed: {}", e);
-                        }
-                    }
-                })
-            },
-        )?
-    };
+    // ETH workflow (always on — preserves the original behavior).
+    setup_asset_trader(config.eth_asset(), &config.binance, &sched).await?;
 
-    sched.add(job).await?;
-    sched.start().await?;
-    info!(
-        "DCA Bot is running. Scheduled for: {} (timezone: {})",
-        config.schedule.cron_expression,
-        config.schedule.timezone
-    );
-    
-    // Log when the next DCA batch will happen
-    match calculate_next_execution(&config.schedule.cron_expression, &config.schedule.timezone) {
-        Ok(time_until) => {
-            info!("⏰ Next DCA batch will execute in: {}", time_until);
-        }
-        Err(e) => {
-            error!("Failed to calculate next execution time: {}", e);
+    // BTC workflow (optional — runs alongside ETH in the same process).
+    if let Some(btc_cfg) = config.btc.clone() {
+        if let Err(e) = setup_asset_trader(btc_cfg, &config.binance, &sched).await {
+            error!("Failed to set up BTC DCA workflow: {}", e);
         }
     }
-    
+
+    sched.start().await?;
+    info!("DCA Bot is running.");
+
     info!("Press Ctrl+C to stop the bot");
 
     // Keep the application running
     tokio::signal::ctrl_c().await?;
     info!("Shutting down DCA Bot");
+
+    Ok(())
+}
+
+/// Build a [`DcaTrader`] for one asset, run its startup checks, and register its
+/// recurring purchase job on the shared scheduler.
+async fn setup_asset_trader(
+    asset_cfg: config::AssetDcaConfig,
+    binance_cfg: &config::BinanceConfig,
+    sched: &JobScheduler,
+) -> Result<()> {
+    let asset = asset_cfg.asset.clone();
+
+    let binance_client = binance::BinanceClient::new(
+        binance_cfg.api_key.clone(),
+        binance_cfg.secret_key.clone(),
+        binance_cfg.base_url.clone(),
+    );
+
+    let trader = DcaTrader::new(
+        asset.clone(),
+        &asset_cfg.mongo_collection,
+        binance_client,
+        asset_cfg.trading.clone(),
+        asset_cfg.withdrawal.clone(),
+        Some(&asset_cfg.notion),
+        asset_cfg.schedule.timezone.clone(),
+        asset_cfg.schedule.cron_expression.clone(),
+    )
+    .await?;
+
+    info!("[{}] Testing Binance API connection...", asset);
+    match trader.binance_client.get_usdc_balanc().await {
+        Ok(balance) => {
+            info!("[{}] Current USDC balance: {}", asset, balance);
+            trader.show_dca_summary().await.unwrap_or_else(|e| {
+                error!("[{}] Failed to load DCA summary: {}", asset, e);
+            });
+
+            // Check for withdrawal on startup if we're in the right time period
+            info!("[{}] 🔍 Checking if withdrawal is needed at startup...", asset);
+            trader.check_and_execute_withdrawal().await.unwrap_or_else(|e| {
+                error!("[{}] Startup withdrawal check failed: {}", asset, e);
+            });
+
+            // Check if DCA is needed (no purchase in last 24h)
+            info!("[{}] 🔍 Checking if startup DCA is needed...", asset);
+            trader.check_and_execute_startup_dca().await.unwrap_or_else(|e| {
+                error!("[{}] Startup DCA check failed: {}", asset, e);
+            });
+        }
+        Err(e) => {
+            error!("[{}] Failed to connect to Binance API: {}", asset, e);
+            return Err(e);
+        }
+    };
+
+    let cron = asset_cfg.schedule.cron_expression.clone();
+    let timezone_str = asset_cfg.schedule.timezone.clone();
+
+    let job = if timezone_str == "UTC" || timezone_str.is_empty() {
+        let trader = trader.clone();
+        let asset_for_job = asset.clone();
+        Job::new_async(cron.as_str(), move |_uuid, _l| {
+            let trader = trader.clone();
+            let asset = asset_for_job.clone();
+            Box::pin(async move {
+                info!("[{}] Executing scheduled DCA purchase", asset);
+                match trader.execute_dca_purchase().await {
+                    Ok(()) => info!("[{}] Scheduled DCA purchase completed successfully", asset),
+                    Err(e) => error!("[{}] Scheduled DCA purchase failed: {}", asset, e),
+                }
+            })
+        })?
+    } else {
+        use chrono_tz::Tz;
+        use std::str::FromStr;
+        let tz = Tz::from_str(&timezone_str).unwrap_or(chrono_tz::Europe::Berlin);
+        let trader = trader.clone();
+        let asset_for_job = asset.clone();
+        Job::new_async_tz(cron.as_str(), tz, move |_uuid, _l| {
+            let trader = trader.clone();
+            let asset = asset_for_job.clone();
+            Box::pin(async move {
+                info!("[{}] Executing scheduled DCA purchase", asset);
+                match trader.execute_dca_purchase().await {
+                    Ok(()) => info!("[{}] Scheduled DCA purchase completed successfully", asset),
+                    Err(e) => error!("[{}] Scheduled DCA purchase failed: {}", asset, e),
+                }
+            })
+        })?
+    };
+
+    sched.add(job).await?;
+    info!(
+        "[{}] DCA job scheduled for: {} (timezone: {})",
+        asset, cron, timezone_str
+    );
+
+    match calculate_next_execution(&cron, &timezone_str) {
+        Ok(time_until) => info!("[{}] ⏰ Next DCA batch will execute in: {}", asset, time_until),
+        Err(e) => error!("[{}] Failed to calculate next execution time: {}", asset, e),
+    }
 
     Ok(())
 }
@@ -239,6 +251,60 @@ fn load_config() -> Result<Config> {
         config.withdrawal.withdrawal_amount = Some(amount.parse()?);
     }
 
+    // Load optional BTC DCA workflow (additive — leaves the ETH workflow untouched).
+    if env::var("BTC_DCA_ENABLED").map(|v| v == "true").unwrap_or(false) {
+        let mut btc = config::AssetDcaConfig::btc_default();
+
+        if let Ok(amount) = env::var("BTC_DCA_AMOUNT_EUR") {
+            btc.trading.buy_amount_eur = amount.parse()?;
+        }
+        if let Ok(min_balance) = env::var("BTC_MIN_BALANCE_USDC") {
+            btc.trading.min_balance_usdc = min_balance.parse()?;
+        }
+        if let Ok(cron) = env::var("BTC_SCHEDULE_CRON") {
+            btc.schedule.cron_expression = cron;
+        }
+        // BTC reuses the global TIMEZONE unless a BTC-specific one is provided.
+        btc.schedule.timezone = env::var("BTC_TIMEZONE")
+            .ok()
+            .or_else(|| env::var("TIMEZONE").ok())
+            .unwrap_or(btc.schedule.timezone);
+        if let Ok(collection) = env::var("BTC_MONGO_COLLECTION") {
+            btc.mongo_collection = collection;
+        }
+
+        // Notion (its own database; token may be shared with the ETH integration).
+        if let Ok(token) = env::var("BTC_NOTION_TOKEN").or_else(|_| env::var("NOTION_TOKEN")) {
+            btc.notion.token = token;
+        }
+        if let Ok(database_id) = env::var("BTC_NOTION_DATABASE_ID") {
+            btc.notion.database_id = database_id;
+        }
+        if let Ok(cold_wallet) = env::var("BTC_COLD_WALLET_ADDRESS") {
+            btc.notion.cold_wallet_address = cold_wallet.clone();
+            btc.withdrawal.cold_wallet_address = cold_wallet;
+        }
+
+        // Withdrawal (BTC-specific network/address/threshold).
+        if let Ok(enabled) = env::var("BTC_WITHDRAWAL_ENABLED") {
+            btc.withdrawal.enabled = enabled.parse().unwrap_or(false);
+        }
+        if let Ok(wallet) = env::var("BTC_WITHDRAWAL_WALLET_ADDRESS") {
+            btc.withdrawal.cold_wallet_address = wallet;
+        }
+        if let Ok(network) = env::var("BTC_WITHDRAWAL_NETWORK") {
+            btc.withdrawal.network = network;
+        }
+        if let Ok(threshold) = env::var("BTC_WITHDRAWAL_MIN_THRESHOLD") {
+            btc.withdrawal.min_eth_threshold = threshold.parse()?;
+        }
+        if let Ok(amount) = env::var("BTC_WITHDRAWAL_AMOUNT") {
+            btc.withdrawal.withdrawal_amount = Some(amount.parse()?);
+        }
+
+        config.btc = Some(btc);
+    }
+
     Ok(config)
 }
 
@@ -281,7 +347,35 @@ fn validate_config(config: &Config) -> Result<()> {
     } else {
         info!("Withdrawal is disabled");
     }
-    
+
+    // Validate the optional BTC workflow.
+    if let Some(btc) = &config.btc {
+        if btc.trading.buy_amount_eur <= rust_decimal::Decimal::ZERO {
+            return Err(anyhow::anyhow!("Invalid BTC_DCA_AMOUNT_EUR"));
+        }
+        if btc.trading.min_balance_usdc < rust_decimal::Decimal::ZERO {
+            return Err(anyhow::anyhow!("Invalid BTC_MIN_BALANCE_USDC"));
+        }
+        if !btc.notion.token.is_empty() && btc.notion.database_id.is_empty() {
+            return Err(anyhow::anyhow!("BTC_NOTION_DATABASE_ID is required when a Notion token is provided"));
+        }
+        if !btc.notion.database_id.is_empty() && btc.notion.token.is_empty() {
+            return Err(anyhow::anyhow!("BTC_NOTION_TOKEN (or NOTION_TOKEN) is required when BTC_NOTION_DATABASE_ID is provided"));
+        }
+        if btc.withdrawal.enabled {
+            if btc.withdrawal.cold_wallet_address.is_empty() {
+                return Err(anyhow::anyhow!("BTC_WITHDRAWAL_WALLET_ADDRESS is required when BTC withdrawal is enabled"));
+            }
+            if btc.withdrawal.network.is_empty() {
+                return Err(anyhow::anyhow!("BTC_WITHDRAWAL_NETWORK is required when BTC withdrawal is enabled"));
+            }
+        }
+        info!(
+            "BTC DCA workflow enabled (symbol {}, schedule {}, collection {})",
+            btc.trading.symbol, btc.schedule.cron_expression, btc.mongo_collection
+        );
+    }
+
     info!("Configuration validated successfully");
     Ok(())
 }
