@@ -18,8 +18,45 @@ pub struct DcaPurchase {
     pub eth_amount: Decimal,
     pub eth_price: Decimal,
     pub fees_usdc: Decimal,
-    pub order_id: u64,
+    /// Exchange order identifier. Binance order IDs are numeric while Kraken txids
+    /// are strings (e.g. `OQCLML-BW3P3-BUCMWZ`), so this is stored as a string.
+    /// Historical records that persisted a numeric order id are still read correctly
+    /// via [`de_order_id`].
+    #[serde(deserialize_with = "de_order_id")]
+    pub order_id: String,
     pub status: String,
+}
+
+/// Accept both string and integer order ids so purchases written by the old
+/// (numeric, Binance) schema keep deserializing after the switch to string ids.
+fn de_order_id<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use std::fmt;
+    struct OrderIdVisitor;
+    impl<'de> serde::de::Visitor<'de> for OrderIdVisitor {
+        type Value = String;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a string or integer order id")
+        }
+        fn visit_str<E>(self, v: &str) -> std::result::Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_string<E>(self, v: String) -> std::result::Result<String, E> {
+            Ok(v)
+        }
+        fn visit_i64<E>(self, v: i64) -> std::result::Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_u64<E>(self, v: u64) -> std::result::Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_i32<E>(self, v: i32) -> std::result::Result<String, E> {
+            Ok(v.to_string())
+        }
+    }
+    deserializer.deserialize_any(OrderIdVisitor)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +103,22 @@ impl DcaStatsDB {
         self.collection.insert_one(purchase).await?;
         info!("💾 Purchase recorded in database: {}", purchase.id);
         Ok(())
+    }
+
+    /// Look up a stored purchase by its exchange order id (string txid or the
+    /// stringified numeric id of a legacy Binance order).
+    pub async fn get_purchase_by_order_id(&self, order_id: &str) -> Result<Option<DcaPurchase>> {
+        let filter = doc! { "order_id": order_id };
+        let purchase = self.collection.find_one(filter).await?;
+        Ok(purchase)
+    }
+
+    /// Remove a stored purchase by its exchange order id. Returns whether a
+    /// document was actually deleted.
+    pub async fn remove_purchase_by_order_id(&self, order_id: &str) -> Result<bool> {
+        let filter = doc! { "order_id": order_id };
+        let result = self.collection.delete_one(filter).await?;
+        Ok(result.deleted_count > 0)
     }
 
     pub async fn get_summary(&self, current_eth_price: Decimal) -> Result<DcaSummary> {

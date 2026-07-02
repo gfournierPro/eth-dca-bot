@@ -2,19 +2,40 @@ mod binance;
 mod config;
 mod dca;
 mod dca_stats_mongo;
+mod exchange;
+mod kraken;
 mod notion_integration;
 mod date_utils;
 
 use anyhow::Result;
-use config::Config;
+use config::{Config, ExchangeKind};
 use dca::DcaTrader;
+use exchange::Exchange;
 use dotenv::dotenv;
 use std::env;
+use std::sync::Arc;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{error, info};
 use tracing_subscriber;
 use chrono::Utc;
 use std::str::FromStr;
+
+/// Construct the active exchange backend from config. Both backends are always
+/// compiled in; `EXCHANGE` selects which one is used at runtime.
+fn build_exchange(config: &Config) -> Arc<dyn Exchange> {
+    match config.exchange {
+        ExchangeKind::Binance => Arc::new(binance::BinanceClient::new(
+            config.binance.api_key.clone(),
+            config.binance.secret_key.clone(),
+            config.binance.base_url.clone(),
+        )),
+        ExchangeKind::Kraken => Arc::new(kraken::KrakenClient::new(
+            config.kraken.api_key.clone(),
+            config.kraken.secret_key.clone(),
+            config.kraken.base_url.clone(),
+        )),
+    }
+}
 
 fn calculate_next_execution(cron_expr: &str, timezone_str: &str) -> Result<String> {
     use cron::Schedule;
@@ -74,12 +95,16 @@ async fn main() -> Result<()> {
 
     let sched = JobScheduler::new().await?;
 
+    // Build the selected exchange backend once and share it across workflows.
+    let exchange = build_exchange(&config);
+    info!("Using exchange backend: {}", exchange.name());
+
     // ETH workflow (always on — preserves the original behavior).
-    setup_asset_trader(config.eth_asset(), &config.binance, &sched).await?;
+    setup_asset_trader(config.eth_asset(), exchange.clone(), &sched).await?;
 
     // BTC workflow (optional — runs alongside ETH in the same process).
     if let Some(btc_cfg) = config.btc.clone() {
-        if let Err(e) = setup_asset_trader(btc_cfg, &config.binance, &sched).await {
+        if let Err(e) = setup_asset_trader(btc_cfg, exchange.clone(), &sched).await {
             error!("Failed to set up BTC DCA workflow: {}", e);
         }
     }
@@ -100,21 +125,16 @@ async fn main() -> Result<()> {
 /// recurring purchase job on the shared scheduler.
 async fn setup_asset_trader(
     asset_cfg: config::AssetDcaConfig,
-    binance_cfg: &config::BinanceConfig,
+    exchange: Arc<dyn Exchange>,
     sched: &JobScheduler,
 ) -> Result<()> {
     let asset = asset_cfg.asset.clone();
-
-    let binance_client = binance::BinanceClient::new(
-        binance_cfg.api_key.clone(),
-        binance_cfg.secret_key.clone(),
-        binance_cfg.base_url.clone(),
-    );
+    let exchange_name = exchange.name();
 
     let trader = DcaTrader::new(
         asset.clone(),
         &asset_cfg.mongo_collection,
-        binance_client,
+        exchange,
         asset_cfg.trading.clone(),
         asset_cfg.withdrawal.clone(),
         Some(&asset_cfg.notion),
@@ -123,8 +143,8 @@ async fn setup_asset_trader(
     )
     .await?;
 
-    info!("[{}] Testing Binance API connection...", asset);
-    match trader.binance_client.get_usdc_balanc().await {
+    info!("[{}] Testing {} API connection...", asset, exchange_name);
+    match trader.exchange.get_usdc_balance().await {
         Ok(balance) => {
             info!("[{}] Current USDC balance: {}", asset, balance);
             trader.show_dca_summary().await.unwrap_or_else(|e| {
@@ -144,7 +164,7 @@ async fn setup_asset_trader(
             });
         }
         Err(e) => {
-            error!("[{}] Failed to connect to Binance API: {}", asset, e);
+            error!("[{}] Failed to connect to {} API: {}", asset, exchange_name, e);
             return Err(e);
         }
     };
@@ -200,14 +220,34 @@ async fn setup_asset_trader(
 }
 
 fn load_config() -> Result<Config> {
-    let api_key =
-        env::var("BINANCE_API_KEY").map_err(|_| anyhow::anyhow!("BINANCE_API_KEY not set"))?;
-    let secret_key = env::var("BINANCE_SECRET_KEY")
-        .map_err(|_| anyhow::anyhow!("BINANCE_SECRET_KEY not set"))?;
-
     let mut config = Config::default();
-    config.binance.api_key = api_key;
-    config.binance.secret_key = secret_key;
+
+    // Select the exchange backend (defaults to Binance for backwards compatibility).
+    if let Ok(exchange) = env::var("EXCHANGE") {
+        config.exchange = ExchangeKind::parse(&exchange)
+            .ok_or_else(|| anyhow::anyhow!("Invalid EXCHANGE '{}' (expected 'binance' or 'kraken')", exchange))?;
+    }
+
+    // Load credentials for whichever backends are configured. Only the selected
+    // exchange's credentials are required (validated in validate_config).
+    if let Ok(v) = env::var("BINANCE_API_KEY") {
+        config.binance.api_key = v;
+    }
+    if let Ok(v) = env::var("BINANCE_SECRET_KEY") {
+        config.binance.secret_key = v;
+    }
+    if let Ok(v) = env::var("KRAKEN_API_KEY") {
+        config.kraken.api_key = v;
+    }
+    if let Ok(v) = env::var("KRAKEN_SECRET_KEY") {
+        config.kraken.secret_key = v;
+    }
+    if let Ok(v) = env::var("BINANCE_BASE_URL") {
+        config.binance.base_url = v;
+    }
+    if let Ok(v) = env::var("KRAKEN_BASE_URL") {
+        config.kraken.base_url = v;
+    }
 
     if let Ok(amount) = env::var("DCA_AMOUNT_EUR") {
         config.trading.buy_amount_eur = amount.parse()?;
@@ -309,8 +349,21 @@ fn load_config() -> Result<Config> {
 }
 
 fn validate_config(config: &Config) -> Result<()> {
-    if config.binance.api_key.is_empty() || config.binance.secret_key.is_empty() {
-        return Err(anyhow::anyhow!("Invalid Binance API credentials"));
+    match config.exchange {
+        ExchangeKind::Binance => {
+            if config.binance.api_key.is_empty() || config.binance.secret_key.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Invalid Binance API credentials (set BINANCE_API_KEY and BINANCE_SECRET_KEY)"
+                ));
+            }
+        }
+        ExchangeKind::Kraken => {
+            if config.kraken.api_key.is_empty() || config.kraken.secret_key.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Invalid Kraken API credentials (set KRAKEN_API_KEY and KRAKEN_SECRET_KEY)"
+                ));
+            }
+        }
     }
     if config.trading.buy_amount_eur <= rust_decimal::Decimal::ZERO {
         return Err(anyhow::anyhow!("Invalid DCA_AMOUNT_EUR"));

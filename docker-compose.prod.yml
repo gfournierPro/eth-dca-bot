@@ -7,10 +7,18 @@ services:
     container_name: eth-dca-bot
     restart: unless-stopped
     environment:
-      # Binance API Configuration
-      - BINANCE_API_KEY=${BINANCE_API_KEY}
-      - BINANCE_SECRET_KEY=${BINANCE_SECRET_KEY}
+      # Exchange selection: "binance" or "kraken"
+      - EXCHANGE=${EXCHANGE:-kraken}
+
+      # Binance API Configuration (used when EXCHANGE=binance)
+      - BINANCE_API_KEY=${BINANCE_API_KEY:-}
+      - BINANCE_SECRET_KEY=${BINANCE_SECRET_KEY:-}
       - BINANCE_BASE_URL=${BINANCE_BASE_URL:-https://api.binance.com}
+
+      # Kraken API Configuration (used when EXCHANGE=kraken)
+      - KRAKEN_API_KEY=${KRAKEN_API_KEY:-}
+      - KRAKEN_SECRET_KEY=${KRAKEN_SECRET_KEY:-}
+      - KRAKEN_BASE_URL=${KRAKEN_BASE_URL:-https://api.kraken.com}
       
       # Trading Configuration
       - DCA_AMOUNT_EUR=${DCA_AMOUNT_EUR:-50}

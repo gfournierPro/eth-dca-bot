@@ -1,9 +1,30 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+/// Which exchange backend the bot trades on. Both are kept so the active exchange
+/// can be flipped via the `EXCHANGE` env var without code changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ExchangeKind {
+    Binance,
+    Kraken,
+}
+
+impl ExchangeKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "binance" => Some(Self::Binance),
+            "kraken" => Some(Self::Kraken),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
+    /// Selected exchange backend (`binance` or `kraken`).
+    pub exchange: ExchangeKind,
     pub binance: BinanceConfig,
+    pub kraken: KrakenConfig,
     pub trading: TradingConfig,
     pub schedule: ScheduleConfig,
     pub notion: NotionConfig,
@@ -31,6 +52,13 @@ pub struct AssetDcaConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BinanceConfig {
+    pub api_key: String,
+    pub secret_key: String,
+    pub base_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct KrakenConfig {
     pub api_key: String,
     pub secret_key: String,
     pub base_url: String,
@@ -69,10 +97,16 @@ pub struct WithdrawalConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            exchange: ExchangeKind::Binance,
             binance: BinanceConfig {
                 api_key: String::new(),
                 secret_key: String::new(),
                 base_url: "https://api.binance.com".to_string(),
+            },
+            kraken: KrakenConfig {
+                api_key: String::new(),
+                secret_key: String::new(),
+                base_url: "https://api.kraken.com".to_string(),
             },
             trading: TradingConfig {
                 symbol: "ETHUSDC".to_string(),

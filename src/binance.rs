@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 use anyhow::{Ok, Result, anyhow};
+use async_trait::async_trait;
 use chrono::{Utc, Datelike, TimeZone};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
@@ -10,6 +11,7 @@ use rust_decimal_macros::dec;
 use sha2::Sha256;
 use tracing::{error, info, warn};
 use crate::dca_stats_mongo::DcaPurchase;
+use crate::exchange::{Exchange, OrderOutcome};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -314,7 +316,7 @@ impl BinanceClient {
                         eth_amount: executed_qty,
                         eth_price: average_price,
                         fees_usdc: estimated_fees,
-                        order_id: order.order_id,
+                        order_id: order.order_id.to_string(),
                         status: order.status.clone(),
                     };
                     
@@ -490,6 +492,83 @@ impl BinanceClient {
                 Ok(false)
             }
         }
+    }
+}
+
+#[async_trait]
+impl Exchange for BinanceClient {
+    fn name(&self) -> &'static str {
+        "Binance"
+    }
+
+    async fn get_usdc_balance(&self) -> Result<Decimal> {
+        self.get_usdc_balanc().await
+    }
+
+    async fn get_asset_balance(&self, asset: &str) -> Result<Decimal> {
+        BinanceClient::get_asset_balance(self, asset).await
+    }
+
+    async fn get_price(&self, symbol: &str) -> Result<Decimal> {
+        self.get_symbol_price(symbol).await
+    }
+
+    async fn get_usdc_per_eur(&self) -> Result<Decimal> {
+        // Binance quotes EUR directly against USDC (USDC per EUR).
+        self.get_symbol_price("EURUSDC").await
+    }
+
+    async fn place_market_buy(&self, symbol: &str, quote_usdc: Decimal) -> Result<OrderOutcome> {
+        let order = self.place_market_buy_order(symbol, quote_usdc).await?;
+
+        let executed_qty: Decimal = order.executed_qty.parse().unwrap_or(dec!(0));
+        let executed_value: Decimal = order.cummulative_quote_qty.parse().unwrap_or(dec!(0));
+        let avg_price = if executed_qty > dec!(0) {
+            executed_value / executed_qty
+        } else {
+            dec!(0)
+        };
+        // Base asset symbol, e.g. "ETH" from "ETHUSDC", used to price base-denominated fees.
+        let base_asset = symbol.trim_end_matches("USDC");
+        let fees_usdc = order.calculate_total_fees_in_usdc(base_asset, avg_price);
+
+        Ok(OrderOutcome {
+            order_id: order.order_id.to_string(),
+            status: order.status,
+            executed_qty,
+            executed_value,
+            avg_price,
+            fees_usdc,
+        })
+    }
+
+    async fn get_current_month_purchases(&self, symbol: &str) -> Result<Vec<DcaPurchase>> {
+        BinanceClient::get_current_month_purchases(self, symbol).await
+    }
+
+    async fn verify_withdrawal(
+        &self,
+        asset: &str,
+        _destination: &str,
+        network: &str,
+        _amount: Decimal,
+    ) -> Result<bool> {
+        let coin_ok = self.check_withdrawal_capability(asset).await?;
+        if !coin_ok {
+            return Ok(false);
+        }
+        self.check_network_withdrawal_capability(asset, network).await
+    }
+
+    async fn withdraw(
+        &self,
+        asset: &str,
+        destination: &str,
+        amount: Decimal,
+        network: &str,
+    ) -> Result<String> {
+        let response = self.withdraw_asset(asset, destination, amount, network).await?;
+        Ok(response.id)
     }
 }
 

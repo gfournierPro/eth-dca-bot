@@ -38,10 +38,12 @@ pub struct NotionDCATracker {
     database_id: String,
     cold_wallet_address: String,
     asset: String,
+    /// Exchange name recorded in the "From" property (e.g. "Binance", "Kraken").
+    source: String,
 }
 
 impl NotionDCATracker {
-    pub fn new(config: &NotionConfig, asset: &str) -> Result<Self> {
+    pub fn new(config: &NotionConfig, asset: &str, source: &str) -> Result<Self> {
         if config.token.is_empty() {
             return Err(anyhow!("Notion token is required"));
         }
@@ -50,7 +52,7 @@ impl NotionDCATracker {
         }
 
         let client = NotionClient::new(config.token.clone(), None)?;
-        info!("Notion integration initialized for {}", asset);
+        info!("Notion integration initialized for {} (source: {})", asset, source);
         info!("Database ID: {}", &config.database_id[..8]);
         info!("Cold wallet: {}", config.cold_wallet_address);
 
@@ -59,6 +61,7 @@ impl NotionDCATracker {
             database_id: config.database_id.clone(),
             cold_wallet_address: config.cold_wallet_address.clone(),
             asset: asset.to_string(),
+            source: source.to_string(),
         })
     }
 
@@ -250,7 +253,7 @@ impl NotionDCATracker {
                 id: None,
                 select: Some(notion_client::objects::page::SelectPropertyValue {
                     id: None,
-                    name: Some("Binance".to_string()),
+                    name: Some(self.source.clone()),
                     color: None,
                 }),
             },
@@ -470,7 +473,7 @@ impl NotionDCATracker {
         Ok(MonthlyDCAData {
             page_id: Some(page_id.to_string()),
             month_name: "".to_string(), // We don't need this for updates
-            from: "Binance".to_string(),
+            from: self.source.clone(),
             link: None,
             network_fee_eth,
             trading_fee_eth,

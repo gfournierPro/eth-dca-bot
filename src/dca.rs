@@ -1,7 +1,8 @@
 use crate::config::{TradingConfig, NotionConfig, WithdrawalConfig};
 use crate::dca_stats_mongo::{DcaPurchase, print_dca_summary, print_recent_purchases};
+use crate::exchange::Exchange;
 use crate::notion_integration::NotionDCATracker;
-use crate::{binance::BinanceClient, dca_stats_mongo::DcaStatsDB};
+use crate::dca_stats_mongo::DcaStatsDB;
 use crate::date_utils::should_check_withdrawal;
 use anyhow::{Result, anyhow};
 use chrono::{Utc, DateTime, Duration};
@@ -10,11 +11,12 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 use cron::Schedule;
 use std::str::FromStr;
+use std::sync::Arc;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DcaTrader {
     pub asset: String,
-    pub binance_client: BinanceClient,
+    pub exchange: Arc<dyn Exchange>,
     trading_config: TradingConfig,
     withdrawal_config: WithdrawalConfig,
     pub stats_db: DcaStatsDB,
@@ -27,7 +29,7 @@ impl DcaTrader {
     pub async fn new(
         asset: String,
         mongo_collection: &str,
-        binance_client: BinanceClient,
+        exchange: Arc<dyn Exchange>,
         trading_config: TradingConfig,
         withdrawal_config: WithdrawalConfig,
         notion_config: Option<&NotionConfig>,
@@ -36,9 +38,10 @@ impl DcaTrader {
     ) -> Result<Self> {
         let stats_db = DcaStatsDB::with_collection(mongo_collection).await?;
 
+        let source = exchange.name();
         let notion_tracker = if let Some(config) = notion_config {
             if !config.token.is_empty() && !config.database_id.is_empty() {
-                match NotionDCATracker::new(config, &asset) {
+                match NotionDCATracker::new(config, &asset, source) {
                     Ok(tracker) => {
                         info!("[{}] Notion integration enabled", asset);
                         Some(tracker)
@@ -59,7 +62,7 @@ impl DcaTrader {
 
         Ok(Self {
             asset,
-            binance_client,
+            exchange,
             trading_config,
             withdrawal_config,
             stats_db,
@@ -73,13 +76,13 @@ impl DcaTrader {
         info!("Starting {} DCA purchase execution", self.asset);
 
         // First, get EUR/USDC exchange rate to convert our EUR amount to USDC
-        let eur_usdc_price = self.binance_client.get_symbol_price("EURUSDC").await?;
+        let eur_usdc_price = self.exchange.get_usdc_per_eur().await?;
         let target_usdc_amount = self.trading_config.buy_amount_eur * eur_usdc_price;
-        
-        info!("EUR/USDC rate: {} - Converting {} EUR to {} USDC", 
+
+        info!("EUR/USDC rate: {} - Converting {} EUR to {} USDC",
               eur_usdc_price, self.trading_config.buy_amount_eur, target_usdc_amount);
 
-        let usdc_balance = self.binance_client.get_usdc_balanc().await?;
+        let usdc_balance = self.exchange.get_usdc_balance().await?;
         if usdc_balance < self.trading_config.min_balance_usdc {
             let error_msg = format!(
                 "Insufficient USDC balance: {}. Minimum required is {}",
@@ -106,8 +109,8 @@ impl DcaTrader {
         }
 
         let current_price = self
-            .binance_client
-            .get_symbol_price(&self.trading_config.symbol)
+            .exchange
+            .get_price(&self.trading_config.symbol)
             .await?;
 
         let estimated_eth = purchase_amount / current_price;
@@ -118,18 +121,14 @@ impl DcaTrader {
         );
 
         let order_result = self
-            .binance_client
-            .place_market_buy_order(&self.trading_config.symbol, purchase_amount)
+            .exchange
+            .place_market_buy(&self.trading_config.symbol, purchase_amount)
             .await?;
 
-        let executed_qty: Decimal = order_result.executed_qty.parse()?;
-        let executed_value: Decimal = order_result.cummulative_quote_qty.parse()?;
-        let average_price = if executed_qty > Decimal::ZERO {
-            executed_value / executed_qty
-        } else {
-            Decimal::ZERO
-        };
-        let fees_usdc = order_result.calculate_total_fees_in_usdc(&self.asset, current_price);
+        let executed_qty = order_result.executed_qty;
+        let executed_value = order_result.executed_value;
+        let average_price = order_result.avg_price;
+        let fees_usdc = order_result.fees_usdc;
 
         let purchase = DcaPurchase {
             id: Uuid::new_v4().to_string(),
@@ -139,13 +138,13 @@ impl DcaTrader {
             eth_amount: executed_qty,
             eth_price: average_price,
             fees_usdc,
-            order_id: order_result.order_id,
+            order_id: order_result.order_id.clone(),
             status: order_result.status.clone(),
         };
         self.stats_db.record_purchase(&purchase).await?;
 
         if let Some(ref notion_tracker) = self.notion_tracker {
-            let eur_usd_price = self.binance_client.get_symbol_price("EURUSDC").await?;
+            let eur_usd_price = self.exchange.get_usdc_per_eur().await?;
             let eur_amount = executed_value / eur_usd_price;
             if let Err(e) = notion_tracker
                 .record_dca_purchase(&purchase, eur_amount)
@@ -156,7 +155,7 @@ impl DcaTrader {
         }
 
         // Calculate EUR amount spent for display purposes
-        let eur_usd_price = self.binance_client.get_symbol_price("EURUSDC").await?;
+        let eur_usd_price = self.exchange.get_usdc_per_eur().await?;
         let actual_eur_spent = executed_value / eur_usd_price;
 
         // Print purchase details
@@ -201,33 +200,34 @@ impl DcaTrader {
     }
     pub async fn show_dca_summary(&self) -> Result<()> {
         let current_price = self
-            .binance_client
-            .get_symbol_price(&self.trading_config.symbol)
+            .exchange
+            .get_price(&self.trading_config.symbol)
             .await?;
         let summary = self.stats_db.get_summary(current_price).await?;
         print_dca_summary(&self.asset, &summary);
 
         let mut recent_purchases = self.stats_db.get_recent_purchases(5).await?;
-        
-        // If no recent purchases found in database, try to fetch from Binance
+
+        // If no recent purchases found in database, try to fetch from the exchange
         if recent_purchases.is_empty() {
-            info!("📝 No recent purchases found in database, fetching from Binance...");
-            match self.binance_client.get_current_month_purchases(&self.trading_config.symbol).await {
-                Ok(binance_purchases) => {
-                    if !binance_purchases.is_empty() {
-                        info!("✅ Found {} purchases from current month on Binance", binance_purchases.len());
+            let source = self.exchange.name();
+            info!("📝 No recent purchases found in database, fetching from {}...", source);
+            match self.exchange.get_current_month_purchases(&self.trading_config.symbol).await {
+                Ok(exchange_purchases) => {
+                    if !exchange_purchases.is_empty() {
+                        info!("✅ Found {} purchases from current month on {}", exchange_purchases.len(), source);
                         // Take only the 5 most recent ones
-                        recent_purchases = binance_purchases.into_iter().take(5).collect();
+                        recent_purchases = exchange_purchases.into_iter().take(5).collect();
                     } else {
-                        info!("📝 No purchases found for current month on Binance either");
+                        info!("📝 No purchases found for current month on {} either", source);
                     }
                 }
                 Err(e) => {
-                    warn!("⚠️  Failed to fetch purchases from Binance: {}", e);
+                    warn!("⚠️  Failed to fetch purchases from {}: {}", source, e);
                 }
             }
         }
-        
+
         print_recent_purchases(&self.asset, &recent_purchases);
         Ok(())
     }
@@ -305,9 +305,9 @@ impl DcaTrader {
             Ok(has_purchase) => Ok(has_purchase),
             Err(e) => {
                 warn!("⚠️  Failed to check purchases in database: {}", e);
-                // Fallback: check from Binance
-                let binance_purchases = self.binance_client.get_current_month_purchases(&self.trading_config.symbol).await?;
-                Ok(binance_purchases.iter().any(|p| p.timestamp >= start && p.timestamp <= end))
+                // Fallback: check from the exchange
+                let exchange_purchases = self.exchange.get_current_month_purchases(&self.trading_config.symbol).await?;
+                Ok(exchange_purchases.iter().any(|p| p.timestamp >= start && p.timestamp <= end))
             }
         }
     }
@@ -326,42 +326,9 @@ impl DcaTrader {
         info!("🔍 Checking if withdrawal is needed (last Monday of month)...");
 
         let coin = self.asset.as_str();
+        let destination = self.withdrawal_config.cold_wallet_address.as_str();
 
-        // First check if withdrawals are available for this coin
-        match self.binance_client.check_withdrawal_capability(coin).await {
-            Ok(can_withdraw) => {
-                if !can_withdraw {
-                    warn!("⚠️  {} withdrawals are not enabled for your account", coin);
-                    warn!("💡 Please check:");
-                    warn!("   • Account verification status");
-                    warn!("   • API key withdrawal permissions");
-                    warn!("   • Regional restrictions");
-                    warn!("   • Account security settings (2FA, etc.)");
-                    return Ok(());
-                }
-            }
-            Err(e) => {
-                warn!("Could not verify withdrawal capability: {}", e);
-                // Continue anyway, let the withdrawal attempt provide the specific error
-            }
-        }
-
-        // Also check the specific network
-        match self.binance_client.check_network_withdrawal_capability(coin, &self.withdrawal_config.network).await {
-            Ok(network_available) => {
-                if !network_available {
-                    warn!("⚠️  Network '{}' is not available for {} withdrawals", self.withdrawal_config.network, coin);
-                    warn!("💡 Double-check the WITHDRAWAL_NETWORK value matches a network Binance lists for {}", coin);
-                    return Ok(());
-                }
-                info!("Network '{}' is available for {} withdrawals", self.withdrawal_config.network, coin);
-            }
-            Err(e) => {
-                warn!("Could not verify network capability: {}", e);
-            }
-        }
-
-        let asset_balance = self.binance_client.get_asset_balance(coin).await?;
+        let asset_balance = self.exchange.get_asset_balance(coin).await?;
         info!("Current {} balance: {} {}", coin, asset_balance, coin);
 
         if asset_balance < self.withdrawal_config.min_eth_threshold {
@@ -384,29 +351,58 @@ impl DcaTrader {
 
         let actual_withdrawal_amount = withdrawal_amount.min(asset_balance);
 
+        // Verify the withdrawal is possible before attempting it. On Binance this
+        // checks coin/network availability; on Kraken it validates the withdrawal key.
+        match self.exchange.verify_withdrawal(
+            coin,
+            destination,
+            &self.withdrawal_config.network,
+            actual_withdrawal_amount,
+        ).await {
+            Ok(true) => {
+                info!("Withdrawal of {} {} verified as available", actual_withdrawal_amount, coin);
+            }
+            Ok(false) => {
+                warn!("⚠️  {} withdrawals are not currently available for this destination", coin);
+                warn!("💡 Please check:");
+                warn!("   • API key withdrawal permissions");
+                warn!("   • That the destination address/withdrawal key is registered on the exchange");
+                warn!("   • Regional restrictions and account security settings");
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("Could not verify withdrawal capability: {}", e);
+                // Continue anyway, let the withdrawal attempt provide the specific error
+            }
+        }
+
         info!("💸 Initiating withdrawal of {} {} to cold wallet", actual_withdrawal_amount, coin);
 
-        match self.binance_client.withdraw_asset(
+        match self.exchange.withdraw(
             coin,
-            &self.withdrawal_config.cold_wallet_address,
+            destination,
             actual_withdrawal_amount,
             &self.withdrawal_config.network,
         ).await {
-            Ok(response) => {
+            Ok(withdrawal_id) => {
                 info!("✅ Withdrawal initiated successfully!");
-                info!("Withdrawal ID: {}", response.id);
-                
+                info!("Withdrawal ID: {}", withdrawal_id);
+
                 // Log the withdrawal details
                 info!("╔═══════════════════════════════════════╗");
                 info!("║         💸 WITHDRAWAL DETAILS         ║");
                 info!("╠═══════════════════════════════════════╣");
                 info!("║ Amount: {:>23} {:>3} ║", actual_withdrawal_amount.round_dp(6), coin);
                 info!("║ Network: {:>26} ║", self.withdrawal_config.network);
-                info!("║ Address: {:>26} ║", format!("{}...{}", 
-                    &self.withdrawal_config.cold_wallet_address[..6],
-                    &self.withdrawal_config.cold_wallet_address[self.withdrawal_config.cold_wallet_address.len()-4..]
-                ));
-                info!("║ Withdrawal ID: {:>21} ║", response.id);
+                // `destination` is a raw address on Binance or a withdrawal-key name on
+                // Kraken; only abbreviate when it's long enough to be a real address.
+                let dest_display = if destination.len() > 12 {
+                    format!("{}...{}", &destination[..6], &destination[destination.len() - 4..])
+                } else {
+                    destination.to_string()
+                };
+                info!("║ Destination: {:>22} ║", dest_display);
+                info!("║ Withdrawal ID: {:>21} ║", withdrawal_id);
                 info!("╚═══════════════════════════════════════╝");
                 
                 Ok(())

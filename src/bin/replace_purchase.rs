@@ -1,24 +1,35 @@
 use anyhow::Result;
-use chrono::{TimeZone, Utc};
 use eth_dca_bot::binance::BinanceClient;
-use eth_dca_bot::config::Config;
-use eth_dca_bot::dca_stats_mongo::{DcaStatsDB, DcaPurchase};
+use eth_dca_bot::config::{Config, ExchangeKind};
+use eth_dca_bot::dca_stats_mongo::{DcaPurchase, DcaStatsDB};
+use eth_dca_bot::exchange::Exchange;
+use eth_dca_bot::kraken::KrakenClient;
 use eth_dca_bot::notion_integration::NotionDCATracker;
-use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::env;
+use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
 
 fn load_config() -> Result<Config> {
-    let api_key =
-        env::var("BINANCE_API_KEY").map_err(|_| anyhow::anyhow!("BINANCE_API_KEY not set"))?;
-    let secret_key = env::var("BINANCE_SECRET_KEY")
-        .map_err(|_| anyhow::anyhow!("BINANCE_SECRET_KEY not set"))?;
-
     let mut config = Config::default();
-    config.binance.api_key = api_key;
-    config.binance.secret_key = secret_key;
+
+    if let Ok(exchange) = env::var("EXCHANGE") {
+        config.exchange = ExchangeKind::parse(&exchange)
+            .ok_or_else(|| anyhow::anyhow!("Invalid EXCHANGE '{}'", exchange))?;
+    }
+    if let Ok(v) = env::var("BINANCE_API_KEY") {
+        config.binance.api_key = v;
+    }
+    if let Ok(v) = env::var("BINANCE_SECRET_KEY") {
+        config.binance.secret_key = v;
+    }
+    if let Ok(v) = env::var("KRAKEN_API_KEY") {
+        config.kraken.api_key = v;
+    }
+    if let Ok(v) = env::var("KRAKEN_SECRET_KEY") {
+        config.kraken.secret_key = v;
+    }
 
     if let Ok(amount) = env::var("DCA_AMOUNT_EUR") {
         config.trading.buy_amount_eur = amount.parse()?;
@@ -26,14 +37,8 @@ fn load_config() -> Result<Config> {
     if let Ok(min_balance) = env::var("MIN_BALANCE_USDC") {
         config.trading.min_balance_usdc = min_balance.parse()?;
     }
-    if let Ok(cron) = env::var("SCHEDULE_CRON") {
-        config.schedule.cron_expression = cron;
-    }
-    if let Ok(timezone) = env::var("TIMEZONE") {
-        config.schedule.timezone = timezone;
-    }
 
-    // Load Notion configuration
+    // Notion configuration
     if let Ok(token) = env::var("NOTION_TOKEN") {
         config.notion.token = token;
     }
@@ -41,85 +46,64 @@ fn load_config() -> Result<Config> {
         config.notion.database_id = database_id;
     }
     if let Ok(cold_wallet) = env::var("COLD_WALLET_ADDRESS") {
-        config.notion.cold_wallet_address = cold_wallet.clone();
-        config.withdrawal.cold_wallet_address = cold_wallet; // Also set for withdrawal
-    }
-
-    // Load Withdrawal configuration
-    if let Ok(enabled) = env::var("WITHDRAWAL_ENABLED") {
-        config.withdrawal.enabled = enabled.parse().unwrap_or(false);
-    }
-    if let Ok(wallet) = env::var("WITHDRAWAL_WALLET_ADDRESS") {
-        config.withdrawal.cold_wallet_address = wallet;
-    }
-    if let Ok(network) = env::var("WITHDRAWAL_NETWORK") {
-        config.withdrawal.network = network;
-    }
-    if let Ok(threshold) = env::var("WITHDRAWAL_MIN_ETH_THRESHOLD") {
-        config.withdrawal.min_eth_threshold = threshold.parse()?;
-    }
-    if let Ok(amount) = env::var("WITHDRAWAL_AMOUNT") {
-        config.withdrawal.withdrawal_amount = Some(amount.parse()?);
+        config.notion.cold_wallet_address = cold_wallet;
     }
 
     Ok(config)
 }
 
+fn build_exchange(config: &Config) -> Arc<dyn Exchange> {
+    match config.exchange {
+        ExchangeKind::Binance => Arc::new(BinanceClient::new(
+            config.binance.api_key.clone(),
+            config.binance.secret_key.clone(),
+            config.binance.base_url.clone(),
+        )),
+        ExchangeKind::Kraken => Arc::new(KrakenClient::new(
+            config.kraken.api_key.clone(),
+            config.kraken.secret_key.clone(),
+            config.kraken.base_url.clone(),
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .init();
-
-    // Load environment variables
+    tracing_subscriber::fmt().init();
     dotenv::dotenv().ok();
 
     let args: Vec<String> = env::args().collect();
     if args.len() != 3 {
         eprintln!("Usage: {} <order_id_to_remove> <order_id_to_replace_with>", args[0]);
-        eprintln!("Example: {} 6863767683 6863022335", args[0]);
+        eprintln!("Example: {} 6863767683 OQCLML-BW3P3-BUCMWZ", args[0]);
         std::process::exit(1);
     }
 
-    let order_id_to_remove: u64 = args[1].parse()
-        .map_err(|_| anyhow::anyhow!("Invalid order ID to remove: {}", args[1]))?;
-    
-    let order_id_to_replace_with: u64 = args[2].parse()
-        .map_err(|_| anyhow::anyhow!("Invalid replacement order ID: {}", args[2]))?;
+    // Order ids are strings now: numeric for legacy Binance orders, txids for Kraken.
+    let order_id_to_remove = args[1].clone();
+    let order_id_to_replace_with = args[2].clone();
 
     info!("🔄 Starting purchase replacement process");
     info!("   Removing order ID: {}", order_id_to_remove);
     info!("   Replacing with order ID: {}", order_id_to_replace_with);
 
-    // Load configuration using the same method as main.rs
     let config = load_config()?;
-    
-    // Initialize MongoDB connection
     let db = DcaStatsDB::new().await?;
-    
-    println!("{:?}",config.binance.api_key );
-    // Initialize Binance client
-    let binance_client = BinanceClient::new(
-        config.binance.api_key.clone(),
-        config.binance.secret_key.clone(),
-        config.binance.base_url.clone(),
-    );
+    let exchange = build_exchange(&config);
+    info!("Using exchange backend: {}", exchange.name());
 
-    // Step 1: Check if the order to remove exists in MongoDB
+    // Step 1: Remove the existing purchase from MongoDB if present.
     info!("🔍 Checking if order {} exists in MongoDB...", order_id_to_remove);
-    let existing_purchase = db.get_purchase_by_order_id(order_id_to_remove).await?;
-    
-    let removed_purchase = match existing_purchase {
+    let removed_purchase = match db.get_purchase_by_order_id(&order_id_to_remove).await? {
         Some(purchase) => {
             info!("✅ Found existing purchase: {:?}", purchase);
-            
-            // Remove the existing purchase
             info!("🗑️  Removing purchase with order ID: {}", order_id_to_remove);
-            let removed = db.remove_purchase_by_order_id(order_id_to_remove).await?;
-            if !removed {
-                return Err(anyhow::anyhow!("Failed to remove purchase with order ID: {}", order_id_to_remove));
+            if !db.remove_purchase_by_order_id(&order_id_to_remove).await? {
+                return Err(anyhow::anyhow!(
+                    "Failed to remove purchase with order ID: {}",
+                    order_id_to_remove
+                ));
             }
-            
             Some(purchase)
         }
         None => {
@@ -128,97 +112,81 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Step 2: Get order details from Binance for the replacement order
-    info!("📡 Fetching order details from Binance for order ID: {}", order_id_to_replace_with);
-    
-    // Get order history and find the specific order
-    let orders = binance_client.get_order_history("ETHUSDC", None, None, Some(1000)).await?;
-    
-    let replacement_order = orders.iter()
-        .find(|order| order.order_id == order_id_to_replace_with)
-        .ok_or_else(|| anyhow::anyhow!("Order with ID {} not found on Binance", order_id_to_replace_with))?;
+    // Step 2: Find the replacement order on the exchange (current month's orders).
+    info!(
+        "📡 Fetching order details from {} for order ID: {}",
+        exchange.name(),
+        order_id_to_replace_with
+    );
+    let purchases = exchange
+        .get_current_month_purchases(&config.trading.symbol)
+        .await?;
 
-    info!("✅ Found replacement order on Binance: {:?}", replacement_order);
+    let source = purchases
+        .into_iter()
+        .find(|p| p.order_id == order_id_to_replace_with)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Order with ID {} not found on {}",
+                order_id_to_replace_with,
+                exchange.name()
+            )
+        })?;
 
-    // Step 3: Create new DcaPurchase from Binance order
-    let executed_qty: Decimal = replacement_order.executed_qty.parse()
-        .map_err(|_| anyhow::anyhow!("Invalid executed quantity: {}", replacement_order.executed_qty))?;
-    
-    let executed_value: Decimal = replacement_order.cummulative_quote_qty.parse()
-        .map_err(|_| anyhow::anyhow!("Invalid executed value: {}", replacement_order.cummulative_quote_qty))?;
-
-    if executed_qty <= dec!(0) || executed_value <= dec!(0) {
-        return Err(anyhow::anyhow!("Invalid order data: qty={}, value={}", executed_qty, executed_value));
+    if source.eth_amount <= dec!(0) || source.usdc_amount <= dec!(0) {
+        return Err(anyhow::anyhow!(
+            "Invalid order data: qty={}, value={}",
+            source.eth_amount,
+            source.usdc_amount
+        ));
     }
 
-    let average_price = executed_value / executed_qty;
-    let timestamp = Utc.timestamp_millis_opt(replacement_order.time)
-        .single()
-        .ok_or_else(|| anyhow::anyhow!("Invalid timestamp: {}", replacement_order.time))?;
-
-    // Estimate fees as 0.1% of trade value (Binance standard fee)
-    let estimated_fees = executed_value * dec!(0.001);
-
+    // Step 3: Build a fresh purchase record from the exchange order.
     let new_purchase = DcaPurchase {
         id: Uuid::new_v4().to_string(),
-        timestamp,
-        symbol: replacement_order.symbol.clone(),
-        usdc_amount: executed_value,
-        eth_amount: executed_qty,
-        eth_price: average_price,
-        fees_usdc: estimated_fees,
-        order_id: replacement_order.order_id,
-        status: replacement_order.status.clone(),
+        timestamp: source.timestamp,
+        symbol: source.symbol.clone(),
+        usdc_amount: source.usdc_amount,
+        eth_amount: source.eth_amount,
+        eth_price: source.eth_price,
+        fees_usdc: source.fees_usdc,
+        order_id: source.order_id.clone(),
+        status: source.status.clone(),
     };
 
     info!("📦 Created new purchase record: {:?}", new_purchase);
 
-    // Step 4: Add new purchase to MongoDB
+    // Step 4: Store the new purchase.
     info!("💾 Adding new purchase to MongoDB...");
     db.record_purchase(&new_purchase).await?;
 
-    // Step 5: Handle Notion integration if configured
+    // Step 5: Notion, if configured.
     if config.notion.token.is_empty() || config.notion.database_id.is_empty() {
         info!("⚠️  Notion integration not configured, skipping Notion updates");
     } else {
         info!("📝 Updating Notion...");
-        
-        // Initialize Notion client
-        let notion_client = NotionDCATracker::new(&config.notion, "ETH")?;
-        
-        // We need to calculate EUR amount for Notion
-        // For simplicity, using a default EUR/USD rate of 0.85 (you might want to fetch this from an API)
+        let notion_client = NotionDCATracker::new(&config.notion, "ETH", exchange.name())?;
+        // Approximate EUR using a default rate; adjust if precise EUR is needed.
         let eur_amount = new_purchase.usdc_amount * dec!(0.85);
-        
-        // Record the new purchase in Notion
         notion_client.record_dca_purchase(&new_purchase, eur_amount).await?;
-        
         info!("✅ Notion updated successfully");
     }
 
-    // Step 6: Print summary
+    // Step 6: Summary.
     info!("🎉 Purchase replacement completed successfully!");
-    info!("╔═══════════════════════════════════════╗");
-    info!("║         REPLACEMENT SUMMARY           ║");
-    info!("╠═══════════════════════════════════════╣");
-    
     if let Some(removed) = &removed_purchase {
-        info!("║ REMOVED:                              ║");
-        info!("║ Order ID: {:>25} ║", removed.order_id);
-        info!("║ Date: {:>31} ║", removed.timestamp.format("%Y-%m-%d %H:%M:%S UTC"));
-        info!("║ USDC: ${:>30} ║", removed.usdc_amount.round_dp(2));
-        info!("║ ETH: {:>32} ║", removed.eth_amount.round_dp(6));
-        info!("╠═══════════════════════════════════════╣");
+        info!("REMOVED: order {} — {} USDC / {} {}",
+            removed.order_id,
+            removed.usdc_amount.round_dp(2),
+            removed.eth_amount.round_dp(6),
+            removed.symbol);
     }
-    
-    info!("║ ADDED:                                ║");
-    info!("║ Order ID: {:>25} ║", new_purchase.order_id);
-    info!("║ Date: {:>31} ║", new_purchase.timestamp.format("%Y-%m-%d %H:%M:%S UTC"));
-    info!("║ USDC: ${:>30} ║", new_purchase.usdc_amount.round_dp(2));
-    info!("║ ETH: {:>32} ║", new_purchase.eth_amount.round_dp(6));
-    info!("║ Price: ${:>29} ║", new_purchase.eth_price.round_dp(2));
-    info!("║ Fees: ${:>30} ║", new_purchase.fees_usdc.round_dp(4));
-    info!("╚═══════════════════════════════════════╝");
+    info!("ADDED: order {} — {} USDC / {} at ${} (fees ${})",
+        new_purchase.order_id,
+        new_purchase.usdc_amount.round_dp(2),
+        new_purchase.eth_amount.round_dp(6),
+        new_purchase.eth_price.round_dp(2),
+        new_purchase.fees_usdc.round_dp(4));
 
     Ok(())
 }

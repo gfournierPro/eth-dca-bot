@@ -1,10 +1,11 @@
 # ETH DCA Bot 🤖⚡
 
-A sophisticated Ethereum Dollar-Cost Averaging (DCA) bot built in Rust that automatically purchases ETH on Binance using a scheduled strategy. The bot includes advanced features like automated withdrawals to cold storage, comprehensive tracking with MongoDB, and optional Notion integration for portfolio management.
+A sophisticated Ethereum Dollar-Cost Averaging (DCA) bot built in Rust that automatically purchases ETH on Binance or Kraken using a scheduled strategy. The bot includes advanced features like automated withdrawals to cold storage, comprehensive tracking with MongoDB, and optional Notion integration for portfolio management.
 
 ## 🌟 Features
 
-- **Automated DCA Trading**: Schedule regular ETH purchases using EUR amounts (automatically converted to USDC) on Binance
+- **Pluggable Exchange Backend**: Trade on Binance or Kraken, selected with a single `EXCHANGE` env var — switch between them without code changes (see [Choosing an Exchange](#choosing-an-exchange))
+- **Automated DCA Trading**: Schedule regular ETH purchases using EUR amounts (automatically converted to USDC)
 - **Multi-Asset Support**: Optionally run a BTC DCA workflow alongside ETH in the same process, with independent schedules, stats, and withdrawals (see [BTC DCA Workflow](#btc-dca-workflow-optional))
 - **Smart Withdrawal System**: Automatically withdraw ETH/BTC to cold storage when thresholds are met
 - **MongoDB Integration**: Track all purchases, statistics, and performance metrics
@@ -18,8 +19,10 @@ A sophisticated Ethereum Dollar-Cost Averaging (DCA) bot built in Rust that auto
 
 ```
 src/
-├── main.rs              # Application entry point and scheduling
-├── binance.rs           # Binance API client and trading operations
+├── main.rs              # Application entry point, scheduling, exchange factory
+├── exchange.rs          # Exchange trait + unified order/withdrawal types
+├── binance.rs           # Binance API client (implements Exchange)
+├── kraken.rs            # Kraken API client (implements Exchange)
 ├── dca.rs              # Core DCA logic and trade execution
 ├── config.rs           # Configuration structures and defaults
 ├── dca_stats_mongo.rs  # MongoDB integration for statistics
@@ -27,13 +30,33 @@ src/
 └── date_utils.rs       # Date/time utilities for withdrawals
 ```
 
+## Choosing an Exchange
+
+Set `EXCHANGE=binance` or `EXCHANGE=kraken` (defaults to `binance` if unset). Only
+the selected exchange's credentials are required. Both integrations trade the same
+USDC-quoted pairs (`ETHUSDC`, `BTCUSDC`) and size buys from an EUR amount.
+
+Key differences to be aware of on Kraken:
+
+- **Credentials**: `KRAKEN_API_KEY` / `KRAKEN_SECRET_KEY` (the secret is the base64
+  "Private Key" shown when the API key is created).
+- **Withdrawals**: Kraken cannot withdraw to an arbitrary address via API. Register
+  your cold wallet as a **withdrawal key** in the Kraken UI (Funding → Withdraw) and
+  set `WITHDRAWAL_WALLET_ADDRESS` to that key's name. `WITHDRAWAL_NETWORK` is
+  informational on Kraken (the network is implied by the key).
+- **BTC**: referred to as `XBT` internally by Kraken; the bot handles the mapping, so
+  keep using `BTCUSDC` in config.
+
+To switch back to Binance later, set `EXCHANGE=binance` and provide the Binance
+credentials — no rebuild needed beyond restarting with the new env.
+
 ## 🚀 Quick Start
 
 ### Prerequisites
 
 - Rust (latest stable version)
 - Docker and Docker Compose
-- Binance account with API access
+- A Binance or Kraken account with API access
 - MongoDB (provided via Docker Compose)
 - (Optional) Notion integration token and database
 
@@ -49,9 +72,16 @@ cd eth-dca-bot
 Create a `.env` file in the project root:
 
 ```env
-# Binance API Configuration
+# Exchange selection: "binance" or "kraken"
+EXCHANGE=kraken
+
+# Binance API Configuration (used when EXCHANGE=binance)
 BINANCE_API_KEY=your_binance_api_key
 BINANCE_SECRET_KEY=your_binance_secret_key
+
+# Kraken API Configuration (used when EXCHANGE=kraken)
+KRAKEN_API_KEY=your_kraken_api_key
+KRAKEN_SECRET_KEY=your_kraken_private_key
 
 # Trading Configuration
 DCA_AMOUNT_EUR=50.0              # Amount in EUR to purchase ETH with (converted to USDC)
@@ -60,6 +90,7 @@ SCHEDULE_CRON=0 0 12 * * * *     # Daily at noon
 
 # Withdrawal Configuration
 WITHDRAWAL_ENABLED=true
+# Binance: on-chain address. Kraken: name of a pre-registered withdrawal key.
 WITHDRAWAL_WALLET_ADDRESS=0x1234567890123456789012345678901234567890
 WITHDRAWAL_NETWORK=ETH
 WITHDRAWAL_MIN_ETH_THRESHOLD=0.1
