@@ -8,11 +8,40 @@
 //! Every exchange speaks in the same USDC-quoted terms the DCA logic expects:
 //! balances in USDC, prices in USDC, and buys sized by a USDC amount.
 
+use std::time::Duration;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 
 use crate::dca_stats_mongo::DcaPurchase;
+
+/// Tuning for a "patient maker" limit buy (see [`Exchange::place_limit_buy`]).
+///
+/// The idea: rest a post-only limit order at the best bid to pay the lower maker
+/// fee, re-peg it as the market moves, and only cross the spread with a taker
+/// market order if the price drifts beyond `max_drift` or `hard_timeout` elapses —
+/// so the buy always eventually fills.
+#[derive(Debug, Clone)]
+pub struct LimitBuyConfig {
+    /// Fraction the best ask may rise above the starting ask before giving up on
+    /// maker fills and falling back to a market order (e.g. `0.003` = 0.3%).
+    pub max_drift: Decimal,
+    /// Hard cap on how long to chase a maker fill before falling back to market.
+    pub hard_timeout: Duration,
+    /// How often to re-check the book / resting order state.
+    pub poll_interval: Duration,
+}
+
+impl Default for LimitBuyConfig {
+    fn default() -> Self {
+        Self {
+            max_drift: Decimal::new(3, 3), // 0.003 = 0.3%
+            hard_timeout: Duration::from_secs(180),
+            poll_interval: Duration::from_secs(1),
+        }
+    }
+}
 
 /// The result of a completed market buy, normalised across exchanges.
 #[derive(Debug, Clone)]
@@ -55,6 +84,22 @@ pub trait Exchange: Send + Sync {
 
     /// Place a market buy sized by a USDC amount and return the fill details.
     async fn place_market_buy(&self, symbol: &str, quote_usdc: Decimal) -> Result<OrderOutcome>;
+
+    /// Buy `quote_usdc` worth of `symbol`, preferring the cheaper maker fee via a
+    /// resting post-only limit order but always eventually filling (see
+    /// [`LimitBuyConfig`]).
+    ///
+    /// The default implementation just takes liquidity with a market order, for
+    /// exchanges that don't (yet) implement a maker strategy. Kraken overrides it.
+    async fn place_limit_buy(
+        &self,
+        symbol: &str,
+        quote_usdc: Decimal,
+        cfg: &LimitBuyConfig,
+    ) -> Result<OrderOutcome> {
+        let _ = cfg;
+        self.place_market_buy(symbol, quote_usdc).await
+    }
 
     /// Reconstruct this month's filled buy purchases from the exchange, used as a
     /// fallback when the local database has no record.

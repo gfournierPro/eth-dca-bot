@@ -1,6 +1,6 @@
 use crate::config::{TradingConfig, NotionConfig, WithdrawalConfig};
 use crate::dca_stats_mongo::{DcaPurchase, print_dca_summary, print_recent_purchases};
-use crate::exchange::Exchange;
+use crate::exchange::{Exchange, LimitBuyConfig};
 use crate::notion_integration::NotionDCATracker;
 use crate::dca_stats_mongo::DcaStatsDB;
 use crate::date_utils::should_check_withdrawal;
@@ -120,9 +120,17 @@ impl DcaTrader {
             purchase_amount, self.asset, estimated_eth, self.asset
         );
 
+        // Prefer the cheaper maker fee: exchanges that implement a patient-maker
+        // limit strategy (Kraken) will rest a post-only order and only fall back to
+        // a taker market order if the price drifts or a timeout hits. Exchanges
+        // without one (Binance) transparently fall back to a market order.
         let order_result = self
             .exchange
-            .place_market_buy(&self.trading_config.symbol, purchase_amount)
+            .place_limit_buy(
+                &self.trading_config.symbol,
+                purchase_amount,
+                &LimitBuyConfig::default(),
+            )
             .await?;
 
         let executed_qty = order_result.executed_qty;

@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::{Ok, Result, anyhow};
 use async_trait::async_trait;
@@ -30,7 +31,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::dca_stats_mongo::DcaPurchase;
-use crate::exchange::{Exchange, OrderOutcome};
+use crate::exchange::{Exchange, LimitBuyConfig, OrderOutcome};
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -104,6 +105,23 @@ struct KrakenOrderInfo {
 #[derive(Debug, Deserialize)]
 struct ClosedOrdersResult {
     closed: HashMap<String, KrakenOrderInfo>,
+}
+
+/// Raw `Depth` response. Each level is `[price, volume, timestamp]` with mixed
+/// string/number types, so keep it loosely typed and pull out what we need.
+#[derive(Debug, Deserialize)]
+struct DepthResult {
+    asks: Vec<Vec<serde_json::Value>>,
+    bids: Vec<Vec<serde_json::Value>>,
+}
+
+/// Top of the order book. `bid_str` is kept verbatim from the API so the limit
+/// price we post back respects Kraken's tick size for the pair.
+#[derive(Debug, Clone)]
+struct BookTop {
+    bid: Decimal,
+    bid_str: String,
+    ask: Decimal,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +266,281 @@ impl KrakenClient {
             .await?;
         Ok(orders.remove(txid))
     }
+
+    /// Fetch the top of the order book (best bid / best ask) for a USDC pair.
+    async fn get_order_book(&self, symbol: &str) -> Result<BookTop> {
+        let pair = Self::kraken_pair(symbol);
+        let result: HashMap<String, DepthResult> = self
+            .public_get("/public/Depth", &[("pair", pair.as_str()), ("count", "5")])
+            .await?;
+        let depth = result
+            .into_values()
+            .next()
+            .ok_or_else(|| anyhow!("Kraken returned no order book for {}", symbol))?;
+        let bid_str = depth
+            .bids
+            .first()
+            .and_then(|l| l.first())
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("Kraken order book for {} has no bids", symbol))?
+            .to_string();
+        let ask_str = depth
+            .asks
+            .first()
+            .and_then(|l| l.first())
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("Kraken order book for {} has no asks", symbol))?;
+        Ok(BookTop {
+            bid: parse_dec(&bid_str),
+            ask: parse_dec(ask_str),
+            bid_str,
+        })
+    }
+
+    /// Post a maker-only limit buy at `price` for `volume` base asset. The `post`
+    /// flag makes Kraken reject (rather than fill) the order if it would cross the
+    /// spread, guaranteeing the maker fee.
+    async fn add_post_only_limit(
+        &self,
+        pair: &str,
+        price: &str,
+        volume: Decimal,
+    ) -> Result<String> {
+        let add: AddOrderResult = self
+            .private_post(
+                "/private/AddOrder",
+                vec![
+                    ("pair".to_string(), pair.to_string()),
+                    ("type".to_string(), "buy".to_string()),
+                    ("ordertype".to_string(), "limit".to_string()),
+                    ("price".to_string(), price.to_string()),
+                    ("volume".to_string(), volume.to_string()),
+                    ("oflags".to_string(), "post".to_string()),
+                ],
+            )
+            .await?;
+        add.txid
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("Kraken AddOrder returned no txid"))
+    }
+
+    /// Cancel an order, tolerating the common "already closed / unknown" races.
+    async fn cancel_order(&self, txid: &str) {
+        #[derive(Debug, Deserialize)]
+        struct CancelResult {
+            #[serde(default)]
+            count: i64,
+        }
+        match self
+            .private_post::<CancelResult>(
+                "/private/CancelOrder",
+                vec![("txid".to_string(), txid.to_string())],
+            )
+            .await
+        {
+            std::result::Result::Ok(r) => {
+                info!("Canceled Kraken order {} (count {})", txid, r.count)
+            }
+            std::result::Result::Err(e) => {
+                warn!("Cancel of {} failed (may already be closed): {}", txid, e)
+            }
+        }
+    }
+
+    /// Read back how much of `txid` actually filled: (qty, quote cost, fee).
+    async fn realized_fill(&self, txid: &str) -> (Decimal, Decimal, Decimal) {
+        match self.query_order(txid).await {
+            std::result::Result::Ok(Some(o)) => (
+                parse_dec(&o.vol_exec),
+                parse_dec(&o.cost),
+                parse_dec(&o.fee),
+            ),
+            std::result::Result::Ok(None) => (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO),
+            std::result::Result::Err(e) => {
+                warn!("Could not read fill for {}: {}", txid, e);
+                (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)
+            }
+        }
+    }
+
+    /// Buy `quote_usdc` worth of `symbol` while paying the maker fee whenever
+    /// possible: rest a post-only limit at the best bid, re-peg it as the bid
+    /// moves, and fall back to a market order only if the ask drifts beyond
+    /// `cfg.max_drift` or `cfg.hard_timeout` elapses. Handles partial fills by
+    /// accumulating across re-pegs. Always fills unless nothing at all executed.
+    async fn run_patient_maker_buy(
+        &self,
+        symbol: &str,
+        quote_usdc: Decimal,
+        cfg: &LimitBuyConfig,
+    ) -> Result<OrderOutcome> {
+        let pair = Self::kraken_pair(symbol);
+        let min_remaining = dec!(0.5); // stop once the unspent budget is dust
+
+        // Reference: what a taker would pay right now. Drift is measured off this.
+        let start = self.get_order_book(symbol).await?;
+        let drift_ceiling = start.ask * (Decimal::ONE + cfg.max_drift);
+        let deadline = Instant::now() + cfg.hard_timeout;
+
+        info!(
+            "Patient maker buy: {} USDC of {} | best bid {} / ask {} | drift ceiling {} | timeout {}s",
+            quote_usdc,
+            pair,
+            start.bid,
+            start.ask,
+            drift_ceiling,
+            cfg.hard_timeout.as_secs()
+        );
+
+        let mut acc_qty = Decimal::ZERO;
+        let mut acc_value = Decimal::ZERO;
+        let mut acc_fee = Decimal::ZERO;
+        // Txids that actually contributed a fill (used as the composite order id).
+        let mut filled_txids: Vec<String> = Vec::new();
+        // The order currently resting on the book, if any: (txid, its limit price).
+        let mut resting: Option<(String, Decimal)> = None;
+
+        loop {
+            if quote_usdc - acc_value <= min_remaining {
+                if let Some((txid, _)) = resting.take() {
+                    self.cancel_order(&txid).await;
+                    let (q, v, f) = self.realized_fill(&txid).await;
+                    acc_qty += q;
+                    acc_value += v;
+                    acc_fee += f;
+                    if q > Decimal::ZERO {
+                        filled_txids.push(txid);
+                    }
+                }
+                break;
+            }
+
+            let book = self.get_order_book(symbol).await?;
+
+            // Give up on maker fills if price ran away or we're out of time, and
+            // guarantee the fill with a market order for whatever's left.
+            let drifted = book.ask > drift_ceiling;
+            let timed_out = Instant::now() >= deadline;
+            if drifted || timed_out {
+                if let Some((txid, _)) = resting.take() {
+                    self.cancel_order(&txid).await;
+                    let (q, v, f) = self.realized_fill(&txid).await;
+                    acc_qty += q;
+                    acc_value += v;
+                    acc_fee += f;
+                    if q > Decimal::ZERO {
+                        filled_txids.push(txid);
+                    }
+                }
+                let remaining = quote_usdc - acc_value;
+                if remaining > min_remaining {
+                    warn!(
+                        "{} — market fallback for remaining {} USDC (ask {}, ceiling {})",
+                        if drifted { "price drift" } else { "timeout" },
+                        remaining,
+                        book.ask,
+                        drift_ceiling
+                    );
+                    let fb = self.place_market_buy(symbol, remaining).await?;
+                    acc_qty += fb.executed_qty;
+                    acc_value += fb.executed_value;
+                    acc_fee += fb.fees_usdc;
+                    filled_txids.push(fb.order_id);
+                }
+                break;
+            }
+
+            match resting.clone() {
+                None => {
+                    let remaining = quote_usdc - acc_value;
+                    let volume = (remaining / book.bid)
+                        .round_dp_with_strategy(8, RoundingStrategy::ToZero);
+                    if volume <= Decimal::ZERO {
+                        break;
+                    }
+                    match self.add_post_only_limit(&pair, &book.bid_str, volume).await {
+                        std::result::Result::Ok(txid) => {
+                            info!(
+                                "Posted maker buy {} {} @ {} (txid {})",
+                                volume, pair, book.bid_str, txid
+                            );
+                            resting = Some((txid, book.bid));
+                        }
+                        std::result::Result::Err(e) => {
+                            // Post-only rejected (would have crossed) or transient;
+                            // re-read the book next tick and try again.
+                            warn!("Post-only placement failed, retrying: {}", e);
+                        }
+                    }
+                }
+                Some((txid, price)) => match self.query_order(&txid).await? {
+                    Some(order) if order.status == "closed" => {
+                        let (q, v, f) = (
+                            parse_dec(&order.vol_exec),
+                            parse_dec(&order.cost),
+                            parse_dec(&order.fee),
+                        );
+                        acc_qty += q;
+                        acc_value += v;
+                        acc_fee += f;
+                        if q > Decimal::ZERO {
+                            filled_txids.push(txid.clone());
+                        }
+                        info!("Maker order {} filled: {} for {} USDC", txid, q, v);
+                        resting = None;
+                    }
+                    Some(order) if order.status == "open" || order.status == "pending" => {
+                        // Re-peg only when the best bid has moved off our resting
+                        // price; otherwise keep our queue priority and wait.
+                        if book.bid != price {
+                            self.cancel_order(&txid).await;
+                            let (q, v, f) = self.realized_fill(&txid).await;
+                            acc_qty += q;
+                            acc_value += v;
+                            acc_fee += f;
+                            if q > Decimal::ZERO {
+                                filled_txids.push(txid.clone());
+                            }
+                            info!("Bid moved {} -> {}, re-pegging (filled {} so far)", price, book.bid, q);
+                            resting = None;
+                        }
+                    }
+                    _ => {
+                        // canceled / expired / unknown: realize any fill and repost.
+                        let (q, v, f) = self.realized_fill(&txid).await;
+                        acc_qty += q;
+                        acc_value += v;
+                        acc_fee += f;
+                        if q > Decimal::ZERO {
+                            filled_txids.push(txid.clone());
+                        }
+                        resting = None;
+                    }
+                },
+            }
+
+            sleep(cfg.poll_interval).await;
+        }
+
+        if acc_qty <= Decimal::ZERO {
+            return Err(anyhow!("Limit buy for {} filled no quantity", symbol));
+        }
+
+        let avg_price = acc_value / acc_qty;
+        info!(
+            "Limit buy complete: {} {} for {} USDC (avg {}, fees {})",
+            acc_qty, pair, acc_value, avg_price, acc_fee
+        );
+        Ok(OrderOutcome {
+            order_id: filled_txids.join("+"),
+            status: "FILLED".to_string(),
+            executed_qty: acc_qty,
+            executed_value: acc_value,
+            avg_price,
+            fees_usdc: acc_fee,
+        })
+    }
 }
 
 fn parse_dec(s: &str) -> Decimal {
@@ -391,6 +684,15 @@ impl Exchange for KrakenClient {
         }
 
         Err(anyhow!("Timed out waiting for Kraken order {} to fill", txid))
+    }
+
+    async fn place_limit_buy(
+        &self,
+        symbol: &str,
+        quote_usdc: Decimal,
+        cfg: &LimitBuyConfig,
+    ) -> Result<OrderOutcome> {
+        self.run_patient_maker_buy(symbol, quote_usdc, cfg).await
     }
 
     async fn get_current_month_purchases(&self, symbol: &str) -> Result<Vec<DcaPurchase>> {
