@@ -31,6 +31,9 @@ pub struct LimitBuyConfig {
     pub hard_timeout: Duration,
     /// How often to re-check the book / resting order state.
     pub poll_interval: Duration,
+    /// Stop chasing once the unspent budget is this much USDC or less — the
+    /// remainder is dust not worth another order. Was previously hardcoded.
+    pub min_remaining: Decimal,
 }
 
 impl Default for LimitBuyConfig {
@@ -39,6 +42,7 @@ impl Default for LimitBuyConfig {
             max_drift: Decimal::new(3, 3), // 0.003 = 0.3%
             hard_timeout: Duration::from_secs(180),
             poll_interval: Duration::from_secs(1),
+            min_remaining: Decimal::new(5, 1), // 0.5 USDC
         }
     }
 }

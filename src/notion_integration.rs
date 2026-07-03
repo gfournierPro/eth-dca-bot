@@ -40,6 +40,11 @@ pub struct NotionDCATracker {
     asset: String,
     /// Exchange name recorded in the "From" property (e.g. "Binance", "Kraken").
     source: String,
+    /// Header label for the appended purchase body block, distinguishing the buy
+    /// type inside the shared monthly page (e.g. "DCA Purchase", "Limit Sleeve
+    /// Fill"). Defaults to "DCA Purchase"; the sleeve overrides it via
+    /// [`NotionDCATracker::with_fill_label`].
+    fill_label: String,
 }
 
 impl NotionDCATracker {
@@ -65,7 +70,16 @@ impl NotionDCATracker {
             cold_wallet_address: config.cold_wallet_address.clone(),
             asset: asset.to_string(),
             source: source.to_string(),
+            fill_label: "DCA Purchase".to_string(),
         })
+    }
+
+    /// Override the body-block header label (e.g. the limit sleeve sets
+    /// "Limit Sleeve Fill" so its fills are visually distinct inside the shared
+    /// monthly page, while still rolling into the same accumulated totals).
+    pub fn with_fill_label(mut self, label: &str) -> Self {
+        self.fill_label = label.to_string();
+        self
     }
 
     pub async fn record_dca_purchase(
@@ -546,7 +560,8 @@ impl NotionDCATracker {
 
         // Format the purchase details with real data
         let title_line = format!(
-            "📈 DCA Purchase - {}",
+            "📈 {} - {}",
+            self.fill_label,
             purchase.timestamp.format("%Y-%m-%d %H:%M UTC")
         );
         let amount_line = format!(

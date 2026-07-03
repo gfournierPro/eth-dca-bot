@@ -1,6 +1,8 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::levels::VolumeProfileConfig;
+
 /// Which exchange backend the bot trades on. Both are kept so the active exchange
 /// can be flipped via the `EXCHANGE` env var without code changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -31,6 +33,59 @@ pub struct Config {
     pub withdrawal: WithdrawalConfig,
     /// Optional second asset (BTC) DCA workflow, run alongside ETH.
     pub btc: Option<AssetDcaConfig>,
+    /// Optional limit-order sleeve for the primary (ETH) asset. Off by default;
+    /// fully isolated from the DCA core (own budget, own Mongo collection).
+    pub limit_sleeve: Option<LimitSleeveConfig>,
+}
+
+/// Configuration for the optional limit-order sleeve.
+///
+/// The sleeve rests post-only bids at volume-profile levels below spot, funded by
+/// a fixed USDC war chest that drains as dips fill (never auto-replenished). It is
+/// kept isolated from the DCA core: its fills land in their own Mongo collection
+/// and are tagged in the shared Notion monthly page, so DCA stats stay pure.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LimitSleeveConfig {
+    /// Base asset the sleeve accumulates (e.g. "ETH"). Matches the DCA asset.
+    pub asset: String,
+    /// USDC-quoted trading pair the sleeve places bids on (e.g. "ETHUSDC").
+    pub symbol: String,
+    /// Fixed USDC war chest. Drains as bids fill; the sleeve goes quiet when empty.
+    pub war_chest_usdc: Decimal,
+    /// 7-field cron (with seconds) for recomputing levels and reconciling bids.
+    pub refresh_cron: String,
+    /// Timezone the refresh cron is evaluated in.
+    pub timezone: String,
+    /// OHLC candle interval in minutes. Also sets the lookback window, since
+    /// Kraken's OHLC endpoint caps at ~720 candles (60 ≈ 30 days).
+    pub interval_minutes: u32,
+    /// Mongo collection for the sleeve's fills and persisted war-chest balance,
+    /// kept separate from the DCA collections so stats never mix.
+    pub mongo_collection: String,
+    /// Volume-profile tunables handed to [`crate::levels`].
+    pub volume_profile: VolumeProfileConfig,
+}
+
+impl LimitSleeveConfig {
+    /// Sensible ETH defaults for the sleeve. Off unless `LIMIT_SLEEVE_ENABLED=true`
+    /// flips it on in `load_config`, where these get overridden from env.
+    pub fn eth_default() -> Self {
+        Self {
+            asset: "ETH".to_string(),
+            symbol: "ETHUSDC".to_string(),
+            war_chest_usdc: Decimal::new(500, 0), // $500 war chest
+            refresh_cron: "0 0 */6 * * *".to_string(), // every 6 hours
+            timezone: "Europe/Berlin".to_string(),
+            interval_minutes: 60, // hourly candles ≈ 30 days
+            mongo_collection: "limit_sleeve_fills".to_string(),
+            volume_profile: VolumeProfileConfig {
+                bucket_size: Decimal::new(5, 0),         // $5 buckets for ETH
+                hvn_threshold_ratio: Decimal::new(7, 1), // 0.7
+                ladder_steps: 4,
+                require_local_maxima: true,
+            },
+        }
+    }
 }
 
 /// A self-contained DCA workflow for a single asset.
@@ -131,6 +186,7 @@ impl Default for Config {
                 withdrawal_amount: None,         // Withdraw all available ETH
             },
             btc: None,
+            limit_sleeve: None,
         }
     }
 }

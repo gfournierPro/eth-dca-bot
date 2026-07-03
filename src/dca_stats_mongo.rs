@@ -220,6 +220,19 @@ impl DcaStatsDB {
         }
     }
 
+    /// Close-time of the most recently recorded purchase, or `None` if the
+    /// collection is empty. A proper sorted query (unlike `get_recent_purchases`,
+    /// which sorts a bounded, unordered cursor page). The sleeve uses this to bound
+    /// its Kraken `ClosedOrders` scan to "since our newest recorded fill".
+    pub async fn latest_purchase_timestamp(&self) -> Result<Option<DateTime<Utc>>> {
+        let latest = self
+            .collection
+            .find_one(Document::new())
+            .sort(doc! { "timestamp": -1 })
+            .await?;
+        Ok(latest.map(|p| p.timestamp))
+    }
+
     pub async fn get_recent_purchases(&self, limit: i64) -> Result<Vec<DcaPurchase>> {
         let mut cursor = self.collection.find(Document::new()).await?;
 

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use anyhow::{Ok, Result, anyhow};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{Datelike, TimeZone, Utc};
@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 use crate::dca_stats_mongo::DcaPurchase;
 use crate::exchange::{Exchange, LimitBuyConfig, OrderOutcome};
+use crate::levels::{BidLadder, VolumeProfileConfig, compute_volume_profile, derive_bid_ladder};
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -84,11 +85,17 @@ struct OrderDescr {
     pair: String,
     #[serde(rename = "type")]
     otype: String,
+    /// Resting limit price (present for limit orders; the top-level `price` field is
+    /// the average *fill* price, which differs for a partially/unfilled order).
+    #[serde(default)]
+    price: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct KrakenOrderInfo {
     status: String,
+    #[serde(default)]
+    vol: String,
     #[serde(default)]
     vol_exec: String,
     #[serde(default)]
@@ -99,12 +106,55 @@ struct KrakenOrderInfo {
     price: String,
     #[serde(default)]
     closetm: f64,
+    /// Client order reference; the sleeve tags its orders with a known userref so it
+    /// can identify them among all account orders. 0 / absent means "no reference".
+    #[serde(default)]
+    userref: i64,
     descr: OrderDescr,
 }
 
 #[derive(Debug, Deserialize)]
 struct ClosedOrdersResult {
     closed: HashMap<String, KrakenOrderInfo>,
+}
+
+/// One resting sleeve order, as seen in `OpenOrders`.
+#[derive(Debug, Clone)]
+pub struct OpenSleeveOrder {
+    pub txid: String,
+    /// Resting limit price.
+    pub price: Decimal,
+    /// Total ordered base volume.
+    pub volume: Decimal,
+    /// Base volume filled so far (a partial fill; the order is still `open`).
+    pub executed_qty: Decimal,
+}
+
+/// A sleeve order that has left the book (filled or canceled-after-partial), with
+/// the fill it realised. Only orders with a nonzero fill are surfaced. The average
+/// fill price is derived by the caller from `executed_value / executed_qty` (which
+/// equals Kraken's own `cost / vol_exec`), so it isn't duplicated here.
+#[derive(Debug, Clone)]
+pub struct ClosedSleeveFill {
+    pub txid: String,
+    pub executed_qty: Decimal,
+    /// USDC spent.
+    pub executed_value: Decimal,
+    /// USDC fee.
+    pub fee: Decimal,
+    /// Kraken close time (unix seconds) — the *actual* fill time, so the record is
+    /// dated correctly rather than to when the reconcile happened to observe it.
+    pub closetm: i64,
+}
+
+/// Per-pair trading constraints from Kraken's `AssetPairs`, needed to place valid
+/// resting bids: prices must be a multiple of `tick_size`, volumes rounded to
+/// `lot_decimals`, and every order must be at least `ordermin` base units.
+#[derive(Debug, Clone)]
+pub struct PairSpec {
+    pub tick_size: Decimal,
+    pub lot_decimals: u32,
+    pub ordermin: Decimal,
 }
 
 /// Raw `Depth` response. Each level is `[price, volume, timestamp]` with mixed
@@ -139,6 +189,29 @@ struct WithdrawResult {
     refid: String,
 }
 
+/// Normalised snapshot of a resting sleeve order, distilled from Kraken's
+/// `QueryOrders`. Exposes only what the limit sleeve needs — the current status
+/// and the fill accumulated so far — without leaking the raw Kraken payload.
+///
+/// IMPORTANT for reconcile logic: Kraken has **no `partial` status**. A partially
+/// filled order is still `open` with a nonzero `executed_qty`. So "did this order
+/// fill anything?" must be answered by `executed_qty > 0`, *independently* of
+/// `status` — branching on `status == "closed"` alone silently drops partial fills
+/// (which is exactly the real-money bug the realize-before-cancel rule guards
+/// against). The patient-maker loop follows the same rule.
+#[derive(Debug, Clone)]
+pub struct RestingOrderState {
+    /// Kraken order status: `open`, `closed`, `canceled`, `pending`, `expired`.
+    /// Note a partial fill is `open`, not a distinct status — see the type docs.
+    pub status: String,
+    /// Base asset filled so far (may be partial while still `open`).
+    pub executed_qty: Decimal,
+    /// USDC spent so far.
+    pub executed_value: Decimal,
+    /// USDC fees charged so far.
+    pub fee: Decimal,
+}
+
 impl KrakenClient {
     pub fn new(api_key: String, secret_key: String, base_url: String) -> Self {
         Self {
@@ -153,6 +226,251 @@ impl KrakenClient {
     /// altname, which uses `XBT` for Bitcoin.
     fn kraken_pair(symbol: &str) -> String {
         symbol.replace("BTC", "XBT")
+    }
+
+    /// Fetch OHLC candles from Kraken's public API and reduce them to
+    /// `(price, volume)` observations for volume-profile computation.
+    ///
+    /// Each candle contributes its **VWAP** (Kraken's own per-candle
+    /// volume-weighted average price) as the representative price, paired with the
+    /// candle's traded volume. VWAP attributes a candle's volume more faithfully
+    /// than close or typical price, and Kraken hands it to us for free.
+    ///
+    /// Zero-volume candles are dropped: they carry no information and their VWAP is
+    /// reported as `0`, which would otherwise corrupt the profile's price range.
+    ///
+    /// Note: Kraken's `OHLC` endpoint returns at most ~720 candles regardless of
+    /// range, so `interval_minutes` effectively sets the lookback window (e.g.
+    /// `60` ≈ 30 days of hourly candles).
+    pub async fn fetch_volume_observations(
+        &self,
+        symbol: &str,
+        interval_minutes: u32,
+    ) -> Result<Vec<(Decimal, Decimal)>> {
+        let pair = Self::kraken_pair(symbol);
+        let interval = interval_minutes.to_string();
+        // Result is `{ "<pair>": [[time,o,h,l,c,vwap,vol,count], ...], "last": N }`.
+        // The candle array lives under a pair-named key we can't predict exactly
+        // (Kraken may return a legacy code), so pull the first array-valued entry.
+        let result: serde_json::Value = self
+            .public_get(
+                "/public/OHLC",
+                &[("pair", pair.as_str()), ("interval", interval.as_str())],
+            )
+            .await?;
+
+        let observations = ohlc_observations(&result, symbol)?;
+
+        info!(
+            "Kraken OHLC for {} ({}m): {} usable candles",
+            symbol,
+            interval_minutes,
+            observations.len()
+        );
+        Ok(observations)
+    }
+
+    /// Build a volume-profile bid ladder for `symbol` straight from live Kraken
+    /// data: fetch OHLC observations, compute the profile, read current spot, and
+    /// derive the ladder of resting-bid levels below spot.
+    ///
+    /// Returns the ladder **and the spot price it was derived against**. The ladder
+    /// filter is "strictly below spot", so the sleeve must compare bids against the
+    /// *same* spot used here rather than reading price again — a third read could
+    /// straddle an HVN center and disagree about whether a level is a valid bid.
+    ///
+    /// This is the entry point the (future) limit-order sleeve calls; the level
+    /// math itself lives in [`crate::levels`] and stays exchange-agnostic.
+    pub async fn build_bid_ladder(
+        &self,
+        symbol: &str,
+        interval_minutes: u32,
+        config: &VolumeProfileConfig,
+    ) -> Result<(BidLadder, Decimal)> {
+        let observations = self
+            .fetch_volume_observations(symbol, interval_minutes)
+            .await?;
+        let profile = compute_volume_profile(&observations, config)?;
+        let current_price = self.get_price(symbol).await?;
+        let ladder = derive_bid_ladder(&profile, current_price, config)?;
+        Ok((ladder, current_price))
+    }
+
+    // --- Resting-order primitives for the limit sleeve ---------------------------
+    //
+    // These are thin, sleeve-facing wrappers over the exact post-only / cancel /
+    // query machinery the patient-maker loop already uses. Unlike `place_limit_buy`
+    // (which chases a fill synchronously and returns once done), these are
+    // fire-and-forget: the sleeve places resting bids, walks away, and reconciles
+    // them on a later refresh tick.
+
+    /// Post a fire-and-forget, post-only limit **buy** of `volume` base asset at
+    /// `price` for `symbol`, tagged with `userref` so it can be identified later,
+    /// returning the Kraken txid of the resting order.
+    ///
+    /// `price` is stringified as-is; the caller (sleeve) is responsible for rounding
+    /// it to the pair's tick size (see [`KrakenClient::fetch_pair_spec`]), since a
+    /// post-only order at an invalid tick is rejected by Kraken.
+    pub async fn place_resting_limit_buy(
+        &self,
+        symbol: &str,
+        price: Decimal,
+        volume: Decimal,
+        userref: i32,
+    ) -> Result<String> {
+        let pair = Self::kraken_pair(symbol);
+        self.add_post_only_limit(&pair, &price.normalize().to_string(), volume, userref)
+            .await
+    }
+
+    /// Fetch the per-pair trading constraints (tick size, lot decimals, order
+    /// minimum) the sleeve needs to place valid resting bids.
+    pub async fn fetch_pair_spec(&self, symbol: &str) -> Result<PairSpec> {
+        #[derive(Debug, Deserialize)]
+        struct AssetPairInfo {
+            #[serde(default)]
+            pair_decimals: u32,
+            #[serde(default)]
+            lot_decimals: u32,
+            #[serde(default)]
+            ordermin: String,
+            #[serde(default)]
+            tick_size: Option<String>,
+        }
+
+        let pair = Self::kraken_pair(symbol);
+        let result: HashMap<String, AssetPairInfo> = self
+            .public_get("/public/AssetPairs", &[("pair", pair.as_str())])
+            .await?;
+        let info = result
+            .into_values()
+            .next()
+            .ok_or_else(|| anyhow!("Kraken AssetPairs returned nothing for {}", symbol))?;
+
+        // Prefer the explicit tick_size; fall back to 10^-pair_decimals for older
+        // responses that omit it.
+        let tick_size = match info.tick_size.as_deref() {
+            Some(s) if !s.is_empty() => parse_dec(s),
+            _ => Decimal::ONE / Decimal::from(10u64.pow(info.pair_decimals)),
+        };
+        if tick_size <= Decimal::ZERO {
+            return Err(anyhow!(
+                "Kraken AssetPairs gave non-positive tick for {}",
+                symbol
+            ));
+        }
+        Ok(PairSpec {
+            tick_size,
+            lot_decimals: info.lot_decimals,
+            ordermin: parse_dec(&info.ordermin),
+        })
+    }
+
+    /// List the sleeve's currently-resting orders (those tagged with `userref`).
+    pub async fn get_open_sleeve_orders(&self, userref: i32) -> Result<Vec<OpenSleeveOrder>> {
+        #[derive(Debug, Deserialize)]
+        struct OpenOrdersResult {
+            open: HashMap<String, KrakenOrderInfo>,
+        }
+        let res: OpenOrdersResult = self.private_post("/private/OpenOrders", Vec::new()).await?;
+        Ok(res
+            .open
+            .into_iter()
+            .filter(|(_, info)| info.userref == userref as i64)
+            .map(|(txid, info)| OpenSleeveOrder {
+                txid,
+                price: parse_dec(&info.descr.price),
+                volume: parse_dec(&info.vol),
+                executed_qty: parse_dec(&info.vol_exec),
+            })
+            .collect())
+    }
+
+    /// List the sleeve's orders that have left the book with a nonzero fill (fully
+    /// filled, or canceled after a partial fill) — the crash-safe source of truth for
+    /// what actually got bought. Caller dedups against its own records by txid.
+    ///
+    /// `start` (unix seconds) bounds the scan; the endpoint returns only ~50 orders
+    /// per page, so this paginates through `ofs` to cover the whole window rather than
+    /// silently seeing only the most recent 50. Passing the caller's newest recorded
+    /// fill time keeps the scan cheap while never missing an unrecorded fill (every
+    /// unrecorded fill is newer than the newest recorded one).
+    pub async fn get_closed_sleeve_fills(
+        &self,
+        userref: i32,
+        start: Option<i64>,
+    ) -> Result<Vec<ClosedSleeveFill>> {
+        #[derive(Debug, Deserialize)]
+        struct ClosedPage {
+            closed: HashMap<String, KrakenOrderInfo>,
+            #[serde(default)]
+            count: i64,
+        }
+
+        // Safety cap so a bad `count` can never spin forever (40 pages ≈ 2000 orders).
+        const MAX_PAGES: i64 = 40;
+
+        let mut out = Vec::new();
+        let mut ofs: i64 = 0;
+        let mut complete = false;
+        for _ in 0..MAX_PAGES {
+            let mut params = vec![("ofs".to_string(), ofs.to_string())];
+            if let Some(s) = start {
+                params.push(("start".to_string(), s.to_string()));
+            }
+            let page: ClosedPage = self.private_post("/private/ClosedOrders", params).await?;
+            let page_len = page.closed.len() as i64;
+
+            for (txid, info) in page.closed {
+                if info.userref != userref as i64 {
+                    continue;
+                }
+                let executed_qty = parse_dec(&info.vol_exec);
+                if executed_qty > Decimal::ZERO {
+                    out.push(ClosedSleeveFill {
+                        txid,
+                        executed_qty,
+                        executed_value: parse_dec(&info.cost),
+                        fee: parse_dec(&info.fee),
+                        closetm: info.closetm as i64,
+                    });
+                }
+            }
+
+            ofs += page_len;
+            if page_len == 0 || ofs >= page.count {
+                complete = true;
+                break;
+            }
+        }
+        // Hitting the cap means the `[start, now]` window held more than ~2000 closed
+        // orders (a long downtime over a busy account). Surface it loudly rather than
+        // returning a truncated scan silently — some fills may go unrecorded this pass
+        // (the next reconcile retries from the same low-water mark).
+        if !complete {
+            warn!(
+                "Kraken ClosedOrders scan hit the {}-page cap; window too large, some sleeve fills may be unrecorded this pass",
+                MAX_PAGES
+            );
+        }
+        Ok(out)
+    }
+
+    /// Cancel a resting order by txid, tolerating the "already closed / unknown"
+    /// races (mirrors the maker loop's cancel semantics).
+    pub async fn cancel_resting_order(&self, txid: &str) {
+        self.cancel_order(txid).await
+    }
+
+    /// Read the current state of a resting order, or `None` if Kraken doesn't know
+    /// the txid. Normalises the raw payload into [`RestingOrderState`].
+    pub async fn query_resting_order(&self, txid: &str) -> Result<Option<RestingOrderState>> {
+        Ok(self.query_order(txid).await?.map(|o| RestingOrderState {
+            executed_qty: parse_dec(&o.vol_exec),
+            executed_value: parse_dec(&o.cost),
+            fee: parse_dec(&o.fee),
+            status: o.status,
+        }))
     }
 
     /// Candidate balance map keys for an asset. Kraken uses the `X`/`Z` prefixed
@@ -313,20 +631,22 @@ impl KrakenClient {
         pair: &str,
         price: &str,
         volume: Decimal,
+        userref: i32,
     ) -> Result<String> {
-        let add: AddOrderResult = self
-            .private_post(
-                "/private/AddOrder",
-                vec![
-                    ("pair".to_string(), pair.to_string()),
-                    ("type".to_string(), "buy".to_string()),
-                    ("ordertype".to_string(), "limit".to_string()),
-                    ("price".to_string(), price.to_string()),
-                    ("volume".to_string(), volume.to_string()),
-                    ("oflags".to_string(), "post".to_string()),
-                ],
-            )
-            .await?;
+        let mut params = vec![
+            ("pair".to_string(), pair.to_string()),
+            ("type".to_string(), "buy".to_string()),
+            ("ordertype".to_string(), "limit".to_string()),
+            ("price".to_string(), price.to_string()),
+            ("volume".to_string(), volume.to_string()),
+            ("oflags".to_string(), "post".to_string()),
+        ];
+        // Tag the order so it can be identified later (sleeve uses this). Kraken
+        // treats userref 0 / absent as "no reference", so the maker loop passes 0.
+        if userref != 0 {
+            params.push(("userref".to_string(), userref.to_string()));
+        }
+        let add: AddOrderResult = self.private_post("/private/AddOrder", params).await?;
         add.txid
             .into_iter()
             .next()
@@ -347,10 +667,10 @@ impl KrakenClient {
             )
             .await
         {
-            std::result::Result::Ok(r) => {
+            Ok(r) => {
                 info!("Canceled Kraken order {} (count {})", txid, r.count)
             }
-            std::result::Result::Err(e) => {
+            Err(e) => {
                 warn!("Cancel of {} failed (may already be closed): {}", txid, e)
             }
         }
@@ -359,13 +679,13 @@ impl KrakenClient {
     /// Read back how much of `txid` actually filled: (qty, quote cost, fee).
     async fn realized_fill(&self, txid: &str) -> (Decimal, Decimal, Decimal) {
         match self.query_order(txid).await {
-            std::result::Result::Ok(Some(o)) => (
+            Ok(Some(o)) => (
                 parse_dec(&o.vol_exec),
                 parse_dec(&o.cost),
                 parse_dec(&o.fee),
             ),
-            std::result::Result::Ok(None) => (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO),
-            std::result::Result::Err(e) => {
+            Ok(None) => (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO),
+            Err(e) => {
                 warn!("Could not read fill for {}: {}", txid, e);
                 (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)
             }
@@ -384,7 +704,7 @@ impl KrakenClient {
         cfg: &LimitBuyConfig,
     ) -> Result<OrderOutcome> {
         let pair = Self::kraken_pair(symbol);
-        let min_remaining = dec!(0.5); // stop once the unspent budget is dust
+        let min_remaining = cfg.min_remaining; // stop once the unspent budget is dust
 
         // Reference: what a taker would pay right now. Drift is measured off this.
         let start = self.get_order_book(symbol).await?;
@@ -467,15 +787,18 @@ impl KrakenClient {
                     if volume <= Decimal::ZERO {
                         break;
                     }
-                    match self.add_post_only_limit(&pair, &book.bid_str, volume).await {
-                        std::result::Result::Ok(txid) => {
+                    match self
+                        .add_post_only_limit(&pair, &book.bid_str, volume, 0)
+                        .await
+                    {
+                        Ok(txid) => {
                             info!(
                                 "Posted maker buy {} {} @ {} (txid {})",
                                 volume, pair, book.bid_str, txid
                             );
                             resting = Some((txid, book.bid));
                         }
-                        std::result::Result::Err(e) => {
+                        Err(e) => {
                             // Post-only rejected (would have crossed) or transient;
                             // re-read the book next tick and try again.
                             warn!("Post-only placement failed, retrying: {}", e);
@@ -556,6 +879,50 @@ impl KrakenClient {
 
 fn parse_dec(s: &str) -> Decimal {
     s.parse::<Decimal>().unwrap_or(dec!(0))
+}
+
+/// Reduce a raw Kraken `OHLC` result object to `(vwap, volume)` observations.
+///
+/// The response shape is awkward: an object keyed by the (possibly legacy-coded)
+/// pair name whose value is the candle array, plus a sibling `"last"` cursor.
+/// Each candle is `[time, open, high, low, close, vwap, volume, count]` with the
+/// price fields string-encoded. We take index 5 (VWAP) as the representative
+/// price and index 6 as the volume, and drop zero-volume candles whose VWAP is
+/// reported as `0` (they carry no information and would drag the profile's price
+/// range down to zero). Kept separate from the network call so it is unit-testable
+/// offline.
+fn ohlc_observations(result: &serde_json::Value, symbol: &str) -> Result<Vec<(Decimal, Decimal)>> {
+    let candles = result
+        .as_object()
+        .and_then(|obj| {
+            obj.iter()
+                .find(|(key, value)| *key != "last" && value.is_array())
+                .map(|(_, value)| value)
+        })
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| anyhow!("Kraken OHLC returned no candle series for {}", symbol))?;
+
+    let mut observations = Vec::with_capacity(candles.len());
+    for candle in candles {
+        let row = match candle.as_array() {
+            Some(row) if row.len() >= 7 => row,
+            _ => continue,
+        };
+        // Row layout: [time, open, high, low, close, vwap, volume, count].
+        let high = row[2].as_str().map(parse_dec).unwrap_or(Decimal::ZERO);
+        let low = row[3].as_str().map(parse_dec).unwrap_or(Decimal::ZERO);
+        let vwap = row[5].as_str().map(parse_dec).unwrap_or(Decimal::ZERO);
+        let volume = row[6].as_str().map(parse_dec).unwrap_or(Decimal::ZERO);
+        // Drop empty candles (vwap reported as 0) and any internally inconsistent
+        // row: a correctly-computed VWAP always lies within the candle's own
+        // [low, high], so this only ever rejects malformed data (e.g. a bad row
+        // during a venue incident), never a legitimate observation. Since this
+        // feeds real-money bid placement, that cheap guard is worth having.
+        if volume > Decimal::ZERO && vwap > Decimal::ZERO && vwap >= low && vwap <= high {
+            observations.push((vwap, volume));
+        }
+    }
+    Ok(observations)
 }
 
 #[async_trait]
@@ -685,7 +1052,7 @@ impl Exchange for KrakenClient {
                         if avg_price <= Decimal::ZERO && executed_qty > Decimal::ZERO {
                             avg_price = executed_value / executed_qty;
                         }
-                        return std::result::Result::Ok(OrderOutcome {
+                        return Ok(OrderOutcome {
                             order_id: txid,
                             status: "FILLED".to_string(),
                             executed_qty,
@@ -797,14 +1164,14 @@ impl Exchange for KrakenClient {
             )
             .await
         {
-            std::result::Result::Ok(info) => {
+            Ok(info) => {
                 info!(
                     "Kraken withdrawal available for {}: net {} (fee {}, limit {})",
                     asset, info.amount, info.fee, info.limit
                 );
                 Ok(true)
             }
-            std::result::Result::Err(e) => {
+            Err(e) => {
                 warn!(
                     "Kraken withdrawal not available for {} via key '{}': {}",
                     asset, destination, e
@@ -868,5 +1235,51 @@ mod tests {
     fn kraken_pair_maps_btc_to_xbt() {
         assert_eq!(KrakenClient::kraken_pair("BTCUSDC"), "XBTUSDC");
         assert_eq!(KrakenClient::kraken_pair("ETHUSDC"), "ETHUSDC");
+    }
+
+    #[test]
+    fn ohlc_observations_takes_vwap_and_volume_and_drops_empty_candles() {
+        // Shape mirrors Kraken's real OHLC result: a pair-keyed candle array plus a
+        // sibling "last" cursor. Each candle is
+        // [time, open, high, low, close, vwap, volume, count].
+        let payload = serde_json::json!({
+            "XETHZUSD": [
+                [1616662740, "1900.0", "1910.0", "1895.0", "1905.0", "1902.5", "12.5", 42],
+                // Zero-volume candle: Kraken reports vwap "0.0"; must be dropped so it
+                // doesn't drag the profile's price range to zero.
+                [1616662800, "1905.0", "1905.0", "1905.0", "1905.0", "0.0", "0.0", 0],
+                [1616662860, "1905.0", "1920.0", "1904.0", "1918.0", "1912.0", "8.0", 30]
+            ],
+            "last": 1616662860
+        });
+
+        let obs = ohlc_observations(&payload, "ETHUSDC").unwrap();
+        assert_eq!(
+            obs,
+            vec![(dec!(1902.5), dec!(12.5)), (dec!(1912.0), dec!(8.0))]
+        );
+    }
+
+    #[test]
+    fn ohlc_observations_errors_when_no_candle_series() {
+        // Only the "last" cursor, no pair-keyed array -> caller/upstream problem.
+        let payload = serde_json::json!({ "last": 1616662860 });
+        assert!(ohlc_observations(&payload, "ETHUSDC").is_err());
+    }
+
+    #[test]
+    fn ohlc_observations_drops_vwap_outside_candle_range() {
+        // Malformed row: vwap 5000 sits above the candle's own high (1910). A real
+        // VWAP can never exceed [low, high], so this must be rejected rather than
+        // corrupt the profile's price range.
+        let payload = serde_json::json!({
+            "XETHZUSD": [
+                [1616662740, "1900.0", "1910.0", "1895.0", "1905.0", "5000.0", "12.5", 42],
+                [1616662800, "1905.0", "1920.0", "1904.0", "1918.0", "1912.0", "8.0", 30]
+            ],
+            "last": 1616662800
+        });
+        let obs = ohlc_observations(&payload, "ETHUSDC").unwrap();
+        assert_eq!(obs, vec![(dec!(1912.0), dec!(8.0))]);
     }
 }
