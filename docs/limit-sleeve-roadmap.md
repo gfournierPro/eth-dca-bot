@@ -43,6 +43,21 @@ for the live-validation runbook referenced below.
   candles, VWAP inside `[low, high]`). Runbook (`docs/limit-sleeve-smoke-test.md`)
   written and gated.
 
+**Stage 3 — BTC sleeve**
+- Second sleeve slot (`Config::btc_limit_sleeve`) driven by `BTC_LIMIT_SLEEVE_*` /
+  `BTC_VP_*` env vars (shared loader with the ETH sleeve), with
+  `LimitSleeveConfig::btc_default()`: BTCUSDC, own `btc_limit_sleeve_fills`
+  collection, $100 volume-profile buckets (BTC-scaled).
+- **Per-sleeve `userref`** (ETH 770077, BTC 770078) moved from a hardcoded constant
+  into `LimitSleeveConfig` — with a shared userref the two sleeves would see (and
+  cancel) each other's bids and record each other's fills against their own war
+  chest. `validate_config` fails fast if the sleeves ever share a userref or a
+  Mongo collection.
+- BTC sleeve fills mirror into the **BTC** Notion DB (`BTC_NOTION_*`, falling back
+  to the BTC DCA workflow's config), tagged "Limit Sleeve Fill" like ETH's.
+- `sleeve_smoke` takes `--asset eth|btc` on every command so the same staged
+  runbook can be re-run against the BTC sleeve before funding it.
+
 ## Not done / open
 
 **Gate — live authenticated smoke test (blocks funding beyond pocket change)**
@@ -54,24 +69,20 @@ for the live-validation runbook referenced below.
   above a token amount.
 
 **Known gaps / backlog, roughly in order of relevance**
-1. **BTC sleeve.** The sleeve is ETH-only in practice (`eth_default()`,
-   single `Option<LimitSleeveConfig>`), unlike DCA which already runs ETH+BTC via
-   `Option<AssetDcaConfig>`. Extending needs a `btc_default()` with a BTC-scaled
-   `bucket_size` (~$50–100, not $5) and a second config slot + env wiring.
-2. **Float precision leak in the war-chest hard cap.** `deployable = war_chest -
+1. **Float precision leak in the war-chest hard cap.** `deployable = war_chest -
    spent` depends on `DcaStatsDB::get_summary`, which sums via MongoDB's
    `$toDouble` aggregation (`dca_stats_mongo.rs:124`) — an f64 round-trip baked
    into a Decimal-only codebase's hard spend cap. Harmless at USDC scale today,
    but worth a Decimal-native aggregation (or summing in Rust) if this pattern is
    ever reused somewhere precision-sensitive.
-3. **Re-peg hysteresis carried over from the patient-maker loop** — was deferred
+2. **Re-peg hysteresis carried over from the patient-maker loop** — was deferred
    there too. Not applicable to the sleeve's resting bids in the same way (they're
    meant to sit), but worth revisiting if reconcile cadence ever tightens below 6h.
-4. **War-chest replenishment.** Currently a fixed chest that drains and stops —
+3. **War-chest replenishment.** Currently a fixed chest that drains and stops —
    a deliberate choice, not a bug — but "sweep stale unfilled budget back to
    DCA" or a scheduled top-up were floated and never built. Decide only if the
    drain-and-stop behavior turns out to be the wrong shape in practice.
-5. **No alerting beyond logs.** Notion mirror failures and reconcile errors are
+4. **No alerting beyond logs.** Notion mirror failures and reconcile errors are
    logged (`warn!`/`error!`) but nothing pages anyone. Acceptable for an
    unattended bot today; revisit if the war chest grows large enough that a
    silent failure matters.
@@ -84,5 +95,7 @@ for the live-validation runbook referenced below.
    (0.001 ETH) hasn't already been re-verified there.
 3. Once a real fill has round-tripped cleanly, raise the war chest to its intended
    size.
-4. Then, in whatever order matters to you: BTC sleeve, war-chest replenishment
-   policy, Decimal-native war-chest aggregation.
+4. Repeat the runbook for the BTC sleeve (`sleeve_smoke ... --asset btc`) before
+   funding its war chest.
+5. Then, in whatever order matters to you: war-chest replenishment policy,
+   Decimal-native war-chest aggregation.

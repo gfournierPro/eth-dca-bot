@@ -32,10 +32,6 @@ use crate::kraken::{ClosedSleeveFill, KrakenClient, OpenSleeveOrder, PairSpec};
 use crate::levels::BidLevel;
 use crate::notion_integration::NotionDCATracker;
 
-/// Client order reference stamped on every sleeve order, so the sleeve can pick its
-/// own orders out of all account orders in `OpenOrders`/`ClosedOrders`.
-const SLEEVE_USERREF: i32 = 770_077;
-
 /// A concrete, exchange-valid bid: price rounded to tick, volume rounded to lot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SizedBid {
@@ -166,11 +162,15 @@ impl LimitSleeve {
         let spent = self.fills_db.get_summary(spot).await?.total_usdc_invested;
         let deployable = self.config.war_chest_usdc - spent;
 
-        let open = self.kraken.get_open_sleeve_orders(SLEEVE_USERREF).await?;
+        let open = self
+            .kraken
+            .get_open_sleeve_orders(self.config.userref)
+            .await?;
 
         if deployable <= Decimal::ZERO {
             info!(
-                "[sleeve] war chest cap reached (spent {:.2} / {:.2} USDC); cancelling {} resting order(s)",
+                "[sleeve:{}] war chest cap reached (spent {:.2} / {:.2} USDC); cancelling {} resting order(s)",
+                self.config.asset,
                 spent,
                 self.config.war_chest_usdc,
                 open.len()
@@ -242,19 +242,19 @@ impl LimitSleeve {
             }
             match self
                 .kraken
-                .place_resting_limit_buy(&symbol, bid.price, bid.volume, SLEEVE_USERREF)
+                .place_resting_limit_buy(&symbol, bid.price, bid.volume, self.config.userref)
                 .await
             {
                 Ok(txid) => {
                     available -= bid.value();
                     info!(
-                        "[sleeve] placed bid {} {} @ {} (txid {})",
-                        bid.volume, self.config.asset, bid.price, txid
+                        "[sleeve:{}] placed bid {} @ {} (txid {})",
+                        self.config.asset, bid.volume, bid.price, txid
                     );
                 }
                 Err(e) => warn!(
-                    "[sleeve] failed to place bid {} @ {}: {}",
-                    bid.volume, bid.price, e
+                    "[sleeve:{}] failed to place bid {} @ {}: {}",
+                    self.config.asset, bid.volume, bid.price, e
                 ),
             }
         }
@@ -284,8 +284,8 @@ impl LimitSleeve {
                     .await
                 {
                     warn!(
-                        "[sleeve] failed to realise partial before cancel {}: {}",
-                        o.txid, e
+                        "[sleeve:{}] failed to realise partial before cancel {}: {}",
+                        self.config.asset, o.txid, e
                     );
                 }
             }
@@ -311,7 +311,7 @@ impl LimitSleeve {
 
         let fills: Vec<ClosedSleeveFill> = self
             .kraken
-            .get_closed_sleeve_fills(SLEEVE_USERREF, start)
+            .get_closed_sleeve_fills(self.config.userref, start)
             .await?;
         for f in fills {
             let when = DateTime::<Utc>::from_timestamp(f.closetm, 0).unwrap_or_else(Utc::now);
@@ -364,8 +364,8 @@ impl LimitSleeve {
         };
         self.fills_db.record_purchase(&purchase).await?;
         info!(
-            "[sleeve] recorded fill {} {} @ {} ({:.2} USDC, txid {})",
-            qty, self.config.asset, avg_price, value_usdc, txid
+            "[sleeve:{}] recorded fill {} @ {} ({:.2} USDC, txid {})",
+            self.config.asset, qty, avg_price, value_usdc, txid
         );
 
         // Mirror to Notion (shared monthly page, tagged). Best-effort: a Notion
@@ -376,7 +376,10 @@ impl LimitSleeve {
                 _ => value_usdc, // fall back to ~USDC if the rate is unavailable
             };
             if let Err(e) = notion.record_dca_purchase(&purchase, eur).await {
-                warn!("[sleeve] Notion mirror failed for {}: {}", txid, e);
+                warn!(
+                    "[sleeve:{}] Notion mirror failed for {}: {}",
+                    self.config.asset, txid, e
+                );
             }
         }
         Ok(())
