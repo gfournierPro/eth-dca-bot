@@ -36,6 +36,9 @@ pub struct Config {
     /// Optional limit-order sleeve for the primary (ETH) asset. Off by default;
     /// fully isolated from the DCA core (own budget, own Mongo collection).
     pub limit_sleeve: Option<LimitSleeveConfig>,
+    /// Optional limit-order sleeve for BTC, run alongside the ETH sleeve. Same
+    /// isolation guarantees; separated on Kraken by a distinct `userref`.
+    pub btc_limit_sleeve: Option<LimitSleeveConfig>,
 }
 
 /// Configuration for the optional limit-order sleeve.
@@ -62,6 +65,12 @@ pub struct LimitSleeveConfig {
     /// Mongo collection for the sleeve's fills and persisted war-chest balance,
     /// kept separate from the DCA collections so stats never mix.
     pub mongo_collection: String,
+    /// Client order reference stamped on every order this sleeve places, and the
+    /// filter it uses to pick its own orders out of `OpenOrders`/`ClosedOrders`.
+    /// MUST be unique per sleeve on the same Kraken account: with a shared userref
+    /// each sleeve would see (and cancel) the other's bids and record the other's
+    /// fills against its own war chest.
+    pub userref: i32,
     /// Volume-profile tunables handed to [`crate::levels`].
     pub volume_profile: VolumeProfileConfig,
 }
@@ -78,8 +87,33 @@ impl LimitSleeveConfig {
             timezone: "Europe/Berlin".to_string(),
             interval_minutes: 60, // hourly candles ≈ 30 days
             mongo_collection: "limit_sleeve_fills".to_string(),
+            userref: 770_077,
             volume_profile: VolumeProfileConfig {
                 bucket_size: Decimal::new(5, 0),         // $5 buckets for ETH
+                hvn_threshold_ratio: Decimal::new(7, 1), // 0.7
+                ladder_steps: 4,
+                require_local_maxima: true,
+            },
+        }
+    }
+
+    /// Sensible BTC defaults for the sleeve. Mirrors [`Self::eth_default`] but
+    /// targets BTCUSDC, its own fills collection, a distinct `userref` (so the two
+    /// sleeves never touch each other's Kraken orders), and a BTC-scaled volume
+    /// bucket — BTC trades ~30-40x ETH's price, so $5 buckets would shred its
+    /// profile into noise.
+    pub fn btc_default() -> Self {
+        Self {
+            asset: "BTC".to_string(),
+            symbol: "BTCUSDC".to_string(),
+            war_chest_usdc: Decimal::new(500, 0), // $500 war chest
+            refresh_cron: "0 0 */6 * * *".to_string(), // every 6 hours
+            timezone: "Europe/Berlin".to_string(),
+            interval_minutes: 60, // hourly candles ≈ 30 days
+            mongo_collection: "btc_limit_sleeve_fills".to_string(),
+            userref: 770_078,
+            volume_profile: VolumeProfileConfig {
+                bucket_size: Decimal::new(100, 0),       // $100 buckets for BTC
                 hvn_threshold_ratio: Decimal::new(7, 1), // 0.7
                 ladder_steps: 4,
                 require_local_maxima: true,
@@ -187,6 +221,7 @@ impl Default for Config {
             },
             btc: None,
             limit_sleeve: None,
+            btc_limit_sleeve: None,
         }
     }
 }

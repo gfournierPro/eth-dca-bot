@@ -5,9 +5,13 @@
 //! duplicate) a live DCA cron running elsewhere on the same account. It talks to
 //! Kraken and Mongo directly through the same `LimitSleeve` production code path.
 //!
+//! Every command takes `--asset eth|btc` (default eth) to pick which sleeve's
+//! defaults — symbol, userref, bucket size, fills collection — it operates on.
+//!
 //!   cargo run --bin sleeve_smoke -- reconcile --chest 1.0 --collection limit_sleeve_smoke
 //!   cargo run --bin sleeve_smoke -- validate --price 2999.5 --volume 0.0015
 //!   cargo run --bin sleeve_smoke -- teardown
+//!   cargo run --bin sleeve_smoke -- reconcile --asset btc --chest 1.0
 
 use anyhow::{Result, anyhow};
 use eth_dca_bot::config::LimitSleeveConfig;
@@ -18,12 +22,11 @@ use rust_decimal::Decimal;
 use std::env;
 use std::str::FromStr;
 
-const SLEEVE_USERREF: i32 = 770_077;
-
 fn kraken_client() -> Result<KrakenClient> {
     let api_key = env::var("KRAKEN_API_KEY").map_err(|_| anyhow!("KRAKEN_API_KEY not set"))?;
     let secret = env::var("KRAKEN_SECRET_KEY").map_err(|_| anyhow!("KRAKEN_SECRET_KEY not set"))?;
-    let base_url = env::var("KRAKEN_BASE_URL").unwrap_or_else(|_| "https://api.kraken.com".to_string());
+    let base_url =
+        env::var("KRAKEN_BASE_URL").unwrap_or_else(|_| "https://api.kraken.com".to_string());
     Ok(KrakenClient::new(api_key, secret, base_url))
 }
 
@@ -34,42 +37,68 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
-fn decimal_arg(args: &[String], flag: &str, default: &str) -> Result<Decimal> {
-    let s = arg_value(args, flag).unwrap_or_else(|| default.to_string());
-    Decimal::from_str(&s).map_err(|e| anyhow!("bad value for {flag}: {e}"))
+fn decimal_arg(args: &[String], flag: &str, default: Decimal) -> Result<Decimal> {
+    match arg_value(args, flag) {
+        Some(s) => Decimal::from_str(&s).map_err(|e| anyhow!("bad value for {flag}: {e}")),
+        None => Ok(default),
+    }
+}
+
+/// The sleeve defaults selected by `--asset eth|btc` (default eth). Carries the
+/// per-asset symbol, userref, bucket size, and fills collection, so the smoke test
+/// exercises exactly what the production sleeve for that asset would.
+fn sleeve_defaults(args: &[String]) -> Result<LimitSleeveConfig> {
+    match arg_value(args, "--asset").as_deref().unwrap_or("eth") {
+        "eth" | "ETH" => Ok(LimitSleeveConfig::eth_default()),
+        "btc" | "BTC" => Ok(LimitSleeveConfig::btc_default()),
+        other => Err(anyhow!("unknown --asset '{other}' (expected eth or btc)")),
+    }
+}
+
+/// Default smoke collection per asset — kept separate from the production fills
+/// collections so a smoke run can never pollute real war-chest accounting.
+fn smoke_collection(cfg: &LimitSleeveConfig) -> String {
+    match cfg.asset.as_str() {
+        "BTC" => "btc_limit_sleeve_smoke".to_string(),
+        _ => "limit_sleeve_smoke".to_string(),
+    }
 }
 
 async fn cmd_reconcile(args: &[String]) -> Result<()> {
-    let chest = decimal_arg(args, "--chest", "1.0")?;
-    let collection = arg_value(args, "--collection").unwrap_or_else(|| "limit_sleeve_smoke".to_string());
-    let bucket_size = decimal_arg(args, "--bucket", "5.0")?;
-    let hvn_ratio = decimal_arg(args, "--hvn-ratio", "0.7")?;
-    let ladder_steps: usize = arg_value(args, "--ladder-steps")
-        .unwrap_or_else(|| "4".to_string())
-        .parse()?;
-    let interval_minutes: u32 = arg_value(args, "--interval")
-        .unwrap_or_else(|| "60".to_string())
-        .parse()?;
-
-    let mut cfg = LimitSleeveConfig::eth_default();
-    cfg.war_chest_usdc = chest;
-    cfg.mongo_collection = collection.clone();
-    cfg.interval_minutes = interval_minutes;
-    cfg.volume_profile.bucket_size = bucket_size;
-    cfg.volume_profile.hvn_threshold_ratio = hvn_ratio;
-    cfg.volume_profile.ladder_steps = ladder_steps;
+    let mut cfg = sleeve_defaults(args)?;
+    cfg.war_chest_usdc = decimal_arg(args, "--chest", Decimal::ONE)?;
+    cfg.mongo_collection =
+        arg_value(args, "--collection").unwrap_or_else(|| smoke_collection(&cfg));
+    cfg.volume_profile.bucket_size = decimal_arg(args, "--bucket", cfg.volume_profile.bucket_size)?;
+    cfg.volume_profile.hvn_threshold_ratio =
+        decimal_arg(args, "--hvn-ratio", cfg.volume_profile.hvn_threshold_ratio)?;
+    if let Some(v) = arg_value(args, "--ladder-steps") {
+        cfg.volume_profile.ladder_steps = v.parse()?;
+    }
+    if let Some(v) = arg_value(args, "--interval") {
+        cfg.interval_minutes = v.parse()?;
+    }
 
     println!(
         "--------------------------------------------------\n\
-         reconcile: symbol={} chest={} collection={} bucket={} hvn_ratio={} ladder_steps={} interval={}m\n\
+         reconcile: asset={} symbol={} userref={} chest={} collection={} bucket={} hvn_ratio={} ladder_steps={} interval={}m\n\
          --------------------------------------------------",
-        cfg.symbol, cfg.war_chest_usdc, cfg.mongo_collection, cfg.volume_profile.bucket_size,
-        cfg.volume_profile.hvn_threshold_ratio, cfg.volume_profile.ladder_steps, cfg.interval_minutes
+        cfg.asset,
+        cfg.symbol,
+        cfg.userref,
+        cfg.war_chest_usdc,
+        cfg.mongo_collection,
+        cfg.volume_profile.bucket_size,
+        cfg.volume_profile.hvn_threshold_ratio,
+        cfg.volume_profile.ladder_steps,
+        cfg.interval_minutes
     );
 
     let kraken = kraken_client()?;
     let notion = if !env::var("NOTION_TOKEN").unwrap_or_default().is_empty()
-        && !env::var("NOTION_DATABASE_ID").unwrap_or_default().is_empty()
+        && !env::var("NOTION_DATABASE_ID")
+            .unwrap_or_default()
+            .is_empty()
     {
         let notion_cfg = eth_dca_bot::config::NotionConfig {
             token: env::var("NOTION_TOKEN").unwrap_or_default(),
@@ -95,24 +124,26 @@ async fn cmd_reconcile(args: &[String]) -> Result<()> {
 }
 
 async fn cmd_ladder(args: &[String]) -> Result<()> {
-    let bucket_size = decimal_arg(args, "--bucket", "5.0")?;
-    let hvn_ratio = decimal_arg(args, "--hvn-ratio", "0.7")?;
-    let ladder_steps: usize = arg_value(args, "--ladder-steps")
-        .unwrap_or_else(|| "4".to_string())
-        .parse()?;
-    let interval_minutes: u32 = arg_value(args, "--interval")
-        .unwrap_or_else(|| "60".to_string())
-        .parse()?;
-    let vp = eth_dca_bot::levels::VolumeProfileConfig {
-        bucket_size,
-        hvn_threshold_ratio: hvn_ratio,
-        ladder_steps,
-        require_local_maxima: true,
+    let cfg = sleeve_defaults(args)?;
+    let mut vp = cfg.volume_profile.clone();
+    vp.bucket_size = decimal_arg(args, "--bucket", vp.bucket_size)?;
+    vp.hvn_threshold_ratio = decimal_arg(args, "--hvn-ratio", vp.hvn_threshold_ratio)?;
+    if let Some(v) = arg_value(args, "--ladder-steps") {
+        vp.ladder_steps = v.parse()?;
+    }
+    let interval_minutes: u32 = match arg_value(args, "--interval") {
+        Some(v) => v.parse()?,
+        None => cfg.interval_minutes,
     };
     let kraken = kraken_client()?;
-    let (ladder, spot) = kraken.build_bid_ladder("ETHUSDC", interval_minutes, &vp).await?;
-    let spec = kraken.fetch_pair_spec("ETHUSDC").await?;
-    println!("spot: {spot}  tick_size: {}  ordermin: {}", spec.tick_size, spec.ordermin);
+    let (ladder, spot) = kraken
+        .build_bid_ladder(&cfg.symbol, interval_minutes, &vp)
+        .await?;
+    let spec = kraken.fetch_pair_spec(&cfg.symbol).await?;
+    println!(
+        "{}: spot: {spot}  tick_size: {}  ordermin: {}",
+        cfg.symbol, spec.tick_size, spec.ordermin
+    );
     for (i, l) in ladder.levels.iter().enumerate() {
         println!(
             "  level {i}: price={} weight={} source_volume={}",
@@ -126,25 +157,36 @@ async fn cmd_ladder(args: &[String]) -> Result<()> {
 }
 
 async fn cmd_validate(args: &[String]) -> Result<()> {
-    let price = decimal_arg(args, "--price", "0")?;
-    let volume = decimal_arg(args, "--volume", "0.0015")?;
+    let cfg = sleeve_defaults(args)?;
+    let price = decimal_arg(args, "--price", Decimal::ZERO)?;
+    let volume = decimal_arg(args, "--volume", Decimal::from_str("0.0015").unwrap())?;
     if price <= Decimal::ZERO {
         return Err(anyhow!("--price <tick-rounded HVN price> is required"));
     }
     let kraken = kraken_client()?;
-    println!(">>> validate=true AddOrder: buy {volume} ETHUSDC @ {price} (post-only)");
-    match kraken.validate_resting_limit_buy("ETHUSDC", price, volume).await {
-        Ok(v) => println!("PASS — Kraken accepted (no error):\n{}", serde_json::to_string_pretty(&v)?),
+    println!(
+        ">>> validate=true AddOrder: buy {volume} {} @ {price} (post-only)",
+        cfg.symbol
+    );
+    match kraken
+        .validate_resting_limit_buy(&cfg.symbol, price, volume)
+        .await
+    {
+        Ok(v) => println!(
+            "PASS — Kraken accepted (no error):\n{}",
+            serde_json::to_string_pretty(&v)?
+        ),
         Err(e) => println!("FAIL — Kraken rejected:\n{e}"),
     }
     Ok(())
 }
 
-async fn cmd_list() -> Result<()> {
+async fn cmd_list(args: &[String]) -> Result<()> {
+    let cfg = sleeve_defaults(args)?;
     let kraken = kraken_client()?;
-    let open = kraken.get_open_sleeve_orders(SLEEVE_USERREF).await?;
+    let open = kraken.get_open_sleeve_orders(cfg.userref).await?;
     if open.is_empty() {
-        println!("no resting sleeve orders (userref {SLEEVE_USERREF}).");
+        println!("no resting sleeve orders (userref {}).", cfg.userref);
         return Ok(());
     }
     for o in &open {
@@ -156,22 +198,32 @@ async fn cmd_list() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_teardown() -> Result<()> {
+async fn cmd_teardown(args: &[String]) -> Result<()> {
+    let cfg = sleeve_defaults(args)?;
     let kraken = kraken_client()?;
-    let open = kraken.get_open_sleeve_orders(SLEEVE_USERREF).await?;
+    let open = kraken.get_open_sleeve_orders(cfg.userref).await?;
     if open.is_empty() {
-        println!("no resting sleeve orders (userref {SLEEVE_USERREF}) — nothing to cancel.");
+        println!(
+            "no resting sleeve orders (userref {}) — nothing to cancel.",
+            cfg.userref
+        );
         return Ok(());
     }
     for o in &open {
-        println!("cancelling {} (price {}, vol {}, executed {})", o.txid, o.price, o.volume, o.executed_qty);
+        println!(
+            "cancelling {} (price {}, vol {}, executed {})",
+            o.txid, o.price, o.volume, o.executed_qty
+        );
         kraken.cancel_resting_order(&o.txid).await;
     }
-    let remaining = kraken.get_open_sleeve_orders(SLEEVE_USERREF).await?;
+    let remaining = kraken.get_open_sleeve_orders(cfg.userref).await?;
     if remaining.is_empty() {
         println!("confirmed: no resting sleeve orders remain.");
     } else {
-        println!("WARNING: {} order(s) still open after cancel — re-check manually.", remaining.len());
+        println!(
+            "WARNING: {} order(s) still open after cancel — re-check manually.",
+            remaining.len()
+        );
     }
     Ok(())
 }
@@ -186,11 +238,11 @@ async fn main() -> Result<()> {
         Some("reconcile") => cmd_reconcile(&args).await,
         Some("ladder") => cmd_ladder(&args).await,
         Some("validate") => cmd_validate(&args).await,
-        Some("list") => cmd_list().await,
-        Some("teardown") => cmd_teardown().await,
+        Some("list") => cmd_list(&args).await,
+        Some("teardown") => cmd_teardown(&args).await,
         _ => {
             println!(
-                "usage:\n  sleeve_smoke reconcile --chest <usdc> --collection <name> [--bucket 5.0] [--hvn-ratio 0.7] [--ladder-steps 4] [--interval 60]\n  sleeve_smoke ladder [--bucket 5.0] [--hvn-ratio 0.7] [--ladder-steps 4] [--interval 60]\n  sleeve_smoke validate --price <p> --volume <v>\n  sleeve_smoke teardown"
+                "usage (all commands take --asset eth|btc, default eth):\n  sleeve_smoke reconcile [--asset eth|btc] --chest <usdc> --collection <name> [--bucket N] [--hvn-ratio 0.7] [--ladder-steps 4] [--interval 60]\n  sleeve_smoke ladder [--asset eth|btc] [--bucket N] [--hvn-ratio 0.7] [--ladder-steps 4] [--interval 60]\n  sleeve_smoke validate [--asset eth|btc] --price <p> --volume <v>\n  sleeve_smoke list [--asset eth|btc]\n  sleeve_smoke teardown [--asset eth|btc]"
             );
             Ok(())
         }

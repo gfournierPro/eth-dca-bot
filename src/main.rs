@@ -117,9 +117,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Limit-order sleeve (optional — Kraken only, isolated from the DCA core).
-    if let Err(e) = setup_limit_sleeve(&config, &sched).await {
-        error!("Failed to set up limit sleeve: {}", e);
+    // Limit-order sleeves (optional — Kraken only, isolated from the DCA core).
+    if let Err(e) = setup_limit_sleeves(&config, &sched).await {
+        error!("Failed to set up limit sleeves: {}", e);
     }
 
     sched.start().await?;
@@ -247,20 +247,64 @@ async fn setup_asset_trader(
     Ok(())
 }
 
-/// Set up the optional limit-order sleeve: a fresh Kraken client, its own Mongo
-/// collection, a startup reconcile, and the recurring reconcile job. The sleeve is
-/// Kraken-only (it uses Kraken's resting-order path), so it is skipped with a warning
-/// on any other backend.
-async fn setup_limit_sleeve(config: &Config, sched: &JobScheduler) -> Result<()> {
-    let Some(sleeve_cfg) = config.limit_sleeve.clone() else {
+/// Set up every configured limit-order sleeve (ETH and/or BTC). The sleeves are
+/// Kraken-only (they use Kraken's resting-order path), so they are skipped with a
+/// warning on any other backend. Each sleeve is isolated: one failing to start
+/// doesn't take the other down.
+async fn setup_limit_sleeves(config: &Config, sched: &JobScheduler) -> Result<()> {
+    // Each sleeve is paired with the Notion DB it mirrors into: the ETH sleeve
+    // reuses the shared (ETH) Notion DB, the BTC sleeve the BTC workflow's.
+    let mut sleeves: Vec<(config::LimitSleeveConfig, config::NotionConfig)> = Vec::new();
+    if let Some(s) = config.limit_sleeve.clone() {
+        sleeves.push((s, config.notion.clone()));
+    }
+    if let Some(s) = config.btc_limit_sleeve.clone() {
+        sleeves.push((s, btc_sleeve_notion(config)));
+    }
+    if sleeves.is_empty() {
         return Ok(());
-    };
+    }
     if config.exchange != ExchangeKind::Kraken {
         warn!(
             "Limit sleeve is enabled but EXCHANGE is not Kraken; the sleeve requires Kraken — skipping"
         );
         return Ok(());
     }
+
+    for (sleeve_cfg, notion_cfg) in sleeves {
+        let asset = sleeve_cfg.asset.clone();
+        if let Err(e) = setup_one_sleeve(sleeve_cfg, notion_cfg, config, sched).await {
+            error!("[sleeve:{}] setup failed: {}", asset, e);
+        }
+    }
+    Ok(())
+}
+
+/// Notion DB the BTC sleeve mirrors into: the BTC DCA workflow's DB when that
+/// workflow is configured, otherwise resolved from the `BTC_NOTION_*` env vars
+/// directly (the sleeve can run without the BTC DCA workflow).
+fn btc_sleeve_notion(config: &Config) -> config::NotionConfig {
+    if let Some(btc) = &config.btc {
+        return btc.notion.clone();
+    }
+    config::NotionConfig {
+        token: env::var("BTC_NOTION_TOKEN")
+            .or_else(|_| env::var("NOTION_TOKEN"))
+            .unwrap_or_default(),
+        database_id: env::var("BTC_NOTION_DATABASE_ID").unwrap_or_default(),
+        cold_wallet_address: String::new(),
+    }
+}
+
+/// Set up one limit-order sleeve: a fresh Kraken client, its own Mongo collection,
+/// a startup reconcile, and the recurring reconcile job.
+async fn setup_one_sleeve(
+    sleeve_cfg: config::LimitSleeveConfig,
+    notion_cfg: config::NotionConfig,
+    config: &Config,
+    sched: &JobScheduler,
+) -> Result<()> {
+    let asset = sleeve_cfg.asset.clone();
 
     // The sleeve holds a concrete Kraken client (its resting-order methods aren't on
     // the Exchange trait). Uses the same credentials as the trading backend.
@@ -270,13 +314,13 @@ async fn setup_limit_sleeve(config: &Config, sched: &JobScheduler) -> Result<()>
         config.kraken.base_url.clone(),
     );
 
-    // Notion mirror reuses the ETH (shared) Notion DB if configured; fills are tagged
-    // "Limit Sleeve Fill" inside it. Absent config just means Mongo-only recording.
-    let notion = if !config.notion.token.is_empty() && !config.notion.database_id.is_empty() {
-        match NotionDCATracker::new(&config.notion, &sleeve_cfg.asset, "Kraken") {
+    // Notion mirror; fills are tagged "Limit Sleeve Fill" inside the monthly page.
+    // Absent config just means Mongo-only recording.
+    let notion = if !notion_cfg.token.is_empty() && !notion_cfg.database_id.is_empty() {
+        match NotionDCATracker::new(&notion_cfg, &sleeve_cfg.asset, "Kraken") {
             Ok(tracker) => Some(tracker),
             Err(e) => {
-                warn!("[sleeve] Notion mirror disabled: {}", e);
+                warn!("[sleeve:{}] Notion mirror disabled: {}", asset, e);
                 None
             }
         }
@@ -289,13 +333,13 @@ async fn setup_limit_sleeve(config: &Config, sched: &JobScheduler) -> Result<()>
         .with_notion(notion);
 
     info!(
-        "[sleeve] enabled for {} on {} (war chest {} USDC)",
-        sleeve_cfg.asset, sleeve_cfg.symbol, sleeve_cfg.war_chest_usdc
+        "[sleeve:{}] enabled on {} (war chest {} USDC, userref {})",
+        asset, sleeve_cfg.symbol, sleeve_cfg.war_chest_usdc, sleeve_cfg.userref
     );
 
     // Reconcile once at startup (records any fills, places the initial ladder).
     if let Err(e) = sleeve.reconcile().await {
-        error!("[sleeve] startup reconcile failed: {}", e);
+        error!("[sleeve:{}] startup reconcile failed: {}", asset, e);
     }
 
     // Schedule the recurring reconcile.
@@ -304,13 +348,15 @@ async fn setup_limit_sleeve(config: &Config, sched: &JobScheduler) -> Result<()>
 
     let job = if timezone_str == "UTC" || timezone_str.is_empty() {
         let sleeve = sleeve.clone();
+        let asset = asset.clone();
         Job::new_async(cron.as_str(), move |_uuid, _l| {
             let sleeve = sleeve.clone();
+            let asset = asset.clone();
             Box::pin(async move {
-                info!("[sleeve] running scheduled reconcile");
+                info!("[sleeve:{}] running scheduled reconcile", asset);
                 match sleeve.reconcile().await {
-                    Ok(()) => info!("[sleeve] reconcile complete"),
-                    Err(e) => error!("[sleeve] reconcile failed: {}", e),
+                    Ok(()) => info!("[sleeve:{}] reconcile complete", asset),
+                    Err(e) => error!("[sleeve:{}] reconcile failed: {}", asset, e),
                 }
             })
         })?
@@ -318,13 +364,15 @@ async fn setup_limit_sleeve(config: &Config, sched: &JobScheduler) -> Result<()>
         use chrono_tz::Tz;
         let tz = Tz::from_str(&timezone_str).unwrap_or(chrono_tz::Europe::Berlin);
         let sleeve = sleeve.clone();
+        let asset = asset.clone();
         Job::new_async_tz(cron.as_str(), tz, move |_uuid, _l| {
             let sleeve = sleeve.clone();
+            let asset = asset.clone();
             Box::pin(async move {
-                info!("[sleeve] running scheduled reconcile");
+                info!("[sleeve:{}] running scheduled reconcile", asset);
                 match sleeve.reconcile().await {
-                    Ok(()) => info!("[sleeve] reconcile complete"),
-                    Err(e) => error!("[sleeve] reconcile failed: {}", e),
+                    Ok(()) => info!("[sleeve:{}] reconcile complete", asset),
+                    Err(e) => error!("[sleeve:{}] reconcile failed: {}", asset, e),
                 }
             })
         })?
@@ -332,8 +380,8 @@ async fn setup_limit_sleeve(config: &Config, sched: &JobScheduler) -> Result<()>
 
     sched.add(job).await?;
     info!(
-        "[sleeve] reconcile job scheduled: {} (timezone: {})",
-        cron, timezone_str
+        "[sleeve:{}] reconcile job scheduled: {} (timezone: {})",
+        asset, cron, timezone_str
     );
     Ok(())
 }
@@ -471,79 +519,107 @@ fn load_config() -> Result<Config> {
         config.btc = Some(btc);
     }
 
-    // Load the optional limit-order sleeve (additive; off unless enabled). Fully
-    // isolated from the DCA core — own budget, own Mongo collection.
+    // Load the optional limit-order sleeves (additive; off unless enabled). Fully
+    // isolated from the DCA core — own budget, own Mongo collection per sleeve.
     if env::var("LIMIT_SLEEVE_ENABLED")
         .map(|v| v == "true")
         .unwrap_or(false)
     {
-        let mut sleeve = config::LimitSleeveConfig::eth_default();
-
-        if let Ok(v) = env::var("LIMIT_SLEEVE_SYMBOL") {
-            sleeve.symbol = v;
-        }
-        if let Ok(v) = env::var("LIMIT_SLEEVE_WAR_CHEST_USDC") {
-            sleeve.war_chest_usdc = v.parse()?;
-        }
-        if let Ok(v) = env::var("LIMIT_SLEEVE_REFRESH_CRON") {
-            sleeve.refresh_cron = v;
-        }
-        // Reuse the global TIMEZONE unless a sleeve-specific one is provided.
-        sleeve.timezone = env::var("LIMIT_SLEEVE_TIMEZONE")
-            .ok()
-            .or_else(|| env::var("TIMEZONE").ok())
-            .unwrap_or(sleeve.timezone);
-        if let Ok(v) = env::var("LIMIT_SLEEVE_INTERVAL_MINUTES") {
-            sleeve.interval_minutes = v.parse()?;
-        }
-        if let Ok(v) = env::var("LIMIT_SLEEVE_MONGO_COLLECTION") {
-            sleeve.mongo_collection = v;
-        }
-
-        // Volume-profile tunables.
-        if let Ok(v) = env::var("VP_BUCKET_SIZE_ETH") {
-            sleeve.volume_profile.bucket_size = v.parse()?;
-        }
-        if let Ok(v) = env::var("VP_HVN_THRESHOLD_RATIO") {
-            sleeve.volume_profile.hvn_threshold_ratio = v.parse()?;
-        }
-        if let Ok(v) = env::var("VP_LADDER_STEPS") {
-            sleeve.volume_profile.ladder_steps = v.parse()?;
-        }
-        if let Ok(v) = env::var("VP_REQUIRE_LOCAL_MAXIMA") {
-            sleeve.volume_profile.require_local_maxima = v.parse().unwrap_or(true);
-        }
-
-        // Fail fast on nonsensical values now, rather than at the first reconcile
-        // tick hours later. `levels.rs` guards `bucket_size` internally too, but a
-        // startup error is far easier to diagnose than a mid-run one.
-        let vp = &sleeve.volume_profile;
-        if vp.bucket_size <= rust_decimal::Decimal::ZERO {
-            return Err(anyhow::anyhow!("VP_BUCKET_SIZE_ETH must be positive"));
-        }
-        if vp.ladder_steps == 0 {
-            return Err(anyhow::anyhow!("VP_LADDER_STEPS must be greater than 0"));
-        }
-        if vp.hvn_threshold_ratio <= rust_decimal::Decimal::ZERO
-            || vp.hvn_threshold_ratio > rust_decimal::Decimal::ONE
-        {
-            return Err(anyhow::anyhow!("VP_HVN_THRESHOLD_RATIO must be in (0, 1]"));
-        }
-        if sleeve.war_chest_usdc <= rust_decimal::Decimal::ZERO {
-            return Err(anyhow::anyhow!(
-                "LIMIT_SLEEVE_WAR_CHEST_USDC must be positive"
-            ));
-        }
-        if sleeve.interval_minutes == 0 {
-            return Err(anyhow::anyhow!(
-                "LIMIT_SLEEVE_INTERVAL_MINUTES must be greater than 0"
-            ));
-        }
-
-        config.limit_sleeve = Some(sleeve);
+        config.limit_sleeve = Some(load_sleeve_env(
+            config::LimitSleeveConfig::eth_default(),
+            "LIMIT_SLEEVE",
+            "VP",
+        )?);
+    }
+    if env::var("BTC_LIMIT_SLEEVE_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
+        config.btc_limit_sleeve = Some(load_sleeve_env(
+            config::LimitSleeveConfig::btc_default(),
+            "BTC_LIMIT_SLEEVE",
+            "BTC_VP",
+        )?);
     }
 
     Ok(config)
+}
+
+/// Overlay `{prefix}_*` / `{vp_prefix}_*` env vars onto a sleeve's defaults, then
+/// fail fast on nonsensical values — a startup error is far easier to diagnose than
+/// one at the first reconcile tick hours later (`levels.rs` guards `bucket_size`
+/// internally too). The ETH sleeve reads `LIMIT_SLEEVE_*`/`VP_*`, the BTC sleeve
+/// `BTC_LIMIT_SLEEVE_*`/`BTC_VP_*`.
+fn load_sleeve_env(
+    mut sleeve: config::LimitSleeveConfig,
+    prefix: &str,
+    vp_prefix: &str,
+) -> Result<config::LimitSleeveConfig> {
+    if let Ok(v) = env::var(format!("{prefix}_SYMBOL")) {
+        sleeve.symbol = v;
+    }
+    if let Ok(v) = env::var(format!("{prefix}_WAR_CHEST_USDC")) {
+        sleeve.war_chest_usdc = v.parse()?;
+    }
+    if let Ok(v) = env::var(format!("{prefix}_REFRESH_CRON")) {
+        sleeve.refresh_cron = v;
+    }
+    // Reuse the global TIMEZONE unless a sleeve-specific one is provided.
+    sleeve.timezone = env::var(format!("{prefix}_TIMEZONE"))
+        .ok()
+        .or_else(|| env::var("TIMEZONE").ok())
+        .unwrap_or(sleeve.timezone);
+    if let Ok(v) = env::var(format!("{prefix}_INTERVAL_MINUTES")) {
+        sleeve.interval_minutes = v.parse()?;
+    }
+    if let Ok(v) = env::var(format!("{prefix}_MONGO_COLLECTION")) {
+        sleeve.mongo_collection = v;
+    }
+
+    // Volume-profile tunables. The bucket size accepts the asset-suffixed spelling
+    // first for backwards compatibility (the ETH sleeve shipped as
+    // `VP_BUCKET_SIZE_ETH`), then the plain `{vp_prefix}_BUCKET_SIZE`.
+    if let Ok(v) = env::var(format!("{vp_prefix}_BUCKET_SIZE_{}", sleeve.asset))
+        .or_else(|_| env::var(format!("{vp_prefix}_BUCKET_SIZE")))
+    {
+        sleeve.volume_profile.bucket_size = v.parse()?;
+    }
+    if let Ok(v) = env::var(format!("{vp_prefix}_HVN_THRESHOLD_RATIO")) {
+        sleeve.volume_profile.hvn_threshold_ratio = v.parse()?;
+    }
+    if let Ok(v) = env::var(format!("{vp_prefix}_LADDER_STEPS")) {
+        sleeve.volume_profile.ladder_steps = v.parse()?;
+    }
+    if let Ok(v) = env::var(format!("{vp_prefix}_REQUIRE_LOCAL_MAXIMA")) {
+        sleeve.volume_profile.require_local_maxima = v.parse().unwrap_or(true);
+    }
+
+    let vp = &sleeve.volume_profile;
+    if vp.bucket_size <= rust_decimal::Decimal::ZERO {
+        return Err(anyhow::anyhow!("{vp_prefix}_BUCKET_SIZE must be positive"));
+    }
+    if vp.ladder_steps == 0 {
+        return Err(anyhow::anyhow!(
+            "{vp_prefix}_LADDER_STEPS must be greater than 0"
+        ));
+    }
+    if vp.hvn_threshold_ratio <= rust_decimal::Decimal::ZERO
+        || vp.hvn_threshold_ratio > rust_decimal::Decimal::ONE
+    {
+        return Err(anyhow::anyhow!(
+            "{vp_prefix}_HVN_THRESHOLD_RATIO must be in (0, 1]"
+        ));
+    }
+    if sleeve.war_chest_usdc <= rust_decimal::Decimal::ZERO {
+        return Err(anyhow::anyhow!("{prefix}_WAR_CHEST_USDC must be positive"));
+    }
+    if sleeve.interval_minutes == 0 {
+        return Err(anyhow::anyhow!(
+            "{prefix}_INTERVAL_MINUTES must be greater than 0"
+        ));
+    }
+
+    Ok(sleeve)
 }
 
 fn validate_config(config: &Config) -> Result<()> {
@@ -648,6 +724,25 @@ fn validate_config(config: &Config) -> Result<()> {
             "BTC DCA workflow enabled (symbol {}, schedule {}, collection {})",
             btc.trading.symbol, btc.schedule.cron_expression, btc.mongo_collection
         );
+    }
+
+    // The two sleeves must never share Kraken order tags or a fills collection: a
+    // shared userref means each sleeve sees (and cancels) the other's bids; a shared
+    // collection means each counts the other's fills against its own war chest.
+    if let (Some(eth), Some(btc)) = (&config.limit_sleeve, &config.btc_limit_sleeve) {
+        if eth.userref == btc.userref {
+            return Err(anyhow::anyhow!(
+                "ETH and BTC limit sleeves must use distinct userrefs (got {} for both)",
+                eth.userref
+            ));
+        }
+        if eth.mongo_collection == btc.mongo_collection {
+            return Err(anyhow::anyhow!(
+                "ETH and BTC limit sleeves must use distinct Mongo collections \
+                 (LIMIT_SLEEVE_MONGO_COLLECTION vs BTC_LIMIT_SLEEVE_MONGO_COLLECTION, got '{}')",
+                eth.mongo_collection
+            ));
+        }
     }
 
     info!("Configuration validated successfully");
