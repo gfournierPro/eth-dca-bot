@@ -653,6 +653,29 @@ impl KrakenClient {
             .ok_or_else(|| anyhow!("Kraken AddOrder returned no txid"))
     }
 
+    /// One-off `validate=true` check for a resting post-only buy: proves Kraken
+    /// accepts a tick-rounded price/volume without placing anything. Used only by
+    /// the live smoke-test harness (`src/bin/sleeve_smoke.rs`), not by the sleeve
+    /// itself — the sleeve trusts its own tick/lot/ordermin rounding once validated.
+    pub async fn validate_resting_limit_buy(
+        &self,
+        symbol: &str,
+        price: Decimal,
+        volume: Decimal,
+    ) -> Result<serde_json::Value> {
+        let pair = Self::kraken_pair(symbol);
+        let params = vec![
+            ("pair".to_string(), pair),
+            ("type".to_string(), "buy".to_string()),
+            ("ordertype".to_string(), "limit".to_string()),
+            ("price".to_string(), price.normalize().to_string()),
+            ("volume".to_string(), volume.to_string()),
+            ("oflags".to_string(), "post".to_string()),
+            ("validate".to_string(), "true".to_string()),
+        ];
+        self.private_post("/private/AddOrder", params).await
+    }
+
     /// Cancel an order, tolerating the common "already closed / unknown" races.
     async fn cancel_order(&self, txid: &str) {
         #[derive(Debug, Deserialize)]
