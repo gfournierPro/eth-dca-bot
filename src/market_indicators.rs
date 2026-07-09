@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use anyhow::Result;
 use crate::binance::BinanceClient;
 use crate::dca_stats_mongo::DcaStatsDB;
+use crate::exchange::Exchange;
 use tracing::{info, debug, warn};
 use std::collections::VecDeque;
 use reqwest;
@@ -132,12 +133,12 @@ impl MarketIndicators {
     /// Calculate dynamic DCA multiplier based on market conditions
     pub async fn calculate_dca_multiplier(
         &mut self,
-        binance_client: &BinanceClient,
+        exchange: &dyn Exchange,
         _stats_db: &DcaStatsDB,
         symbol: &str,
     ) -> Result<Decimal> {
         // Update price history with latest data
-        self.update_price_history(binance_client, symbol).await?;
+        self.update_price_history(exchange, symbol).await?;
         
         let mut total_multiplier = Decimal::ONE;
         
@@ -177,7 +178,7 @@ impl MarketIndicators {
     /// Update price history with recent data
     async fn update_price_history(
         &mut self,
-        binance_client: &BinanceClient,
+        exchange: &dyn Exchange,
         symbol: &str,
     ) -> Result<()> {
         // If we have insufficient historical data, fetch from external API
@@ -213,8 +214,8 @@ impl MarketIndicators {
             info!("Historical data loaded, {} price points available", self.price_history.len());
         }
         
-        // Always add current price from Binance
-        let current_price = binance_client.get_symbol_price(symbol).await?;
+        // Always add current price from the exchange
+        let current_price = exchange.get_price(symbol).await?;
         let current_time = Utc::now();
         
         // Add current price to history
