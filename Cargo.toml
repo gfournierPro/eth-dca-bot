@@ -6,11 +6,14 @@ edition = "2024"
 [dependencies]
 # Core dependencies - these compile fast
 anyhow = "1.0.99"
+async-trait = "0.1"
+base64 = "0.22"
 chrono = { version = "0.4.41", features = ["serde"] }
 chrono-tz = "0.10.0"
 dotenv = "0.15.0"
 hex = "0.4.3"
 hmac = "0.12.1"
+serde_urlencoded = "0.7"
 rust_decimal = "1.37.2"
 rust_decimal_macros = "1.37.1"
 serde = "1.0.219"

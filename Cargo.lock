@@ -659,6 +659,8 @@ name = "eth-dca-bot"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "base64 0.22.1",
  "bson",
  "chrono",
  "chrono-tz",
@@ -676,6 +678,7 @@ dependencies = [
  "rust_decimal_macros",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sha2",
  "sqlx",
  "tokio",
