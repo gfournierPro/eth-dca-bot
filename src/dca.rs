@@ -128,21 +128,27 @@ impl DcaTrader {
 
         // Calculate dynamic multiplier if market indicators are enabled
         let dca_multiplier = if let Some(ref mut market_indicators) = self.market_indicators {
-            market_indicators.calculate_dca_multiplier(
-                self.exchange.as_ref(),
-                &self.stats_db,
-                &self.trading_config.symbol,
-            ).await?
+            market_indicators
+                .calculate_dca_multiplier(
+                    self.exchange.as_ref(),
+                    &self.stats_db,
+                    &self.trading_config.symbol,
+                )
+                .await?
         } else {
             Decimal::ONE
         };
 
         let target_usdc_amount = base_target_usdc_amount * dca_multiplier;
 
-        info!("EUR/USDC rate: {} - Converting {} EUR to {} USDC (base amount)",
-              eur_usdc_price, self.trading_config.buy_amount_eur, base_target_usdc_amount);
-        info!("Dynamic DCA multiplier: {} - Adjusted target amount: {} USDC",
-              dca_multiplier, target_usdc_amount);
+        info!(
+            "EUR/USDC rate: {} - Converting {} EUR to {} USDC (base amount)",
+            eur_usdc_price, self.trading_config.buy_amount_eur, base_target_usdc_amount
+        );
+        info!(
+            "Dynamic DCA multiplier: {} - Adjusted target amount: {} USDC",
+            dca_multiplier, target_usdc_amount
+        );
 
         let usdc_balance = self.exchange.get_usdc_balance().await?;
         if usdc_balance < self.trading_config.min_balance_usdc {
@@ -339,16 +345,21 @@ impl DcaTrader {
         let lookback_time = now - Duration::hours(48);
 
         info!("🕐 Current time: {} UTC", now.format("%Y-%m-%d %H:%M:%S"));
-        info!("🔍 Looking for scheduled times between {} UTC and {} UTC",
-              lookback_time.format("%Y-%m-%d %H:%M:%S"),
-              now.format("%Y-%m-%d %H:%M:%S"));
+        info!(
+            "🔍 Looking for scheduled times between {} UTC and {} UTC",
+            lookback_time.format("%Y-%m-%d %H:%M:%S"),
+            now.format("%Y-%m-%d %H:%M:%S")
+        );
         info!("📋 Cron schedule: '{}'", self.cron_schedule);
 
         // Get all scheduled times in the lookback period
         let mut scheduled_times = Vec::new();
         for scheduled_time in schedule.after(&lookback_time).take(200) {
             if scheduled_time <= now {
-                info!("📅 Found scheduled time: {} UTC", scheduled_time.format("%Y-%m-%d %H:%M:%S"));
+                info!(
+                    "📅 Found scheduled time: {} UTC",
+                    scheduled_time.format("%Y-%m-%d %H:%M:%S")
+                );
                 scheduled_times.push(scheduled_time);
             } else {
                 break;
@@ -357,12 +368,17 @@ impl DcaTrader {
 
         if scheduled_times.is_empty() {
             info!("✅ No scheduled DCA executions were planned in the lookback period");
-            info!("💡 Note: Cron schedules are evaluated in UTC. Your schedule '{}' in timezone '{}' might need adjustment.", 
-                  self.cron_schedule, self.timezone);
+            info!(
+                "💡 Note: Cron schedules are evaluated in UTC. Your schedule '{}' in timezone '{}' might need adjustment.",
+                self.cron_schedule, self.timezone
+            );
             return Ok(());
         }
 
-        info!("📅 Found {} scheduled DCA time(s) in the lookback period", scheduled_times.len());
+        info!(
+            "📅 Found {} scheduled DCA time(s) in the lookback period",
+            scheduled_times.len()
+        );
 
         // Check each scheduled time to see if we have a purchase around that time
         for scheduled_time in scheduled_times {
