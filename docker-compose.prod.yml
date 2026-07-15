@@ -7,10 +7,18 @@ services:
     container_name: eth-dca-bot
     restart: unless-stopped
     environment:
-      # Binance API Configuration
-      - BINANCE_API_KEY=${BINANCE_API_KEY}
-      - BINANCE_SECRET_KEY=${BINANCE_SECRET_KEY}
+      # Exchange selection: "binance" or "kraken"
+      - EXCHANGE=${EXCHANGE:-kraken}
+
+      # Binance API Configuration (used when EXCHANGE=binance)
+      - BINANCE_API_KEY=${BINANCE_API_KEY:-}
+      - BINANCE_SECRET_KEY=${BINANCE_SECRET_KEY:-}
       - BINANCE_BASE_URL=${BINANCE_BASE_URL:-https://api.binance.com}
+
+      # Kraken API Configuration (used when EXCHANGE=kraken)
+      - KRAKEN_API_KEY=${KRAKEN_API_KEY:-}
+      - KRAKEN_SECRET_KEY=${KRAKEN_SECRET_KEY:-}
+      - KRAKEN_BASE_URL=${KRAKEN_BASE_URL:-https://api.kraken.com}
       
       # Trading Configuration
       - DCA_AMOUNT_EUR=${DCA_AMOUNT_EUR:-50}
@@ -33,7 +41,22 @@ services:
       # Notion Integration (Optional)
       - NOTION_TOKEN=${NOTION_TOKEN}
       - NOTION_DATABASE_ID=${NOTION_DATABASE_ID}
-      
+
+      # BTC DCA Workflow (Optional) — runs alongside ETH in the same container
+      - BTC_DCA_ENABLED=${BTC_DCA_ENABLED:-false}
+      - BTC_DCA_AMOUNT_EUR=${BTC_DCA_AMOUNT_EUR:-50}
+      - BTC_MIN_BALANCE_USDC=${BTC_MIN_BALANCE_USDC:-50}
+      - BTC_SCHEDULE_CRON=${BTC_SCHEDULE_CRON:-0 9 * * MON}
+      - BTC_TIMEZONE=${BTC_TIMEZONE:-}
+      - BTC_MONGO_COLLECTION=${BTC_MONGO_COLLECTION:-btc_purchases}
+      - BTC_NOTION_TOKEN=${BTC_NOTION_TOKEN:-}
+      - BTC_NOTION_DATABASE_ID=${BTC_NOTION_DATABASE_ID:-}
+      - BTC_COLD_WALLET_ADDRESS=${BTC_COLD_WALLET_ADDRESS:-}
+      - BTC_WITHDRAWAL_ENABLED=${BTC_WITHDRAWAL_ENABLED:-false}
+      - BTC_WITHDRAWAL_WALLET_ADDRESS=${BTC_WITHDRAWAL_WALLET_ADDRESS:-}
+      - BTC_WITHDRAWAL_NETWORK=${BTC_WITHDRAWAL_NETWORK:-BTC}
+      - BTC_WITHDRAWAL_MIN_THRESHOLD=${BTC_WITHDRAWAL_MIN_THRESHOLD:-0.0001}
+
       # Logging
       - RUST_LOG=${RUST_LOG:-info}
     depends_on:

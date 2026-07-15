@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     binance_client.sync_time().await?;
 
     let stats_db = DcaStatsDB::new().await?;
-    let notion_tracker = NotionDCATracker::new(&config.notion)?;
+    let notion_tracker = NotionDCATracker::new(&config.notion, "ETH", "Binance")?;
 
     // Get the most recent purchase from database
     let recent_purchases = stats_db.get_recent_purchases(1).await?;
