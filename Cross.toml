@@ -1,0 +1,8 @@
+[target.aarch64-linux-android]
+# Use the official cross-rs Docker image with Android NDK
+image = "ghcr.io/cross-rs/aarch64-linux-android:main"
+
+[build.env]
+passthrough = [
+    "RUST_LOG",
+]

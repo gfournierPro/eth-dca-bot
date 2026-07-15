@@ -1,0 +1,83 @@
+name: Cross-compile for Android
+
+on:
+  push:
+    branches: [ main, feature/* ]  # Run on main and all feature branches
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Cross.toml'
+      - '.github/workflows/cross-compile.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Cross.toml'
+      - '.github/workflows/cross-compile.yml'
+  workflow_dispatch:  # Allow manual triggering
+
+permissions:
+  contents: write  # Required to push commits back to the repository
+
+jobs:
+  cross-compile:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-linux-android
+    
+    - name: Cache cargo dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+    
+    - name: Install cross
+      run: cargo install cross --git https://github.com/cross-rs/cross
+    
+    - name: Cross compile for Android
+      env:
+        CROSS_NO_WARNINGS: "0"
+        OPENSSL_STATIC: "1"
+        OPENSSL_VENDOR: "1"
+        OPENSSL_NO_PKG_CONFIG: "1"
+        PKG_CONFIG_ALLOW_CROSS: "0"
+      run: cross build --target aarch64-linux-android --release
+    
+    - name: Create binaries directory
+      run: mkdir -p binaries/android
+    
+    - name: Copy Android binary
+      run: cp target/aarch64-linux-android/release/eth-dca-bot binaries/android/eth-dca-bot-android
+    
+    - name: Commit and push binary to repository
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add binaries/android/eth-dca-bot-android
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "🤖 Auto-update Android binary [skip ci]"
+          git push https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git HEAD:${{ github.ref_name }}
+        fi
+    
+    - name: Upload Android binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: eth-dca-bot-android
+        path: target/aarch64-linux-android/release/eth-dca-bot
+        retention-days: 30

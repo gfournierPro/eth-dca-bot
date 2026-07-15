@@ -1,14 +1,14 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Datelike, Utc};
 use notion_client::endpoints::Client as NotionClient;
+use notion_client::endpoints::blocks::append::request::AppendBlockChildrenRequest;
 use notion_client::endpoints::databases::query::request::QueryDatabaseRequestBuilder;
 use notion_client::endpoints::pages::create::request::CreateAPageRequest;
 use notion_client::endpoints::pages::update::request::UpdatePagePropertiesRequest;
-use notion_client::endpoints::blocks::append::request::AppendBlockChildrenRequest;
+use notion_client::objects::block::{Block, BlockType, ParagraphValue, TextColor};
 use notion_client::objects::page::{DateOrDateTime, DatePropertyValue, PageProperty};
 use notion_client::objects::parent::Parent;
 use notion_client::objects::rich_text::{RichText, Text};
-use notion_client::objects::block::{Block, BlockType, ParagraphValue, TextColor};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use tracing::{info, warn};
 
-use crate::dca_stats_mongo::DcaPurchase;
 use crate::config::NotionConfig;
+use crate::dca_stats_mongo::DcaPurchase;
 
 #[derive(Debug, Clone)]
 pub struct MonthlyDCAData {
@@ -37,10 +37,18 @@ pub struct NotionDCATracker {
     client: NotionClient,
     database_id: String,
     cold_wallet_address: String,
+    asset: String,
+    /// Exchange name recorded in the "From" property (e.g. "Binance", "Kraken").
+    source: String,
+    /// Header label for the appended purchase body block, distinguishing the buy
+    /// type inside the shared monthly page (e.g. "DCA Purchase", "Limit Sleeve
+    /// Fill"). Defaults to "DCA Purchase"; the sleeve overrides it via
+    /// [`NotionDCATracker::with_fill_label`].
+    fill_label: String,
 }
 
 impl NotionDCATracker {
-    pub fn new(config: &NotionConfig) -> Result<Self> {
+    pub fn new(config: &NotionConfig, asset: &str, source: &str) -> Result<Self> {
         if config.token.is_empty() {
             return Err(anyhow!("Notion token is required"));
         }
@@ -49,7 +57,10 @@ impl NotionDCATracker {
         }
 
         let client = NotionClient::new(config.token.clone(), None)?;
-        info!("Notion integration initialized");
+        info!(
+            "Notion integration initialized for {} (source: {})",
+            asset, source
+        );
         info!("Database ID: {}", &config.database_id[..8]);
         info!("Cold wallet: {}", config.cold_wallet_address);
 
@@ -57,7 +68,18 @@ impl NotionDCATracker {
             client,
             database_id: config.database_id.clone(),
             cold_wallet_address: config.cold_wallet_address.clone(),
+            asset: asset.to_string(),
+            source: source.to_string(),
+            fill_label: "DCA Purchase".to_string(),
         })
+    }
+
+    /// Override the body-block header label (e.g. the limit sleeve sets
+    /// "Limit Sleeve Fill" so its fills are visually distinct inside the shared
+    /// monthly page, while still rolling into the same accumulated totals).
+    pub fn with_fill_label(mut self, label: &str) -> Self {
+        self.fill_label = label.to_string();
+        self
     }
 
     pub async fn record_dca_purchase(
@@ -73,10 +95,12 @@ impl NotionDCATracker {
             .await?;
 
         // Update the page with actual purchase data
-        self.update_monthly_page(&page_id, purchase, eur_amount).await?;
-        
+        self.update_monthly_page(&page_id, purchase, eur_amount)
+            .await?;
+
         // Add detailed purchase content to the page
-        self.add_dca_purchase_content(&page_id, purchase, eur_amount).await?;
+        self.add_dca_purchase_content(&page_id, purchase, eur_amount)
+            .await?;
 
         Ok(())
     }
@@ -84,7 +108,7 @@ impl NotionDCATracker {
     pub async fn get_month_name(&self, date: &DateTime<Utc>) -> Result<String> {
         // First, check if a page already exists for this month/year
         let year_month = format!("{}-{:02}", date.year(), date.month());
-        
+
         // Get all existing pages to find the highest month number
         let request = QueryDatabaseRequestBuilder::default();
         let response = self
@@ -104,19 +128,28 @@ impl NotionDCATracker {
                     if let Some(first_text) = title.first() {
                         if let RichText::Text { text, .. } = first_text {
                             let title_content = &text.content;
-                            
+
                             // Extract month number from titles like "M22", "M1", etc.
                             if title_content.starts_with('M') {
                                 if let Ok(month_num) = title_content[1..].parse::<u32>() {
                                     highest_month_num = highest_month_num.max(month_num);
                                 }
                             }
-                            
+
                             // Check if this page is for the same month/year by looking at the When property
                             if let Some(when_property) = page.properties.get("When") {
-                                if let PageProperty::Date { date: Some(date_prop), .. } = when_property {
-                                    if let Some(DateOrDateTime::Date(page_date)) = &date_prop.start {
-                                        let page_year_month = format!("{}-{:02}", page_date.year(), page_date.month());
+                                if let PageProperty::Date {
+                                    date: Some(date_prop),
+                                    ..
+                                } = when_property
+                                {
+                                    if let Some(DateOrDateTime::Date(page_date)) = &date_prop.start
+                                    {
+                                        let page_year_month = format!(
+                                            "{}-{:02}",
+                                            page_date.year(),
+                                            page_date.month()
+                                        );
                                         if page_year_month == year_month {
                                             existing_month_for_date = Some(title_content.clone());
                                         }
@@ -131,17 +164,22 @@ impl NotionDCATracker {
 
         // If we found an existing page for this month/year, return its name
         if let Some(existing_name) = existing_month_for_date {
-            info!("Found existing month name for {}: {}", year_month, existing_name);
+            info!(
+                "Found existing month name for {}: {}",
+                year_month, existing_name
+            );
             return Ok(existing_name);
         }
 
         // Otherwise, create new month name by incrementing the highest number
         let new_month_num = highest_month_num + 1;
         let new_month_name = format!("M{}", new_month_num);
-        
-        info!("Creating new month name for {}: {} (highest was M{})", 
-              year_month, new_month_name, highest_month_num);
-        
+
+        info!(
+            "Creating new month name for {}: {} (highest was M{})",
+            year_month, new_month_name, highest_month_num
+        );
+
         Ok(new_month_name)
     }
 
@@ -187,14 +225,18 @@ impl NotionDCATracker {
     }
 
     // Public method for testing - creates a monthly page with fake data
-    pub async fn create_test_monthly_page(&self, month_name: &str, date: &DateTime<Utc>) -> Result<String> {
+    pub async fn create_test_monthly_page(
+        &self,
+        month_name: &str,
+        date: &DateTime<Utc>,
+    ) -> Result<String> {
         self.create_monthly_page(month_name, date).await
     }
 
     // Method to inspect the database schema for debugging
     pub async fn inspect_database_schema(&self) -> Result<()> {
         info!("🔍 Inspecting database schema...");
-        
+
         let response = self
             .client
             .databases
@@ -215,11 +257,9 @@ impl NotionDCATracker {
             };
             info!("  - {}: {}", name, prop_type);
         }
-        
+
         Ok(())
     }
-
-
 
     async fn create_monthly_page(&self, month_name: &str, date: &DateTime<Utc>) -> Result<String> {
         info!("Creating new Notion page for month: {}", month_name);
@@ -248,7 +288,7 @@ impl NotionDCATracker {
                 id: None,
                 select: Some(notion_client::objects::page::SelectPropertyValue {
                     id: None,
-                    name: Some("Binance".to_string()),
+                    name: Some(self.source.clone()),
                     color: None,
                 }),
             },
@@ -301,7 +341,7 @@ impl NotionDCATracker {
         // Create some sample content blocks for the page
         // For now, we'll create the page without content and add it later
         // as the notion-client library's block creation is quite complex
-        
+
         let create_request = CreateAPageRequest {
             parent: Parent::DatabaseId {
                 database_id: self.database_id.clone(),
@@ -324,7 +364,7 @@ impl NotionDCATracker {
             month_name,
             &response.id[..8]
         );
-        
+
         Ok(response.id)
     }
 
@@ -339,7 +379,7 @@ impl NotionDCATracker {
 
         // Calculate new accumulated values
         let new_network_fee = current_data.network_fee_eth; // We'll update this when we have transfer data
-        
+
         // Convert trading fee from USDC to ETH using the purchase price
         let trading_fee_eth = if purchase.eth_price > Decimal::ZERO {
             purchase.fees_usdc / purchase.eth_price
@@ -347,12 +387,12 @@ impl NotionDCATracker {
             Decimal::ZERO
         };
         let new_trading_fee = current_data.trading_fee_eth + trading_fee_eth;
-        
+
         let new_currency_eth = current_data.currency_eth + purchase.eth_amount;
         let new_eur_amount = current_data.eur + eur_amount;
 
-        // Generate Arbitrum link placeholder (you'll need to implement actual transfer tracking)
-        let arbitrum_link = format!("https://arbiscan.io/address/{}", self.cold_wallet_address);
+        // Generate cold-wallet explorer link (placeholder until transfer tracking exists)
+        let arbitrum_link = self.explorer_link();
 
         let update_request = UpdatePagePropertiesRequest {
             properties: {
@@ -421,13 +461,28 @@ impl NotionDCATracker {
 
         info!(" Updated monthly accumulation:");
         info!(
-            "    Total ETH this month: {} ETH",
-            new_currency_eth.round_dp(6)
+            "    Total {} this month: {} {}",
+            self.asset,
+            new_currency_eth.round_dp(6),
+            self.asset
         );
         info!("    Total EUR spent: €{}", new_eur_amount.round_dp(2));
-        info!("     Total trading fees: {} ETH", new_trading_fee.round_dp(6));
+        info!(
+            "     Total trading fees: {} {}",
+            new_trading_fee.round_dp(6),
+            self.asset
+        );
 
         Ok(())
+    }
+
+    /// Cold-wallet explorer URL appropriate for the asset's settlement network.
+    fn explorer_link(&self) -> String {
+        match self.asset.as_str() {
+            "BTC" => format!("https://mempool.space/address/{}", self.cold_wallet_address),
+            // ETH (and other EVM assets) default to the Arbitrum explorer used today.
+            _ => format!("https://arbiscan.io/address/{}", self.cold_wallet_address),
+        }
     }
 
     async fn get_current_page_data(&self, page_id: &str) -> Result<MonthlyDCAData> {
@@ -457,7 +512,7 @@ impl NotionDCATracker {
         Ok(MonthlyDCAData {
             page_id: Some(page_id.to_string()),
             month_name: "".to_string(), // We don't need this for updates
-            from: "Binance".to_string(),
+            from: self.source.clone(),
             link: None,
             network_fee_eth,
             trading_fee_eth,
@@ -488,31 +543,48 @@ impl NotionDCATracker {
     }
 
     // Method to add actual DCA purchase content to a page
-    async fn add_dca_purchase_content(&self, page_id: &str, purchase: &DcaPurchase, eur_amount: Decimal) -> Result<()> {
+    async fn add_dca_purchase_content(
+        &self,
+        page_id: &str,
+        purchase: &DcaPurchase,
+        eur_amount: Decimal,
+    ) -> Result<()> {
         info!("Adding DCA purchase content to page...");
-        
+
         // Calculate trading fee in ETH
         let trading_fee_eth = if purchase.eth_price > Decimal::ZERO {
             purchase.fees_usdc / purchase.eth_price
         } else {
             Decimal::ZERO
         };
-        
+
         // Format the purchase details with real data
-        let title_line = format!("📈 DCA Purchase - {}", purchase.timestamp.format("%Y-%m-%d %H:%M UTC"));
-        let amount_line = format!("💰 Amount: ${} USDC → {} ETH", 
-            purchase.usdc_amount.round_dp(2), 
-            purchase.eth_amount.round_dp(6)
+        let title_line = format!(
+            "📈 {} - {}",
+            self.fill_label,
+            purchase.timestamp.format("%Y-%m-%d %H:%M UTC")
         );
-        let price_line = format!("🏷️ ETH Price: ${}", purchase.eth_price.round_dp(2));
-        let fees_line = format!("💸 Trading Fee: {} ETH (${} USDC)", 
-            trading_fee_eth.round_dp(6), 
+        let amount_line = format!(
+            "💰 Amount: ${} USDC → {} {}",
+            purchase.usdc_amount.round_dp(2),
+            purchase.eth_amount.round_dp(6),
+            self.asset
+        );
+        let price_line = format!(
+            "🏷️ {} Price: ${}",
+            self.asset,
+            purchase.eth_price.round_dp(2)
+        );
+        let fees_line = format!(
+            "💸 Trading Fee: {} {} (${} USDC)",
+            trading_fee_eth.round_dp(6),
+            self.asset,
             purchase.fees_usdc.round_dp(4)
         );
         let eur_line = format!("🇪🇺 EUR Equivalent: €{}", eur_amount.round_dp(2));
         let order_line = format!("🔗 Order ID: {}", purchase.order_id);
         let status_line = format!("✅ Status: {}", purchase.status);
-        
+
         let content_lines = vec![
             title_line.as_str(),
             amount_line.as_str(),
@@ -523,10 +595,10 @@ impl NotionDCATracker {
             status_line.as_str(),
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", // Separator
         ];
-        
+
         // Create paragraph blocks for each line
         let mut blocks = Vec::new();
-        
+
         for line in content_lines {
             let paragraph_block = Block {
                 object: None,
@@ -556,15 +628,20 @@ impl NotionDCATracker {
             };
             blocks.push(paragraph_block);
         }
-        
+
         // Create the append request
         let append_request = AppendBlockChildrenRequest {
             children: blocks,
             after: None,
         };
-        
+
         // Add the blocks to the page
-        match self.client.blocks.append_block_children(page_id, append_request).await {
+        match self
+            .client
+            .blocks
+            .append_block_children(page_id, append_request)
+            .await
+        {
             Ok(_) => {
                 info!("✅ Successfully added DCA purchase details to Notion page!");
             }
@@ -572,13 +649,21 @@ impl NotionDCATracker {
                 warn!("⚠️  Failed to add purchase content to page: {}", e);
                 // Log what we would have added for debugging
                 info!("📝 Purchase details that we attempted to add:");
-                for line in &[&title_line, &amount_line, &price_line, &fees_line, &eur_line, &order_line, &status_line] {
+                for line in &[
+                    &title_line,
+                    &amount_line,
+                    &price_line,
+                    &fees_line,
+                    &eur_line,
+                    &order_line,
+                    &status_line,
+                ] {
                     info!("   {}", line);
                 }
                 return Err(anyhow!("Failed to add purchase content: {}", e));
             }
         }
-        
+
         Ok(())
     }
 }
