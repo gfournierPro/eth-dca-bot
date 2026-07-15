@@ -8,6 +8,7 @@ A sophisticated Ethereum Dollar-Cost Averaging (DCA) bot built in Rust that auto
 - **Automated DCA Trading**: Schedule regular ETH purchases using EUR amounts (automatically converted to USDC)
 - **Dynamic DCA Sizing**: Smart purchase amount adjustments based on market conditions (volatility, RSI, moving averages, momentum)
 - **Multi-Asset Support**: Optionally run a BTC DCA workflow alongside ETH in the same process, with independent schedules, stats, and withdrawals (see [BTC DCA Workflow](#btc-dca-workflow-optional))
+- **Limit-Order Sleeve** *(Kraken only, not yet live-validated)*: Optional volume-profile resting-bid sleeve layered on top of DCA (see [Limit-Order Sleeve](#limit-order-sleeve-optional-kraken-only))
 - **Smart Withdrawal System**: Automatically withdraw ETH/BTC to cold storage when thresholds are met
 - **MongoDB Integration**: Track all purchases, statistics, and performance metrics
 - **Notion Integration**: Optional integration with Notion for portfolio tracking and management
@@ -122,15 +123,17 @@ COLD_WALLET_ADDRESS=0x1234567890123456789012345678901234567890
 ### 3. Start MongoDB
 
 ```bash
-docker compose up -d
+make mongo-up
 ```
 
 ### 4. Build and Run
 
 ```bash
-cargo build --release
-cargo run
+make build-release
+make run
 ```
+
+See [Makefile Commands](#-makefile-commands) below for the full list of `make` targets (tests, linting, Docker, production stack, maintenance binaries).
 
 ## ⚙️ Configuration
 
@@ -209,6 +212,36 @@ and fall back to the defaults below:
 > **Note:** The BTC Notion database must use the same property schema as the ETH one
 > (`Name`, `From`, `When`, `Currency`, `eur`, `Network Fee`, `Trading Fee`, `Link`).
 
+### Limit-Order Sleeve (Optional, Kraken only)
+
+> ⚠️ **Status: code-complete, not yet validated against a live authenticated
+> Kraken account.** The compute path (volume profile, ladder, tick/lot rounding)
+> and public-API parsing are validated live; order placement, cancellation, fill
+> recording, and the war-chest math have only been logic/unit-tested so far. Run
+> the [live smoke-test runbook](docs/limit-sleeve-smoke-test.md) before funding a
+> real war chest — see [`docs/limit-sleeve-roadmap.md`](docs/limit-sleeve-roadmap.md)
+> for the full picture of what's done vs. open.
+
+On top of scheduled DCA buys, the bot can optionally run a **limit-order sleeve**
+that rests post-only bids at volume-profile levels below spot, funded by a fixed
+USDC "war chest" that drains as dips fill (never auto-replenished). It's fully
+isolated from the DCA core — own Mongo collection, own budget — so DCA stats stay
+pure. Kraken only (reuses Kraken's post-only order path); on Binance it's skipped
+with a warning if enabled.
+
+Enable it by setting `LIMIT_SLEEVE_ENABLED=true` (and `BTC_LIMIT_SLEEVE_ENABLED=true`
+for the BTC sleeve). Key variables — see `.env.example` for the full list with
+defaults:
+
+- `LIMIT_SLEEVE_WAR_CHEST_USDC`: fixed USDC budget the sleeve can deploy
+- `LIMIT_SLEEVE_REFRESH_CRON`: cron for recomputing levels and reconciling bids (default every 6h)
+- `LIMIT_SLEEVE_INTERVAL_MINUTES`: OHLC candle interval used to build the volume profile
+- `VP_BUCKET_SIZE_ETH`, `VP_HVN_THRESHOLD_RATIO`, `VP_LADDER_STEPS`, `VP_REQUIRE_LOCAL_MAXIMA`: volume-profile tunables (see `src/levels.rs`)
+
+The BTC sleeve mirrors this with `BTC_LIMIT_SLEEVE_*` / `BTC_VP_*` and its own
+Kraken `userref`, so the two sleeves never see or cancel each other's orders.
+Use `make sleeve-smoke` to drive the validation runbook.
+
 ### Cron Expression Examples
 
 ```bash
@@ -269,39 +302,21 @@ struct DcaPurchase {
 }
 ```
 
-## � Database Sync Feature
+## 🔄 Database Sync Feature
 
-The bot includes a powerful sync feature to recreate/retrieve your MongoDB database by checking trades made on Binance and ensuring they are properly stored in your DCA MongoDB database.
-
-### How to Use Database Sync
-
-To trigger the database sync, set the `SYNC_DATABASE` environment variable to `true`:
-
-```bash
-SYNC_DATABASE=true cargo run --release --bin eth-dca-bot
-```
+When `EXCHANGE=binance`, the bot automatically checks your MongoDB purchase history
+against Binance's own order history **on every startup** (`check_and_sync_database`
+in `main.rs`) — there is no env var to opt in or out; it always runs for Binance.
+It is skipped when `EXCHANGE=kraken`, since Kraken's order ids are opaque string
+txids rather than Binance's sequential numeric ids that the integrity check relies on.
 
 ### What It Does
 
-- **Fetches Historical Data**: Retrieves all ETHUSDC trades (both BUY and SELL orders) from Binance starting from 2025-09-01 08:25:58 (Order ID: 6778085567)
+- **Fetches Historical Data**: Retrieves all `ETHUSDC` trades (both BUY and SELL orders) from Binance since the bot's first recorded order
 - **Compares Records**: Checks existing MongoDB records against Binance history
 - **Identifies Missing Orders**: Finds any orders that exist on Binance but not in your database
-- **Syncs Missing Data**: Adds missing orders (purchases and sales) to your MongoDB database 
-- **Provides Detailed Reports**: Shows exactly what was synced with order type information
-
-### Example Output
-
-```
-🔄 Starting database synchronization with Binance...
-📅 Syncing from: 2025-09-01 08:25:58 UTC (Order ID: 6778085567)
-🔍 Verifying database integrity against Binance records...
-📊 Found 15 existing orders in database
-📊 Found 18 orders from Binance
-🔄 Found 3 missing orders to sync
-✅ Added missing purchase: Order ID 6778085567 (BUY) from 2025-09-01 08:25:58 UTC
-✅ Added missing sale: Order ID 6778123456 (SELL) from 2025-09-02 14:30:22 UTC
-🎉 Sync completed! Added 3 missing orders to database
-```
+- **Syncs Missing Data**: Adds missing orders (purchases and sales) to your MongoDB database
+- **Provides Detailed Reports**: Logs exactly what was synced, with order type information
 
 ### Safety Features
 
@@ -310,9 +325,7 @@ SYNC_DATABASE=true cargo run --release --bin eth-dca-bot
 - **Data Validation**: Verifies integrity before and after sync
 - **Comprehensive Logging**: Detailed logs of all operations
 
-For detailed information, see [SYNC_FEATURE.md](SYNC_FEATURE.md).
-
-## �🔗 Notion Integration
+## 🔗 Notion Integration
 
 The bot can optionally integrate with Notion to track your DCA strategy:
 
@@ -347,44 +360,70 @@ tail -f dca_bot.log
 
 ## 🐳 Docker Deployment
 
-The project includes Docker Compose configuration for MongoDB:
+`make docker-build` builds the production image (multi-stage, Rust builder →
+`debian:bookworm-slim` runtime). For the full stack (bot + MongoDB), see
+[Makefile Commands](#-makefile-commands) → Production stack below.
 
-```bash
-# Start services
-docker compose up -d
+## 🔧 Makefile Commands
 
-# View logs
-docker compose logs -f
+Run `make help` at any time for the full, authoritative list. Quick reference:
 
-# Stop services
-docker compose down
-```
+### Local development (cargo)
 
-## 🔧 Development
+| Command | What it does |
+|---|---|
+| `make setup` | Copy `.env.example` → `.env` if `.env` doesn't exist yet |
+| `make build` / `make build-release` | Compile the bot (debug / release) |
+| `make run` | Run the bot locally (needs `make mongo-up` first) |
+| `make test` | Run the unit test suite |
+| `make fmt` / `make fmt-check` | Format the codebase / check formatting (CI-safe) |
+| `make clippy` | Lint with clippy (all targets) |
+| `make check` | Full verification: `fmt-check` + `clippy` + `test` |
 
-### Build
+### MongoDB (local dev)
 
-```bash
-cargo build
-```
+| Command | What it does |
+|---|---|
+| `make mongo-up` | Start local MongoDB via `docker-compose.yml` |
+| `make mongo-down` | Stop it |
+| `make mongo-logs` | Tail MongoDB logs |
+| `make mongo-shell` | Open a `mongosh` shell into the dev database |
 
-### Run Tests
+### Docker image / production stack
 
-```bash
-cargo test
-```
+| Command | What it does |
+|---|---|
+| `make docker-build` | Build the production image (`eth-dca-bot`) |
+| `make docker-run` | Run the built image standalone with `--env-file .env` |
+| `make prod-up` | Build + start the full stack (bot + Mongo) from `docker-compose.prod.yml`, reading `.env.prod` |
+| `make prod-down` | Stop the production stack |
+| `make prod-logs` | Tail production logs |
+| `make prod-restart` | Restart just the bot container (e.g. after an env change) |
 
-### Code Formatting
+For production, copy `.env.prod.example` → `.env.prod` and fill in real values
+(`MONGO_PASSWORD`, exchange keys, withdrawal address, etc.) before `make prod-up`.
 
-```bash
-cargo fmt
-```
+### Maintenance / diagnostic binaries
 
-### Linting
+These are standalone tools in `src/bin/`, separate from the main scheduler:
 
-```bash
-cargo clippy
-```
+| Command | What it does |
+|---|---|
+| `make sync-notion` | One-off check/sync of the latest DCA purchase against Notion |
+| `make test-kraken` | Manual Kraken smoke test — read-only by default; `ARGS="--buy 5"` or `ARGS="--limit 5"` places a small real order |
+| `make replace-purchase OLD=<id> NEW=<id>` | Remove one recorded purchase and replace it with another, by order id |
+| `make sleeve-smoke ARGS="reconcile --chest 1.0 --collection limit_sleeve_smoke"` | Limit-sleeve live-validation harness — see [`docs/limit-sleeve-smoke-test.md`](docs/limit-sleeve-smoke-test.md) before touching a real war chest |
+
+### Android cross-compilation
+
+`make android-build` cross-compiles for `aarch64-linux-android` using
+[`cross`](https://github.com/cross-rs/cross) (`cargo install cross --git https://github.com/cross-rs/cross`),
+matching what `.github/workflows/cross-compile.yml` runs in CI. See `setup-termux.sh`
+for running the resulting binary under Termux on-device.
+
+### Housekeeping
+
+`make clean` removes build artifacts (`cargo clean`).
 
 ## 📝 Dependencies
 

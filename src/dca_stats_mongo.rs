@@ -7,7 +7,7 @@ use mongodb::{Client, Collection, bson::Document};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DcaPurchase {
@@ -140,8 +140,8 @@ impl DcaStatsDB {
                     "total_purchases": { "$sum": 1 },
                     // For BUY orders: subtract USDC spent (negative cash flow), add ETH acquired (positive ETH balance)
                     // For SELL orders: add USDC received (positive cash flow), subtract ETH sold (negative ETH balance)
-                    "total_usdc_invested": { 
-                        "$sum": { 
+                    "total_usdc_invested": {
+                        "$sum": {
                             "$cond": [
                                 { "$or": [
                                     { "$eq": ["$side", "BUY"] },
@@ -152,8 +152,8 @@ impl DcaStatsDB {
                             ]
                         }
                     },
-                    "total_eth_acquired": { 
-                        "$sum": { 
+                    "total_eth_acquired": {
+                        "$sum": {
                             "$cond": [
                                 { "$or": [
                                     { "$eq": ["$side", "BUY"] },
@@ -317,14 +317,12 @@ impl DcaStatsDB {
     pub async fn get_all_order_ids(&self) -> Result<Vec<String>> {
         use futures::StreamExt;
 
-        let pipeline = vec![
-            Document::from(doc! {
-                "$project": {
-                    "order_id": 1,
-                    "_id": 0
-                }
-            })
-        ];
+        let pipeline = vec![Document::from(doc! {
+            "$project": {
+                "order_id": 1,
+                "_id": 0
+            }
+        })];
 
         let mut cursor = self.collection.aggregate(pipeline).await?;
         let mut order_ids = Vec::new();
@@ -350,22 +348,26 @@ impl DcaStatsDB {
         min_order_id: Option<u64>,
     ) -> Result<usize> {
         info!("🔄 Starting sync of missing orders from Binance...");
-        
+
         // Get all historical orders from Binance
         let binance_orders = binance_client
             .get_historical_dca_orders(symbol, start_date, min_order_id)
             .await?;
-        
+
         if binance_orders.is_empty() {
             info!("📝 No orders found on Binance for the specified criteria");
             return Ok(0);
         }
-        
+
         // Get all existing order IDs from database
         let existing_order_ids = self.get_all_order_ids().await?;
-        let existing_ids_set: std::collections::HashSet<String> = existing_order_ids.into_iter().collect();
+        let existing_ids_set: std::collections::HashSet<String> =
+            existing_order_ids.into_iter().collect();
 
-        info!("📊 Found {} existing orders in database", existing_ids_set.len());
+        info!(
+            "📊 Found {} existing orders in database",
+            existing_ids_set.len()
+        );
         info!("📊 Found {} orders from Binance", binance_orders.len());
 
         // Filter out orders that already exist in database
@@ -373,34 +375,43 @@ impl DcaStatsDB {
             .iter()
             .filter(|order| !existing_ids_set.contains(&order.order_id))
             .collect();
-        
+
         if missing_orders.is_empty() {
             info!("✅ All Binance orders are already in the database - no sync needed");
             return Ok(0);
         }
-        
+
         info!("🔄 Found {} missing orders to sync", missing_orders.len());
-        
+
         // Add missing orders to database
         let mut added_count = 0;
         for order in missing_orders {
             match self.record_purchase(order).await {
                 Ok(()) => {
                     added_count += 1;
-                    let order_type = if order.side == "BUY" { "purchase" } else { "sale" };
-                    info!("✅ Added missing {}: Order ID {} ({}) from {}", 
-                          order_type,
-                          order.order_id, 
-                          order.side,
-                          order.timestamp.format("%Y-%m-%d %H:%M:%S UTC"));
+                    let order_type = if order.side == "BUY" {
+                        "purchase"
+                    } else {
+                        "sale"
+                    };
+                    info!(
+                        "✅ Added missing {}: Order ID {} ({}) from {}",
+                        order_type,
+                        order.order_id,
+                        order.side,
+                        order.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+                    );
                 }
                 Err(e) => {
                     error!("❌ Failed to add order {}: {}", order.order_id, e);
                 }
             }
         }
-        
-        info!("🎉 Sync completed! Added {} missing orders to database", added_count);
+
+        info!(
+            "🎉 Sync completed! Added {} missing orders to database",
+            added_count
+        );
         Ok(added_count)
     }
 
@@ -421,7 +432,8 @@ impl DcaStatsDB {
 
         // Get all existing order IDs from database
         let existing_order_ids = self.get_all_order_ids().await?;
-        let existing_ids_set: std::collections::HashSet<String> = existing_order_ids.into_iter().collect();
+        let existing_ids_set: std::collections::HashSet<String> =
+            existing_order_ids.into_iter().collect();
 
         // Find missing order IDs
         let missing_order_ids: Vec<String> = binance_orders
@@ -429,21 +441,25 @@ impl DcaStatsDB {
             .map(|order| order.order_id.clone())
             .filter(|order_id| !existing_ids_set.contains(order_id))
             .collect();
-        
+
         let total_binance_orders = binance_orders.len();
         let missing_count = missing_order_ids.len();
-        
+
         info!("📊 Database Integrity Report:");
-        info!("   Total Binance orders since {}: {}", start_date.format("%Y-%m-%d"), total_binance_orders);
+        info!(
+            "   Total Binance orders since {}: {}",
+            start_date.format("%Y-%m-%d"),
+            total_binance_orders
+        );
         info!("   Orders in database: {}", existing_ids_set.len());
         info!("   Missing orders: {}", missing_count);
-        
+
         if !missing_order_ids.is_empty() {
             warn!("⚠️  Missing order IDs: {:?}", missing_order_ids);
         } else {
             info!("✅ Database is in sync with Binance records");
         }
-        
+
         Ok((total_binance_orders, missing_count, missing_order_ids))
     }
 }
@@ -527,9 +543,13 @@ pub fn print_recent_purchases(asset: &str, purchases: &[DcaPurchase]) {
         if i > 0 {
             info!("║                                                                ║");
         }
-        
-        let side_emoji = if purchase.side == "BUY" { "🟢" } else { "🔴" };
-        
+
+        let side_emoji = if purchase.side == "BUY" {
+            "🟢"
+        } else {
+            "🔴"
+        };
+
         info!(
             "║ Date: {:>55} ║",
             purchase.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
@@ -544,7 +564,10 @@ pub fn print_recent_purchases(asset: &str, purchases: &[DcaPurchase]) {
                 purchase.eth_amount.round_dp(6)
             );
         } else {
-            info!("║ USDC Received: ${:>44} ║", purchase.usdc_amount.round_dp(2));
+            info!(
+                "║ USDC Received: ${:>44} ║",
+                purchase.usdc_amount.round_dp(2)
+            );
             info!(
                 "║ {:>3} Sold: {:>49} ║",
                 asset,

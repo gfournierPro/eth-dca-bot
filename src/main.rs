@@ -184,7 +184,12 @@ async fn check_and_sync_database(config: &Config) -> Result<()> {
     info!("🔄 Starting automatic sync of missing trades...");
 
     let added_count = stats_db
-        .sync_missing_orders_from_binance(&binance_client, "ETHUSDC", start_date, Some(first_order_id))
+        .sync_missing_orders_from_binance(
+            &binance_client,
+            "ETHUSDC",
+            start_date,
+            Some(first_order_id),
+        )
         .await?;
 
     info!("🎉 Database sync completed successfully!");

@@ -22,25 +22,26 @@ services:
       
       # Trading Configuration
       - DCA_AMOUNT_EUR=${DCA_AMOUNT_EUR:-50}
-      - MIN_USDC_BALANCE=${MIN_USDC_BALANCE:-10}
-      - EUR_TO_USDC_RATE=${EUR_TO_USDC_RATE:-1.1}
-      
+      - MIN_BALANCE_USDC=${MIN_BALANCE_USDC:-10}
+
       # Withdrawal Configuration
-      - WITHDRAWAL_ADDRESS=${WITHDRAWAL_ADDRESS}
-      - WITHDRAWAL_THRESHOLD=${WITHDRAWAL_THRESHOLD:-0.1}
-      - WITHDRAWAL_START_DAY=${WITHDRAWAL_START_DAY:-25}
-      - WITHDRAWAL_END_DAY=${WITHDRAWAL_END_DAY:-5}
-      
+      - WITHDRAWAL_ENABLED=${WITHDRAWAL_ENABLED:-false}
+      - WITHDRAWAL_WALLET_ADDRESS=${WITHDRAWAL_WALLET_ADDRESS:-}
+      - WITHDRAWAL_NETWORK=${WITHDRAWAL_NETWORK:-ARBITRUM}
+      - WITHDRAWAL_MIN_ETH_THRESHOLD=${WITHDRAWAL_MIN_ETH_THRESHOLD:-0.1}
+      - WITHDRAWAL_AMOUNT=${WITHDRAWAL_AMOUNT:-}
+
       # Scheduling
-      - CRON_EXPRESSION=${CRON_EXPRESSION:-0 9 * * MON}
+      - SCHEDULE_CRON=${SCHEDULE_CRON:-0 9 * * MON}
       - TIMEZONE=${TIMEZONE:-Europe/Berlin}
-      
+
       # MongoDB Configuration
-      - MONGODB_URI=mongodb://admin:${MONGO_PASSWORD}@mongodb:27017/dca_bot?authSource=admin
-      
+      - MONGODB_URL=mongodb://admin:${MONGO_PASSWORD}@mongodb:27017/dca_bot?authSource=admin
+
       # Notion Integration (Optional)
       - NOTION_TOKEN=${NOTION_TOKEN}
       - NOTION_DATABASE_ID=${NOTION_DATABASE_ID}
+      - COLD_WALLET_ADDRESS=${COLD_WALLET_ADDRESS:-}
 
       # BTC DCA Workflow (Optional) — runs alongside ETH in the same container
       - BTC_DCA_ENABLED=${BTC_DCA_ENABLED:-false}

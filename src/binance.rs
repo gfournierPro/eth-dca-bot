@@ -11,10 +11,10 @@ use reqwest::Client;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use sha2::Sha256;
-use tracing::{error, info, warn};
-use uuid::Uuid;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -135,12 +135,12 @@ impl BinanceClient {
     async fn get_server_time(&self) -> Result<i64> {
         let url = format!("{}/api/v3/time", self.base_url);
         let response = self.client.get(&url).send().await?;
-        
+
         if !response.status().is_success() {
             let error_text = response.text().await?;
             return Err(anyhow!("Failed to get server time: {}", error_text));
         }
-        
+
         let server_time: ServerTime = response.json().await?;
         Ok(server_time.server_time)
     }
@@ -150,10 +150,12 @@ impl BinanceClient {
         let server_time = self.get_server_time().await?;
         let local_time = Utc::now().timestamp_millis();
         let offset = server_time - local_time;
-        
-        info!("Time sync - Server: {}, Local: {}, Offset: {}ms", 
-              server_time, local_time, offset);
-        
+
+        info!(
+            "Time sync - Server: {}, Local: {}, Offset: {}ms",
+            server_time, local_time, offset
+        );
+
         *self.time_offset.write().await = offset;
         Ok(())
     }
@@ -390,21 +392,27 @@ impl BinanceClient {
         min_order_id: Option<u64>,
     ) -> Result<Vec<DcaPurchase>> {
         let start_timestamp = start_date.timestamp_millis();
-        
-        info!("🔍 Fetching historical DCA orders for {} from {}", symbol, start_date.format("%Y-%m-%d %H:%M:%S UTC"));
+
+        info!(
+            "🔍 Fetching historical DCA orders for {} from {}",
+            symbol,
+            start_date.format("%Y-%m-%d %H:%M:%S UTC")
+        );
         if let Some(min_id) = min_order_id {
             info!("📋 Filtering orders from minimum order ID: {}", min_id);
         }
-        
-        let orders = self.get_order_history(
-            symbol,
-            Some(start_timestamp),
-            None,
-            Some(1000), // Limit to 1000 orders
-        ).await?;
+
+        let orders = self
+            .get_order_history(
+                symbol,
+                Some(start_timestamp),
+                None,
+                Some(1000), // Limit to 1000 orders
+            )
+            .await?;
 
         let mut purchases = Vec::new();
-        
+
         for order in orders {
             // Skip orders before the minimum order ID if specified
             if let Some(min_id) = min_order_id {
@@ -412,25 +420,29 @@ impl BinanceClient {
                     continue;
                 }
             }
-            
+
             // Process both filled buy and sell orders
             if order.status == "FILLED" && (order.side == "BUY" || order.side == "SELL") {
                 let executed_qty: Decimal = order.executed_qty.parse().unwrap_or(dec!(0));
-                let executed_value: Decimal = order.cummulative_quote_qty.parse().unwrap_or(dec!(0));
-                
+                let executed_value: Decimal =
+                    order.cummulative_quote_qty.parse().unwrap_or(dec!(0));
+
                 if executed_qty > dec!(0) && executed_value > dec!(0) {
                     let average_price = executed_value / executed_qty;
                     let timestamp = match Utc.timestamp_millis_opt(order.time) {
                         chrono::LocalResult::Single(dt) => dt,
                         _ => {
-                            warn!("Invalid timestamp for order {}, using current time", order.order_id);
+                            warn!(
+                                "Invalid timestamp for order {}, using current time",
+                                order.order_id
+                            );
                             Utc::now()
                         }
                     };
-                    
+
                     // Estimate fees as 0.1% of trade value since we don't have fill details
                     let estimated_fees = executed_value * dec!(0.001);
-                    
+
                     let purchase = DcaPurchase {
                         id: Uuid::new_v4().to_string(),
                         timestamp,
@@ -448,11 +460,14 @@ impl BinanceClient {
                 }
             }
         }
-        
+
         // Sort by timestamp (oldest first for historical sync)
         purchases.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-        
-        info!("✅ Found {} historical DCA orders from Binance", purchases.len());
+
+        info!(
+            "✅ Found {} historical DCA orders from Binance",
+            purchases.len()
+        );
         Ok(purchases)
     }
 

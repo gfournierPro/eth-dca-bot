@@ -55,56 +55,70 @@ async fn main() -> Result<()> {
 
     // Get the most recent purchase from database
     let recent_purchases = stats_db.get_recent_purchases(1).await?;
-    
+
     info!("📊 Checking database for recent purchases...");
     if !recent_purchases.is_empty() {
         let latest_db = &recent_purchases[0];
-        info!("   Latest in DB: {} ETH at {} UTC", 
-              latest_db.eth_amount, 
-              latest_db.timestamp.format("%Y-%m-%d %H:%M:%S"));
+        info!(
+            "   Latest in DB: {} ETH at {} UTC",
+            latest_db.eth_amount,
+            latest_db.timestamp.format("%Y-%m-%d %H:%M:%S")
+        );
     } else {
         info!("   No purchases in database");
     }
-    
+
     // Always check Binance for the latest purchase
     info!("📊 Checking Binance for current month purchases...");
-    let binance_purchases = binance_client.get_current_month_purchases(&config.trading.symbol).await?;
-    
+    let binance_purchases = binance_client
+        .get_current_month_purchases(&config.trading.symbol)
+        .await?;
+
     if binance_purchases.is_empty() {
         info!("❌ No purchases found on Binance for current month");
         return Ok(());
     }
-    
-    info!("✅ Found {} purchase(s) from Binance in current month", binance_purchases.len());
-    
+
+    info!(
+        "✅ Found {} purchase(s) from Binance in current month",
+        binance_purchases.len()
+    );
+
     // Get the most recent one from Binance
     let latest_purchase = &binance_purchases[0];
-    info!("   Latest on Binance: {} ETH at {} UTC", 
-          latest_purchase.eth_amount, 
-          latest_purchase.timestamp.format("%Y-%m-%d %H:%M:%S"));
-    
+    info!(
+        "   Latest on Binance: {} ETH at {} UTC",
+        latest_purchase.eth_amount,
+        latest_purchase.timestamp.format("%Y-%m-%d %H:%M:%S")
+    );
+
     // Check if this purchase needs to be synced to Notion
-    let hours_ago = chrono::Utc::now().signed_duration_since(latest_purchase.timestamp).num_hours();
+    let hours_ago = chrono::Utc::now()
+        .signed_duration_since(latest_purchase.timestamp)
+        .num_hours();
     info!("⏰ Purchase was {} hours ago", hours_ago);
-    
+
     if hours_ago > 48 {
         info!("✅ Purchase is more than 48 hours old - likely already synced to Notion");
         return Ok(());
     }
-    
+
     // Get EUR amount
     let eur_usdc_price = binance_client.get_symbol_price("EURUSDC").await?;
     let eur_amount = latest_purchase.usdc_amount / eur_usdc_price;
-    
+
     info!("💰 Purchase details:");
     info!("   USDC Amount: {} USDC", latest_purchase.usdc_amount);
     info!("   EUR Amount: {} EUR", eur_amount.round_dp(2));
     info!("   ETH Amount: {} ETH", latest_purchase.eth_amount);
     info!("   ETH Price: {} USDC", latest_purchase.eth_price);
-    
+
     // Sync to Notion
     info!("📤 Syncing purchase to Notion...");
-    match notion_tracker.record_dca_purchase(latest_purchase, eur_amount).await {
+    match notion_tracker
+        .record_dca_purchase(latest_purchase, eur_amount)
+        .await
+    {
         Ok(()) => {
             info!("✅ Successfully synced purchase to Notion!");
             info!("🎉 Done! Your latest purchase is now in Notion.");

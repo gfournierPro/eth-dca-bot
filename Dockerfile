@@ -1,5 +1,5 @@
 # Use the official Rust image as a parent image for building
-FROM rust:1.75 as builder
+FROM rust:1.90 AS builder
 
 # Set the working directory in the container
 WORKDIR /usr/src/app

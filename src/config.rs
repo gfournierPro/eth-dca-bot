@@ -200,7 +200,7 @@ pub struct MarketIndicatorsConfig {
     pub low_volatility_multiplier: Decimal,
     /// Low volatility threshold (below this reduces purchase)
     pub low_volatility_threshold: Decimal,
-    
+
     /// Enable RSI-based adjustments
     pub rsi_enabled: bool,
     /// RSI calculation period
@@ -213,7 +213,7 @@ pub struct MarketIndicatorsConfig {
     pub rsi_overbought_threshold: Decimal,
     /// Multiplier when RSI indicates overbought conditions  
     pub rsi_overbought_multiplier: Decimal,
-    
+
     /// Enable price deviation strategy
     pub price_deviation_enabled: bool,
     /// Moving average period for price deviation
@@ -226,7 +226,7 @@ pub struct MarketIndicatorsConfig {
     pub above_ma_threshold_percent: Decimal,
     /// Multiplier when price is above moving average
     pub above_ma_multiplier: Decimal,
-    
+
     /// Enable momentum-based adjustments
     pub momentum_enabled: bool,
     /// Period for momentum calculation
@@ -239,7 +239,7 @@ pub struct MarketIndicatorsConfig {
     pub positive_momentum_threshold: Decimal,
     /// Multiplier during positive momentum periods
     pub positive_momentum_multiplier: Decimal,
-    
+
     /// Maximum multiplier to prevent excessive purchases
     pub max_total_multiplier: Decimal,
     /// Minimum multiplier to ensure some purchase occurs
@@ -286,9 +286,9 @@ impl Default for Config {
                 volatility_scaling_enabled: true,
                 volatility_period: 30,
                 high_volatility_multiplier: Decimal::new(110, 2), // 1.1x (10% increase)
-                volatility_threshold: Decimal::new(2, 0), // 2 standard deviations
-                low_volatility_multiplier: Decimal::new(95, 2), // 0.95x (5% decrease)
-                low_volatility_threshold: Decimal::new(15, 1), // 1.5 standard deviations
+                volatility_threshold: Decimal::new(2, 0),         // 2 standard deviations
+                low_volatility_multiplier: Decimal::new(95, 2),   // 0.95x (5% decrease)
+                low_volatility_threshold: Decimal::new(15, 1),    // 1.5 standard deviations
 
                 rsi_enabled: true,
                 rsi_period: 14,
@@ -300,9 +300,9 @@ impl Default for Config {
                 price_deviation_enabled: true,
                 moving_average_period: 20,
                 deviation_threshold_percent: Decimal::new(5, 0), // 5%
-                below_ma_multiplier: Decimal::new(105, 2), // 1.05x (5% increase)
-                above_ma_threshold_percent: Decimal::new(8, 0), // 8%
-                above_ma_multiplier: Decimal::new(92, 2), // 0.92x (8% decrease)
+                below_ma_multiplier: Decimal::new(105, 2),       // 1.05x (5% increase)
+                above_ma_threshold_percent: Decimal::new(8, 0),  // 8%
+                above_ma_multiplier: Decimal::new(92, 2),        // 0.92x (8% decrease)
 
                 momentum_enabled: true,
                 momentum_period: 7,
@@ -312,7 +312,7 @@ impl Default for Config {
                 positive_momentum_multiplier: Decimal::new(90, 2), // 0.90x (10% decrease)
 
                 max_total_multiplier: Decimal::new(130, 2), // 1.3x maximum (30% increase)
-                min_total_multiplier: Decimal::new(70, 2), // 0.7x minimum (30% decrease)
+                min_total_multiplier: Decimal::new(70, 2),  // 0.7x minimum (30% decrease)
             },
             btc: None,
             limit_sleeve: None,
@@ -370,33 +370,33 @@ impl AssetDcaConfig {
                 volatility_scaling_enabled: true,
                 volatility_period: 30,
                 high_volatility_multiplier: Decimal::new(110, 2), // 1.1x (10% increase)
-                volatility_threshold: Decimal::new(2, 0), // 2 standard deviations
-                low_volatility_multiplier: Decimal::new(95, 2), // 0.95x (5% decrease)
-                low_volatility_threshold: Decimal::new(15, 1), // 1.5 standard deviations
-                
+                volatility_threshold: Decimal::new(2, 0),         // 2 standard deviations
+                low_volatility_multiplier: Decimal::new(95, 2),   // 0.95x (5% decrease)
+                low_volatility_threshold: Decimal::new(15, 1),    // 1.5 standard deviations
+
                 rsi_enabled: true,
                 rsi_period: 14,
                 rsi_oversold_threshold: Decimal::new(30, 0),
                 rsi_oversold_multiplier: Decimal::new(107, 2), // 1.07x (7% increase)
                 rsi_overbought_threshold: Decimal::new(70, 0),
                 rsi_overbought_multiplier: Decimal::new(93, 2), // 0.93x (7% decrease)
-                
+
                 price_deviation_enabled: true,
                 moving_average_period: 20,
                 deviation_threshold_percent: Decimal::new(5, 0), // 5%
-                below_ma_multiplier: Decimal::new(105, 2), // 1.05x (5% increase)
-                above_ma_threshold_percent: Decimal::new(8, 0), // 8%
-                above_ma_multiplier: Decimal::new(92, 2), // 0.92x (8% decrease)
-                
+                below_ma_multiplier: Decimal::new(105, 2),       // 1.05x (5% increase)
+                above_ma_threshold_percent: Decimal::new(8, 0),  // 8%
+                above_ma_multiplier: Decimal::new(92, 2),        // 0.92x (8% decrease)
+
                 momentum_enabled: true,
                 momentum_period: 7,
                 negative_momentum_threshold: Decimal::new(-5, 0), // -5%
                 negative_momentum_multiplier: Decimal::new(108, 2), // 1.08x (8% increase)
                 positive_momentum_threshold: Decimal::new(15, 0), // 15%
                 positive_momentum_multiplier: Decimal::new(90, 2), // 0.90x (10% decrease)
-                
+
                 max_total_multiplier: Decimal::new(130, 2), // 1.3x maximum (30% increase)
-                min_total_multiplier: Decimal::new(70, 2), // 0.7x minimum (30% decrease)
+                min_total_multiplier: Decimal::new(70, 2),  // 0.7x minimum (30% decrease)
             },
         }
     }
