@@ -7,7 +7,7 @@ A sophisticated Ethereum Dollar-Cost Averaging (DCA) bot built in Rust that auto
 - **Pluggable Exchange Backend**: Trade on Binance or Kraken, selected with a single `EXCHANGE` env var — switch between them without code changes (see [Choosing an Exchange](#choosing-an-exchange))
 - **Automated DCA Trading**: Schedule regular ETH purchases using EUR amounts (automatically converted to USDC)
 - **Dynamic DCA Sizing**: Smart purchase amount adjustments based on market conditions (volatility, RSI, moving averages, momentum)
-- **Multi-Asset Support**: Optionally run a BTC DCA workflow alongside ETH in the same process, with independent schedules, stats, and withdrawals (see [BTC DCA Workflow](#btc-dca-workflow-optional))
+- **Multi-Asset Support**: Runs a BTC DCA workflow alongside ETH in the same process by default, with independent schedules, stats, and withdrawals (see [BTC DCA Workflow](#btc-dca-workflow-optional))
 - **Limit-Order Sleeve** *(Kraken only, not yet live-validated)*: Optional volume-profile resting-bid sleeve layered on top of DCA (see [Limit-Order Sleeve](#limit-order-sleeve-optional-kraken-only))
 - **Smart Withdrawal System**: Automatically withdraw ETH/BTC to cold storage when thresholds are met
 - **MongoDB Integration**: Track all purchases, statistics, and performance metrics
@@ -185,16 +185,16 @@ All market indicators are configurable and can be enabled/disabled independently
 
 ### BTC DCA Workflow (Optional)
 
-The bot can run a **BTC DCA workflow alongside ETH** in the same process. It mirrors
-the ETH workflow exactly (scheduled buys, missed-run catch-up, withdrawals, MongoDB
-stats, Notion tracking) but is fully independent: BTC buys `BTCUSDC`, stores its
-purchases in a **separate MongoDB collection** (`btc_purchases`), and uses its **own
-Notion database**, so ETH and BTC statistics never mix.
+The bot runs a **BTC DCA workflow alongside ETH** in the same process by default. It
+mirrors the ETH workflow exactly (scheduled buys, missed-run catch-up, withdrawals,
+MongoDB stats, Notion tracking) but is fully independent: BTC buys `BTCUSDC`, stores
+its purchases in a **separate MongoDB collection** (`btc_purchases`), and uses its
+**own Notion database**, so ETH and BTC statistics never mix.
 
-Enable it by setting `BTC_DCA_ENABLED=true`. All other `BTC_*` variables are optional
+Opt out by setting `BTC_DCA_ENABLED=false`. All other `BTC_*` variables are optional
 and fall back to the defaults below:
 
-- `BTC_DCA_ENABLED`: Set to `true` to activate the BTC workflow (default `false`)
+- `BTC_DCA_ENABLED`: Set to `false` to deactivate the BTC workflow (default `true`)
 - `BTC_DCA_AMOUNT_EUR`: EUR amount per BTC purchase (default `100`)
 - `BTC_MIN_BALANCE_USDC`: Minimum USDC balance to maintain (default `50`)
 - `BTC_SCHEDULE_CRON`: Cron expression for BTC purchases (default `0 30 5 * * MON`)

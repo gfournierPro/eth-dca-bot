@@ -540,10 +540,10 @@ fn load_config() -> Result<Config> {
         config.withdrawal.withdrawal_amount = Some(amount.parse()?);
     }
 
-    // Load optional BTC DCA workflow (additive — leaves the ETH workflow untouched).
+    // BTC DCA workflow runs by default alongside ETH; set BTC_DCA_ENABLED=false to opt out.
     if env::var("BTC_DCA_ENABLED")
         .map(|v| v == "true")
-        .unwrap_or(false)
+        .unwrap_or(true)
     {
         let mut btc = config::AssetDcaConfig::btc_default();
 
