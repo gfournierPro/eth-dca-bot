@@ -194,11 +194,11 @@ pub struct MarketIndicatorsConfig {
     pub volatility_period: u32,
     /// Multiplier when volatility is high (>1.0 increases purchase amount)
     pub high_volatility_multiplier: Decimal,
-    /// Volatility threshold to consider "high" (standard deviations)
+    /// Volatility threshold to consider "high" (percent of mean price, e.g. 2 = 2%)
     pub volatility_threshold: Decimal,
     /// Multiplier when volatility is low (<1.0 decreases purchase amount)
     pub low_volatility_multiplier: Decimal,
-    /// Low volatility threshold (below this reduces purchase)
+    /// Low volatility threshold (percent of mean price, below this reduces purchase)
     pub low_volatility_threshold: Decimal,
 
     /// Enable RSI-based adjustments
@@ -286,9 +286,9 @@ impl Default for Config {
                 volatility_scaling_enabled: true,
                 volatility_period: 30,
                 high_volatility_multiplier: Decimal::new(110, 2), // 1.1x (10% increase)
-                volatility_threshold: Decimal::new(2, 0),         // 2 standard deviations
+                volatility_threshold: Decimal::new(2, 0),         // 2% of mean price
                 low_volatility_multiplier: Decimal::new(95, 2),   // 0.95x (5% decrease)
-                low_volatility_threshold: Decimal::new(15, 1),    // 1.5 standard deviations
+                low_volatility_threshold: Decimal::new(15, 1),    // 1.5% of mean price
 
                 rsi_enabled: true,
                 rsi_period: 14,
@@ -370,9 +370,9 @@ impl AssetDcaConfig {
                 volatility_scaling_enabled: true,
                 volatility_period: 30,
                 high_volatility_multiplier: Decimal::new(110, 2), // 1.1x (10% increase)
-                volatility_threshold: Decimal::new(2, 0),         // 2 standard deviations
+                volatility_threshold: Decimal::new(2, 0),         // 2% of mean price
                 low_volatility_multiplier: Decimal::new(95, 2),   // 0.95x (5% decrease)
-                low_volatility_threshold: Decimal::new(15, 1),    // 1.5 standard deviations
+                low_volatility_threshold: Decimal::new(15, 1),    // 1.5% of mean price
 
                 rsi_enabled: true,
                 rsi_period: 14,
