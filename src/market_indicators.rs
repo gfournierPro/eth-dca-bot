@@ -18,11 +18,11 @@ pub struct MarketIndicatorsConfig {
     pub volatility_period: u32,
     /// Multiplier when volatility is high (>1.0 increases purchase amount)
     pub high_volatility_multiplier: Decimal,
-    /// Volatility threshold to consider "high" (standard deviations)
+    /// Volatility threshold to consider "high" (percent of mean price, e.g. 2 = 2%)
     pub volatility_threshold: Decimal,
     /// Multiplier when volatility is low (<1.0 decreases purchase amount)
     pub low_volatility_multiplier: Decimal,
-    /// Low volatility threshold (below this reduces purchase)
+    /// Low volatility threshold (percent of mean price, below this reduces purchase)
     pub low_volatility_threshold: Decimal,
 
     /// Enable RSI-based adjustments
@@ -76,9 +76,9 @@ impl Default for MarketIndicatorsConfig {
             volatility_scaling_enabled: true,
             volatility_period: 30,
             high_volatility_multiplier: Decimal::new(110, 2), // 1.1x (10% increase)
-            volatility_threshold: Decimal::new(2, 0),         // 2 standard deviations
+            volatility_threshold: Decimal::new(2, 0),         // 2% of mean price
             low_volatility_multiplier: Decimal::new(95, 2),   // 0.95x (5% decrease)
-            low_volatility_threshold: Decimal::new(15, 1),    // 1.5 standard deviations
+            low_volatility_threshold: Decimal::new(15, 1),    // 1.5% of mean price
 
             rsi_enabled: true,
             rsi_period: 14,
@@ -585,7 +585,7 @@ impl MarketIndicators {
             volatility, mean_price, volatility_ratio
         );
 
-        if volatility_ratio > self.config.volatility_threshold {
+        if volatility_ratio > self.config.volatility_threshold / Decimal::new(100, 0) {
             // High volatility - increase purchase (opportunity)
             Ok(self.config.high_volatility_multiplier)
         } else if volatility_ratio < self.config.low_volatility_threshold / Decimal::new(100, 0) {
@@ -782,6 +782,8 @@ impl MarketIndicators {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kraken::KrakenClient;
+    use chrono::Duration;
 
     #[test]
     fn test_volatility_calculation() {
@@ -826,5 +828,328 @@ mod tests {
 
         let sqrt_9 = indicators.decimal_sqrt(Decimal::new(9, 0));
         assert!((sqrt_9 - Decimal::new(3, 0)).abs() < Decimal::new(1, 5)); // Within 0.00001
+    }
+
+    /// Builds price history in chronological order (oldest first), matching how
+    /// `update_price_history` populates it via `push_back`.
+    fn history_from_prices(prices: &[i64]) -> VecDeque<PriceData> {
+        let base = Utc::now() - Duration::days(prices.len() as i64);
+        prices
+            .iter()
+            .enumerate()
+            .map(|(i, p)| PriceData {
+                timestamp: base + Duration::days(i as i64),
+                price: Decimal::new(*p, 0),
+                volume: None,
+            })
+            .collect()
+    }
+
+    fn indicators_with(config: MarketIndicatorsConfig, prices: &[i64]) -> MarketIndicators {
+        MarketIndicators {
+            config,
+            price_history: history_from_prices(prices),
+        }
+    }
+
+    // --- Volatility multiplier ---
+    // Coefficient of variation (std-dev / mean) for these price sets: high ≈ 26.8%,
+    // low ≈ 0.34%, normal ≈ 1.88%. Thresholds are 2% (high) / 1.5% (low) of mean price.
+
+    #[test]
+    fn test_volatility_multiplier_high_triggers_increase() {
+        let config = MarketIndicatorsConfig {
+            volatility_period: 5,
+            ..Default::default()
+        };
+        let indicators = indicators_with(config.clone(), &[1000, 1300, 700, 1300, 700]);
+        assert_eq!(
+            indicators.calculate_volatility_multiplier().unwrap(),
+            config.high_volatility_multiplier
+        );
+    }
+
+    #[test]
+    fn test_volatility_multiplier_low_triggers_decrease() {
+        let config = MarketIndicatorsConfig {
+            volatility_period: 5,
+            ..Default::default()
+        };
+        let indicators = indicators_with(config.clone(), &[1000, 1005, 995, 1002, 998]);
+        assert_eq!(
+            indicators.calculate_volatility_multiplier().unwrap(),
+            config.low_volatility_multiplier
+        );
+    }
+
+    #[test]
+    fn test_volatility_multiplier_normal_is_neutral() {
+        let config = MarketIndicatorsConfig {
+            volatility_period: 5,
+            ..Default::default()
+        };
+        let indicators = indicators_with(config, &[1000, 1020, 980, 1022, 978]);
+        assert_eq!(
+            indicators.calculate_volatility_multiplier().unwrap(),
+            Decimal::ONE
+        );
+    }
+
+    // --- RSI multiplier ---
+
+    #[test]
+    fn test_rsi_multiplier_downtrend_is_oversold() {
+        let config = MarketIndicatorsConfig {
+            rsi_period: 4,
+            ..Default::default()
+        };
+        // Oldest -> newest: monotonic decline gives RSI = 0.
+        let indicators = indicators_with(config.clone(), &[2200, 2150, 2100, 2050, 2000]);
+        assert_eq!(
+            indicators.calculate_rsi_multiplier().unwrap(),
+            config.rsi_oversold_multiplier
+        );
+    }
+
+    #[test]
+    fn test_rsi_multiplier_uptrend_is_overbought() {
+        let config = MarketIndicatorsConfig {
+            rsi_period: 4,
+            ..Default::default()
+        };
+        // Oldest -> newest: monotonic rise gives RSI = 100.
+        let indicators = indicators_with(config.clone(), &[2000, 2050, 2100, 2150, 2200]);
+        assert_eq!(
+            indicators.calculate_rsi_multiplier().unwrap(),
+            config.rsi_overbought_multiplier
+        );
+    }
+
+    #[test]
+    fn test_rsi_multiplier_choppy_is_neutral() {
+        let config = MarketIndicatorsConfig {
+            rsi_period: 4,
+            ..Default::default()
+        };
+        // Alternating gains/losses give RSI = 50.
+        let indicators = indicators_with(config, &[2000, 2050, 2000, 2050, 2000]);
+        assert_eq!(
+            indicators.calculate_rsi_multiplier().unwrap(),
+            Decimal::ONE
+        );
+    }
+
+    // --- Price deviation multiplier ---
+
+    #[test]
+    fn test_price_deviation_multiplier_below_ma_triggers_increase() {
+        let config = MarketIndicatorsConfig {
+            moving_average_period: 5,
+            ..Default::default()
+        };
+        // MA = 960, latest price 800 -> -16.7% deviation.
+        let indicators = indicators_with(config.clone(), &[1000, 1000, 1000, 1000, 800]);
+        assert_eq!(
+            indicators.calculate_price_deviation_multiplier().unwrap(),
+            config.below_ma_multiplier
+        );
+    }
+
+    #[test]
+    fn test_price_deviation_multiplier_above_ma_triggers_decrease() {
+        let config = MarketIndicatorsConfig {
+            moving_average_period: 5,
+            ..Default::default()
+        };
+        // MA = 1040, latest price 1200 -> +15.4% deviation.
+        let indicators = indicators_with(config.clone(), &[1000, 1000, 1000, 1000, 1200]);
+        assert_eq!(
+            indicators.calculate_price_deviation_multiplier().unwrap(),
+            config.above_ma_multiplier
+        );
+    }
+
+    #[test]
+    fn test_price_deviation_multiplier_near_ma_is_neutral() {
+        let config = MarketIndicatorsConfig {
+            moving_average_period: 5,
+            ..Default::default()
+        };
+        // MA = 1006, latest price 1030 -> +2.4% deviation.
+        let indicators = indicators_with(config, &[1000, 1000, 1000, 1000, 1030]);
+        assert_eq!(
+            indicators.calculate_price_deviation_multiplier().unwrap(),
+            Decimal::ONE
+        );
+    }
+
+    // --- Momentum multiplier ---
+
+    #[test]
+    fn test_momentum_multiplier_negative_triggers_increase() {
+        let config = MarketIndicatorsConfig {
+            momentum_period: 5,
+            ..Default::default()
+        };
+        // -10% over the period.
+        let indicators = indicators_with(config.clone(), &[1000, 990, 980, 970, 960, 900]);
+        assert_eq!(
+            indicators.calculate_momentum_multiplier().unwrap(),
+            config.negative_momentum_multiplier
+        );
+    }
+
+    #[test]
+    fn test_momentum_multiplier_positive_triggers_decrease() {
+        let config = MarketIndicatorsConfig {
+            momentum_period: 5,
+            ..Default::default()
+        };
+        // +20% over the period.
+        let indicators = indicators_with(config.clone(), &[1000, 1010, 1020, 1030, 1040, 1200]);
+        assert_eq!(
+            indicators.calculate_momentum_multiplier().unwrap(),
+            config.positive_momentum_multiplier
+        );
+    }
+
+    #[test]
+    fn test_momentum_multiplier_flat_is_neutral() {
+        let config = MarketIndicatorsConfig {
+            momentum_period: 5,
+            ..Default::default()
+        };
+        // +2% over the period.
+        let indicators = indicators_with(config, &[1000, 1010, 1005, 1015, 1010, 1020]);
+        assert_eq!(
+            indicators.calculate_momentum_multiplier().unwrap(),
+            Decimal::ONE
+        );
+    }
+
+    /// Prints the data behind a live multiplier: fetched history, each
+    /// individual signal's value/multiplier, and the combined result.
+    fn print_live_multiplier_breakdown(indicators: &MarketIndicators, combined_multiplier: Decimal) {
+        let history = &indicators.price_history;
+        let oldest = history.front().map(|p| p.price);
+        let newest = history.back().map(|p| p.price);
+
+        println!("--- Live market indicator data ---");
+        println!(
+            "price points: {} (oldest: {:?}, latest: {:?})",
+            history.len(),
+            oldest,
+            newest
+        );
+
+        let recent_for_vol: Vec<Decimal> = history
+            .iter()
+            .rev()
+            .take(indicators.config.volatility_period as usize)
+            .map(|p| p.price)
+            .collect();
+        if let Ok(volatility) = indicators.calculate_price_volatility(&recent_for_vol) {
+            let mean = recent_for_vol.iter().sum::<Decimal>()
+                / Decimal::new(recent_for_vol.len() as i64, 0);
+            println!(
+                "volatility: std={} mean={} ratio={:.4}%",
+                volatility,
+                mean,
+                (volatility / mean) * Decimal::new(100, 0)
+            );
+        }
+
+        println!(
+            "volatility multiplier: {}",
+            indicators.calculate_volatility_multiplier().unwrap()
+        );
+        println!(
+            "rsi multiplier: {}",
+            indicators.calculate_rsi_multiplier().unwrap()
+        );
+        println!(
+            "price deviation multiplier: {}",
+            indicators.calculate_price_deviation_multiplier().unwrap()
+        );
+        println!(
+            "momentum multiplier: {}",
+            indicators.calculate_momentum_multiplier().unwrap()
+        );
+        println!("combined (clamped) multiplier: {}", combined_multiplier);
+        println!("-----------------------------------");
+    }
+
+    // --- Live integration test ---
+    //
+    // Exercises the full `calculate_dca_multiplier` path (historical fetch +
+    // current price + all four signals + bounds clamping) against the real
+    // Binance public API. `get_price`/klines endpoints used here are
+    // unauthenticated, so no API keys are required. Ignored by default since it
+    // needs network access and real market data isn't deterministic; run with
+    // `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "hits the live Binance API; run explicitly with `cargo test -- --ignored`"]
+    async fn test_calculate_dca_multiplier_against_live_binance_data() {
+        let exchange = BinanceClient::new(
+            String::new(),
+            String::new(),
+            "https://api.binance.com".to_string(),
+        );
+        let stats_db = DcaStatsDB::with_collection("dca_purchases_live_test")
+            .await
+            .expect("DcaStatsDB constructs lazily and shouldn't require a live Mongo connection");
+
+        let config = MarketIndicatorsConfig::default();
+        let mut indicators = MarketIndicators::new(config.clone());
+
+        // Use the real trading pair symbol (as `DcaTrader` does), not the bare
+        // asset name — Binance's ticker endpoint needs the quote currency too.
+        let multiplier = indicators
+            .calculate_dca_multiplier(&exchange, &stats_db, "ETHUSDC")
+            .await
+            .expect("live DCA multiplier calculation should succeed against real market data");
+
+        print_live_multiplier_breakdown(&indicators, multiplier);
+
+        // We fetched enough real history to evaluate every signal.
+        assert!(indicators.price_history.len() >= config.volatility_period as usize);
+        // The combined multiplier always respects the configured bounds.
+        assert!(multiplier >= config.min_total_multiplier);
+        assert!(multiplier <= config.max_total_multiplier);
+        assert!(multiplier > Decimal::ZERO);
+    }
+
+    // Same as above, but sources the live current price from Kraken instead of
+    // Binance. `update_price_history`'s historical fetch always hits Binance's
+    // klines (falling back to CoinGecko) regardless of the trading exchange — only
+    // the final "current price" tick comes from whichever `Exchange` is passed in
+    // — so this confirms the feature also works end-to-end when the bot is
+    // configured with `EXCHANGE=kraken`.
+    #[tokio::test]
+    #[ignore = "hits the live Kraken API; run explicitly with `cargo test -- --ignored`"]
+    async fn test_calculate_dca_multiplier_against_live_kraken_data() {
+        let exchange = KrakenClient::new(
+            String::new(),
+            String::new(),
+            "https://api.kraken.com".to_string(),
+        );
+        let stats_db = DcaStatsDB::with_collection("dca_purchases_live_test")
+            .await
+            .expect("DcaStatsDB constructs lazily and shouldn't require a live Mongo connection");
+
+        let config = MarketIndicatorsConfig::default();
+        let mut indicators = MarketIndicators::new(config.clone());
+
+        let multiplier = indicators
+            .calculate_dca_multiplier(&exchange, &stats_db, "ETHUSDC")
+            .await
+            .expect("live DCA multiplier calculation should succeed against real market data");
+
+        print_live_multiplier_breakdown(&indicators, multiplier);
+
+        assert!(indicators.price_history.len() >= config.volatility_period as usize);
+        assert!(multiplier >= config.min_total_multiplier);
+        assert!(multiplier <= config.max_total_multiplier);
+        assert!(multiplier > Decimal::ZERO);
     }
 }
