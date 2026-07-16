@@ -386,6 +386,32 @@ impl KrakenClient {
             .collect())
     }
 
+    /// Diagnostic dump of every open order on the account regardless of `userref`
+    /// (unlike [`Self::get_open_sleeve_orders`], which only sees the sleeve's own
+    /// tagged orders). Used to spot orders left over from before userref tagging
+    /// existed, which the sleeve has no way to discover on its own.
+    pub async fn debug_list_all_open_orders(&self) -> Result<Vec<(String, String, String, String, String, i64)>> {
+        #[derive(Debug, Deserialize)]
+        struct OpenOrdersResult {
+            open: HashMap<String, KrakenOrderInfo>,
+        }
+        let res: OpenOrdersResult = self.private_post("/private/OpenOrders", Vec::new()).await?;
+        Ok(res
+            .open
+            .into_iter()
+            .map(|(txid, info)| {
+                (
+                    txid,
+                    info.descr.pair.clone(),
+                    info.descr.price.clone(),
+                    info.vol.clone(),
+                    info.vol_exec.clone(),
+                    info.userref,
+                )
+            })
+            .collect())
+    }
+
     /// List the sleeve's orders that have left the book with a nonzero fill (fully
     /// filled, or canceled after a partial fill) — the crash-safe source of truth for
     /// what actually got bought. Caller dedups against its own records by txid.
