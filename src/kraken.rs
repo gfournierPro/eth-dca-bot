@@ -37,8 +37,16 @@ use crate::levels::{BidLadder, VolumeProfileConfig, compute_volume_profile, deri
 type HmacSha512 = Hmac<Sha512>;
 
 /// Process-wide monotonic nonce source. Kraken requires each request's nonce to be
-/// strictly greater than the previous one for the same API key.
+/// strictly greater than the previous one for the same API key, in the order Kraken
+/// *receives* the requests. Generating the nonce isn't enough: two sleeves can each
+/// hold their own `KrakenClient` for the same key, and if their requests race over the
+/// network the higher nonce can arrive first, so `PRIVATE_REQUEST_LOCK` below also
+/// serializes send order to match generation order.
 static NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Held from nonce generation through request dispatch in `private_post`, so concurrent
+/// private calls (e.g. multiple sleeves sharing one API key) can't reorder on the wire.
+static PRIVATE_REQUEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn next_nonce() -> u64 {
     let now = Utc::now().timestamp_millis() as u64;
@@ -566,6 +574,7 @@ impl KrakenClient {
         endpoint: &str,
         mut params: Vec<(String, String)>,
     ) -> Result<T> {
+        let guard = PRIVATE_REQUEST_LOCK.lock().await;
         let nonce = next_nonce().to_string();
         params.insert(0, ("nonce".to_string(), nonce.clone()));
 
@@ -586,6 +595,7 @@ impl KrakenClient {
             .body(postdata)
             .send()
             .await?;
+        drop(guard);
 
         if !response.status().is_success() {
             let text = response.text().await?;
