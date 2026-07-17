@@ -1,0 +1,3 @@
+#!/data/data/com.termux/files/usr/bin/sh
+cd "$HOME" || exit 1
+exec ./eth-dca-bot-android 2>&1
