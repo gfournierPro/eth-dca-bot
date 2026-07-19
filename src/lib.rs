@@ -9,3 +9,4 @@ pub mod levels;
 pub mod limit_sleeve;
 pub mod market_indicators;
 pub mod notion_integration;
+pub mod okx;
