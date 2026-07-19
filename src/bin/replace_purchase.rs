@@ -30,6 +30,15 @@ fn load_config() -> Result<Config> {
     if let Ok(v) = env::var("KRAKEN_SECRET_KEY") {
         config.kraken.secret_key = v;
     }
+    if let Ok(v) = env::var("OKX_API_KEY") {
+        config.okx.api_key = v;
+    }
+    if let Ok(v) = env::var("OKX_SECRET_KEY") {
+        config.okx.secret_key = v;
+    }
+    if let Ok(v) = env::var("OKX_PASSPHRASE") {
+        config.okx.passphrase = v;
+    }
 
     if let Ok(amount) = env::var("DCA_AMOUNT_EUR") {
         config.trading.buy_amount_eur = amount.parse()?;
@@ -63,6 +72,12 @@ fn build_exchange(config: &Config) -> Arc<dyn Exchange> {
             config.kraken.api_key.clone(),
             config.kraken.secret_key.clone(),
             config.kraken.base_url.clone(),
+        )),
+        ExchangeKind::Okx => Arc::new(eth_dca_bot::okx::OkxClient::new(
+            config.okx.api_key.clone(),
+            config.okx.secret_key.clone(),
+            config.okx.passphrase.clone(),
+            config.okx.base_url.clone(),
         )),
     }
 }

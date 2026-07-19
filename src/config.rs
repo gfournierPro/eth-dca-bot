@@ -9,6 +9,7 @@ use crate::levels::VolumeProfileConfig;
 pub enum ExchangeKind {
     Binance,
     Kraken,
+    Okx,
 }
 
 impl ExchangeKind {
@@ -16,6 +17,7 @@ impl ExchangeKind {
         match s.trim().to_lowercase().as_str() {
             "binance" => Some(Self::Binance),
             "kraken" => Some(Self::Kraken),
+            "okx" => Some(Self::Okx),
             _ => None,
         }
     }
@@ -23,10 +25,11 @@ impl ExchangeKind {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
-    /// Selected exchange backend (`binance` or `kraken`).
+    /// Selected exchange backend (`binance`, `kraken` or `okx`).
     pub exchange: ExchangeKind,
     pub binance: BinanceConfig,
     pub kraken: KrakenConfig,
+    pub okx: OkxConfig,
     pub trading: TradingConfig,
     pub schedule: ScheduleConfig,
     pub notion: NotionConfig,
@@ -156,6 +159,15 @@ pub struct KrakenConfig {
     pub base_url: String,
 }
 
+/// OKX needs a third credential: the API passphrase chosen when creating the key.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OkxConfig {
+    pub api_key: String,
+    pub secret_key: String,
+    pub passphrase: String,
+    pub base_url: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TradingConfig {
     pub symbol: String,
@@ -259,6 +271,12 @@ impl Default for Config {
                 api_key: String::new(),
                 secret_key: String::new(),
                 base_url: "https://api.kraken.com".to_string(),
+            },
+            okx: OkxConfig {
+                api_key: String::new(),
+                secret_key: String::new(),
+                passphrase: String::new(),
+                base_url: "https://www.okx.com".to_string(),
             },
             trading: TradingConfig {
                 symbol: "ETHUSDC".to_string(),

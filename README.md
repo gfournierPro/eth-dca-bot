@@ -41,6 +41,7 @@ src/
 ├── exchange.rs          # Exchange trait + unified order/withdrawal types
 ├── binance.rs           # Binance API client (implements Exchange)
 ├── kraken.rs            # Kraken API client (implements Exchange)
+├── okx.rs               # OKX API client (implements Exchange)
 ├── dca.rs              # Core DCA logic and trade execution
 ├── config.rs           # Configuration structures and defaults
 ├── dca_stats_mongo.rs  # MongoDB integration for statistics
@@ -50,9 +51,10 @@ src/
 
 ## Choosing an Exchange
 
-Set `EXCHANGE=binance` or `EXCHANGE=kraken` (defaults to `binance` if unset). Only
-the selected exchange's credentials are required. Both integrations trade the same
-USDC-quoted pairs (`ETHUSDC`, `BTCUSDC`) and size buys from an EUR amount.
+Set `EXCHANGE=binance`, `EXCHANGE=kraken` or `EXCHANGE=okx` (defaults to `binance`
+if unset). Only the selected exchange's credentials are required. All integrations
+trade the same USDC-quoted pairs (`ETHUSDC`, `BTCUSDC`) and size buys from an EUR
+amount.
 
 Key differences to be aware of on Kraken:
 
@@ -64,6 +66,27 @@ Key differences to be aware of on Kraken:
   informational on Kraken (the network is implied by the key).
 - **BTC**: referred to as `XBT` internally by Kraken; the bot handles the mapping, so
   keep using `BTCUSDC` in config.
+
+Key differences to be aware of on OKX:
+
+- **Credentials**: `OKX_API_KEY` / `OKX_SECRET_KEY` / `OKX_PASSPHRASE` (the
+  passphrase is chosen when creating the API key).
+- **EEA accounts**: OKX runs a separate MiCA-regulated platform for EEA users; its
+  API keys are rejected by the global endpoint with error 50119 ("API key doesn't
+  exist"). Set `OKX_BASE_URL=https://my.okx.com` for those accounts.
+- **Withdrawals**: go to a raw on-chain address (`WITHDRAWAL_WALLET_ADDRESS`), but
+  the address must first be added to OKX's withdrawal address book (verified
+  addresses only). `WITHDRAWAL_NETWORK` selects the chain (`ARBITRUM` → `Arbitrum
+  One`, `BTC` → `Bitcoin`). The bot auto-transfers funds from the trading to the
+  funding account before withdrawing.
+  **EEA accounts cannot use this**: since the Dec 2024 Travel Rule upgrade, OKX
+  blocks API withdrawals to private (self-custody) wallets for EEA users — errors
+  58237/58239. Keep `WITHDRAWAL_ENABLED=false` on OKX EEA and withdraw to the cold
+  wallet manually via the app/website (name verification + Satoshi test for
+  >€1000 transfers).
+- **Maker strategy**: same patient-maker limit buy as Kraken (post-only at the
+  best bid, re-pegged, market fallback on drift/timeout). Worthwhile on OKX EEA,
+  whose taker fee is 0.35%.
 
 To switch back to Binance later, set `EXCHANGE=binance` and provide the Binance
 credentials — no rebuild needed beyond restarting with the new env.
@@ -90,7 +113,7 @@ cd eth-dca-bot
 Create a `.env` file in the project root:
 
 ```env
-# Exchange selection: "binance" or "kraken"
+# Exchange selection: "binance", "kraken" or "okx"
 EXCHANGE=kraken
 
 # Binance API Configuration (used when EXCHANGE=binance)
@@ -100,6 +123,11 @@ BINANCE_SECRET_KEY=your_binance_secret_key
 # Kraken API Configuration (used when EXCHANGE=kraken)
 KRAKEN_API_KEY=your_kraken_api_key
 KRAKEN_SECRET_KEY=your_kraken_private_key
+
+# OKX API Configuration (used when EXCHANGE=okx)
+OKX_API_KEY=your_okx_api_key
+OKX_SECRET_KEY=your_okx_secret_key
+OKX_PASSPHRASE=your_okx_api_passphrase
 
 # Trading Configuration
 DCA_AMOUNT_EUR=50.0              # Amount in EUR to purchase ETH with (converted to USDC)

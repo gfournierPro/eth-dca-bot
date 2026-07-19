@@ -9,6 +9,7 @@ mod levels;
 mod limit_sleeve;
 mod market_indicators;
 mod notion_integration;
+mod okx;
 
 use anyhow::Result;
 use chrono::Utc;
@@ -37,6 +38,12 @@ fn build_exchange(config: &Config) -> Arc<dyn Exchange> {
             config.kraken.api_key.clone(),
             config.kraken.secret_key.clone(),
             config.kraken.base_url.clone(),
+        )),
+        ExchangeKind::Okx => Arc::new(okx::OkxClient::new(
+            config.okx.api_key.clone(),
+            config.okx.secret_key.clone(),
+            config.okx.passphrase.clone(),
+            config.okx.base_url.clone(),
         )),
     }
 }
@@ -471,7 +478,7 @@ fn load_config() -> Result<Config> {
     if let Ok(exchange) = env::var("EXCHANGE") {
         config.exchange = ExchangeKind::parse(&exchange).ok_or_else(|| {
             anyhow::anyhow!(
-                "Invalid EXCHANGE '{}' (expected 'binance' or 'kraken')",
+                "Invalid EXCHANGE '{}' (expected 'binance', 'kraken' or 'okx')",
                 exchange
             )
         })?;
@@ -496,6 +503,18 @@ fn load_config() -> Result<Config> {
     }
     if let Ok(v) = env::var("KRAKEN_BASE_URL") {
         config.kraken.base_url = v;
+    }
+    if let Ok(v) = env::var("OKX_API_KEY") {
+        config.okx.api_key = v;
+    }
+    if let Ok(v) = env::var("OKX_SECRET_KEY") {
+        config.okx.secret_key = v;
+    }
+    if let Ok(v) = env::var("OKX_PASSPHRASE") {
+        config.okx.passphrase = v;
+    }
+    if let Ok(v) = env::var("OKX_BASE_URL") {
+        config.okx.base_url = v;
     }
 
     if let Ok(amount) = env::var("DCA_AMOUNT_EUR") {
@@ -713,6 +732,16 @@ fn validate_config(config: &Config) -> Result<()> {
             if config.kraken.api_key.is_empty() || config.kraken.secret_key.is_empty() {
                 return Err(anyhow::anyhow!(
                     "Invalid Kraken API credentials (set KRAKEN_API_KEY and KRAKEN_SECRET_KEY)"
+                ));
+            }
+        }
+        ExchangeKind::Okx => {
+            if config.okx.api_key.is_empty()
+                || config.okx.secret_key.is_empty()
+                || config.okx.passphrase.is_empty()
+            {
+                return Err(anyhow::anyhow!(
+                    "Invalid OKX API credentials (set OKX_API_KEY, OKX_SECRET_KEY and OKX_PASSPHRASE)"
                 ));
             }
         }
