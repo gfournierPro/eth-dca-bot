@@ -380,14 +380,18 @@ impl DcaTrader {
             scheduled_times.len()
         );
 
-        // Check each scheduled time to see if we have a purchase around that time
+        // Check each scheduled time to see if we have a purchase covering it. The
+        // upper bound is `now`, not a fixed window after `scheduled_time`: a catch-up
+        // buy can land arbitrarily late if the bot keeps restarting mid-purchase (the
+        // patient-maker loop can take minutes to hours), and a fixed window used to
+        // make the check fall permanently outside it — re-triggering a fresh buy on
+        // every subsequent restart forever.
         for scheduled_time in scheduled_times {
-            let window_start = scheduled_time - Duration::hours(4); // 30min before
-            let window_end = scheduled_time + Duration::hours(4); // 2h after (generous window)
+            let window_start = scheduled_time - Duration::hours(4);
 
-            // Check if we have any purchase in the window around this scheduled time
+            // Check if we have any purchase since shortly before this scheduled time
             let has_purchase_for_schedule = self
-                .has_purchase_in_time_window(window_start, window_end)
+                .has_purchase_in_time_window(window_start, now)
                 .await?;
 
             if !has_purchase_for_schedule {
@@ -395,7 +399,7 @@ impl DcaTrader {
                     "❌ Missing DCA purchase for scheduled time: {} (checking window {} to {})",
                     scheduled_time.format("%Y-%m-%d %H:%M:%S UTC"),
                     window_start.format("%Y-%m-%d %H:%M:%S UTC"),
-                    window_end.format("%Y-%m-%d %H:%M:%S UTC")
+                    now.format("%Y-%m-%d %H:%M:%S UTC")
                 );
 
                 // Execute the missed DCA

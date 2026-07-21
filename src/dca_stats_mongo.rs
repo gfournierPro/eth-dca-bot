@@ -284,16 +284,8 @@ impl DcaStatsDB {
 
     pub async fn has_purchase_in_last_24h(&self) -> Result<bool> {
         let twenty_four_hours_ago = chrono::Utc::now() - chrono::Duration::hours(24);
-
-        let filter = doc! {
-            "timestamp": {
-                "$gte": twenty_four_hours_ago.to_rfc3339()
-            },
-            "status": "FILLED"
-        };
-
-        let count = self.collection.count_documents(filter).await?;
-        Ok(count > 0)
+        self.has_purchase_in_time_window(twenty_four_hours_ago, chrono::Utc::now())
+            .await
     }
 
     pub async fn has_purchase_in_time_window(
@@ -301,16 +293,24 @@ impl DcaStatsDB {
         start: chrono::DateTime<chrono::Utc>,
         end: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool> {
-        let filter = doc! {
-            "timestamp": {
-                "$gte": start.to_rfc3339(),
-                "$lte": end.to_rfc3339()
-            },
-            "status": "FILLED"
-        };
-
-        let count = self.collection.count_documents(filter).await?;
-        Ok(count > 0)
+        // `timestamp` is stored as whatever format chrono's default serde produced
+        // at write time (an RFC3339 string with variable-precision fractional
+        // seconds), so it can't be range-compared server-side: neither a BSON Date
+        // literal (wrong type) nor a `to_rfc3339()` string (different formatting,
+        // so byte-wise comparison silently misorders around fractional-second
+        // boundaries) reliably brackets it. That mismatch made this check always
+        // report "no purchase found", so the startup missed-DCA logic re-bought on
+        // every restart. Filter server-side on `status` only (plain string
+        // equality, always safe) and compare the already-correctly-parsed
+        // timestamps in Rust instead.
+        let filter = doc! { "status": "FILLED" };
+        let mut cursor = self.collection.find(filter).await?;
+        while let Some(purchase) = cursor.try_next().await? {
+            if purchase.timestamp >= start && purchase.timestamp <= end {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Get all existing order IDs from the database
@@ -585,4 +585,121 @@ pub fn print_recent_purchases(asset: &str, purchases: &[DcaPurchase]) {
     }
 
     info!("╚════════════════════════════════════════════════════════════════╝");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    // Regression test for the bug where `has_purchase_in_time_window` range-compared
+    // the `timestamp` field server-side (as a BSON Date, or before that as a
+    // `to_rfc3339()` string) against what's actually stored: an RFC3339 string in
+    // chrono's own serde format, with variable-precision fractional seconds. Neither
+    // comparison reliably brackets the real value, so the check always reported "no
+    // purchase found" and the bot re-bought on every restart. Needs a reachable
+    // MongoDB (respects MONGODB_URL, same as the rest of the bot).
+    #[tokio::test]
+    async fn has_purchase_in_time_window_finds_a_stored_purchase() {
+        let db = DcaStatsDB::with_collection("test_has_purchase_in_time_window")
+            .await
+            .expect("connect to MongoDB");
+        db.collection
+            .delete_many(Document::new())
+            .await
+            .expect("clear test collection");
+
+        let ts = Utc::now();
+        let purchase = DcaPurchase {
+            id: "test-id".to_string(),
+            timestamp: ts,
+            symbol: "ETHUSDC".to_string(),
+            side: "BUY".to_string(),
+            usdc_amount: dec!(10),
+            eth_amount: dec!(0.005),
+            eth_price: dec!(2000),
+            fees_usdc: dec!(0.01),
+            order_id: "test-order".to_string(),
+            status: "FILLED".to_string(),
+        };
+        db.record_purchase(&purchase).await.expect("insert");
+
+        let inside = db
+            .has_purchase_in_time_window(ts - Duration::hours(1), ts + Duration::hours(1))
+            .await
+            .expect("query");
+        assert!(inside, "purchase should be found inside its window");
+
+        let outside = db
+            .has_purchase_in_time_window(ts - Duration::hours(4), ts - Duration::hours(2))
+            .await
+            .expect("query");
+        assert!(!outside, "purchase should not be found outside its window");
+
+        db.collection
+            .delete_many(Document::new())
+            .await
+            .expect("cleanup test collection");
+    }
+
+    // Reproduces the exact failure from the field: a Monday 09:00 scheduled buy
+    // that only lands ~31 hours late (because the bot kept restarting mid-purchase)
+    // must still be recognized on the *next* restart, using the open-ended
+    // "scheduled_time - 4h .. now" window `check_and_execute_startup_dca` uses.
+    #[tokio::test]
+    async fn late_catch_up_purchase_is_recognized_on_next_restart() {
+        let db = DcaStatsDB::with_collection("test_late_catch_up_purchase")
+            .await
+            .expect("connect to MongoDB");
+        db.collection
+            .delete_many(Document::new())
+            .await
+            .expect("clear test collection");
+
+        let scheduled_time = Utc::now() - Duration::hours(36); // e.g. last Monday 09:00
+        let actual_purchase_time = scheduled_time + Duration::hours(31); // landed a day late
+        let purchase = DcaPurchase {
+            id: "test-id".to_string(),
+            timestamp: actual_purchase_time,
+            symbol: "ETHUSDC".to_string(),
+            side: "BUY".to_string(),
+            usdc_amount: dec!(10),
+            eth_amount: dec!(0.005),
+            eth_price: dec!(2000),
+            fees_usdc: dec!(0.01),
+            order_id: "test-order".to_string(),
+            status: "FILLED".to_string(),
+        };
+        db.record_purchase(&purchase).await.expect("insert");
+
+        // Old behavior: fixed +/-4h window around scheduled_time never contains a
+        // purchase that landed 31h late.
+        let old_window_found = db
+            .has_purchase_in_time_window(
+                scheduled_time - Duration::hours(4),
+                scheduled_time + Duration::hours(4),
+            )
+            .await
+            .expect("query");
+        assert!(
+            !old_window_found,
+            "sanity check: the late purchase falls outside the old fixed window"
+        );
+
+        // New behavior (matches dca.rs::check_and_execute_startup_dca): open-ended
+        // upper bound at `now` catches it, so the bot won't re-buy.
+        let new_window_found = db
+            .has_purchase_in_time_window(scheduled_time - Duration::hours(4), Utc::now())
+            .await
+            .expect("query");
+        assert!(
+            new_window_found,
+            "late catch-up purchase must be found so the bot doesn't re-buy"
+        );
+
+        db.collection
+            .delete_many(Document::new())
+            .await
+            .expect("cleanup test collection");
+    }
 }
