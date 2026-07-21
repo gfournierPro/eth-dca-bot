@@ -36,7 +36,22 @@ This does **not** survive a full phone reboot unless Termux is opened
 afterward (Android doesn't launch apps on boot). For that, install the
 separate Termux:Boot app and drop a script in `~/.termux/boot/` that starts
 `runsvdir` — a manual one-time step on the device.
+```
+# 1. Edit the field(s) you need in local .env (any editor, or):
+# e.g. sed -i '' 's/^EXCHANGE=.*/EXCHANGE=okx/' .env
 
+# 2. Push it to the phone
+scp .env xiaomi-termux:~/.env
+
+# 3. Restart the supervised service to pick it up
+ssh xiaomi-termux 'export SVDIR=$PREFIX/var/service && sv restart eth-dca-bot && sleep 2 && sv status eth-dca-bot'
+
+# 4. Confirm it came up clean
+ssh xiaomi-termux 'tail -n 30 $PREFIX/var/log/sv/eth-dca-bot/current'
+
+# 5. Full logs
+ssh xiaomi-termux 'cat $PREFIX/var/log/sv/eth-dca-bot/current'
+```
 ## Build Info
 - Target: aarch64-linux-android
 - Built with: GitHub Actions + cross-rs
