@@ -52,6 +52,17 @@ ssh xiaomi-termux 'tail -n 30 $PREFIX/var/log/sv/eth-dca-bot/current'
 # 5. Full logs
 ssh xiaomi-termux 'cat $PREFIX/var/log/sv/eth-dca-bot/current'
 ```
+
+## Deploying a new binary
+The running binary is a live executable — `scp`-ing over it directly fails
+with `scp: dest open "...": Failure` (ETXTBSY) while the service has it open.
+Stop the service first:
+```
+ssh xiaomi-termux 'export SVDIR=$PREFIX/var/service && sv stop eth-dca-bot'
+scp binaries/android/eth-dca-bot-android xiaomi-termux:~/eth-dca-bot-android
+ssh xiaomi-termux 'chmod +x ~/eth-dca-bot-android && export SVDIR=$PREFIX/var/service && sv start eth-dca-bot && sleep 2 && sv status eth-dca-bot'
+```
+
 ## Build Info
 - Target: aarch64-linux-android
 - Built with: GitHub Actions + cross-rs
