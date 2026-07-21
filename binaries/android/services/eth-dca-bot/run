@@ -1,3 +1,4 @@
 #!/data/data/com.termux/files/usr/bin/sh
 cd "$HOME" || exit 1
+export RUST_LOG=eth_dca_bot::market_indicators=debug,info
 exec ./eth-dca-bot-android 2>&1

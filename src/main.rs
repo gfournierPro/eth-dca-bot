@@ -135,7 +135,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Limit-order sleeves (optional — Kraken only, isolated from the DCA core).
+    // Limit-order sleeves (optional — Kraken or OKX, isolated from the DCA core).
     if let Err(e) = setup_limit_sleeves(&config, &sched).await {
         error!("Failed to set up limit sleeves: {}", e);
     }
@@ -332,10 +332,10 @@ async fn setup_asset_trader(
     Ok(())
 }
 
-/// Set up every configured limit-order sleeve (ETH and/or BTC). The sleeves are
-/// Kraken-only (they use Kraken's resting-order path), so they are skipped with a
-/// warning on any other backend. Each sleeve is isolated: one failing to start
-/// doesn't take the other down.
+/// Set up every configured limit-order sleeve (ETH and/or BTC). The sleeves work
+/// against Kraken or OKX (both implement [`exchange::SleeveExchange`]); on any
+/// other backend they're skipped with a warning. Each sleeve is isolated: one
+/// failing to start doesn't take the other down.
 async fn setup_limit_sleeves(config: &Config, sched: &JobScheduler) -> Result<()> {
     // Each sleeve is paired with the Notion DB it mirrors into: the ETH sleeve
     // reuses the shared (ETH) Notion DB, the BTC sleeve the BTC workflow's.
@@ -349,16 +349,43 @@ async fn setup_limit_sleeves(config: &Config, sched: &JobScheduler) -> Result<()
     if sleeves.is_empty() {
         return Ok(());
     }
-    if config.exchange != ExchangeKind::Kraken {
-        warn!(
-            "Limit sleeve is enabled but EXCHANGE is not Kraken; the sleeve requires Kraken — skipping"
-        );
-        return Ok(());
-    }
+
+    let sleeve_exchange: Arc<dyn exchange::SleeveExchange> = match config.exchange {
+        ExchangeKind::Kraken => Arc::new(kraken::KrakenClient::new(
+            config.kraken.api_key.clone(),
+            config.kraken.secret_key.clone(),
+            config.kraken.base_url.clone(),
+        )),
+        ExchangeKind::Okx => Arc::new(okx::OkxClient::new(
+            config.okx.api_key.clone(),
+            config.okx.secret_key.clone(),
+            config.okx.passphrase.clone(),
+            config.okx.base_url.clone(),
+        )),
+        ExchangeKind::Binance => {
+            warn!(
+                "Limit sleeve is enabled but EXCHANGE is Binance; the sleeve requires Kraken or OKX — skipping"
+            );
+            return Ok(());
+        }
+    };
+    let source_label = if config.exchange == ExchangeKind::Okx {
+        "OKX"
+    } else {
+        "Kraken"
+    };
 
     for (sleeve_cfg, notion_cfg) in sleeves {
         let asset = sleeve_cfg.asset.clone();
-        if let Err(e) = setup_one_sleeve(sleeve_cfg, notion_cfg, config, sched).await {
+        if let Err(e) = setup_one_sleeve(
+            sleeve_exchange.clone(),
+            source_label,
+            sleeve_cfg,
+            notion_cfg,
+            sched,
+        )
+        .await
+        {
             error!("[sleeve:{}] setup failed: {}", asset, e);
         }
     }
@@ -381,28 +408,22 @@ fn btc_sleeve_notion(config: &Config) -> config::NotionConfig {
     }
 }
 
-/// Set up one limit-order sleeve: a fresh Kraken client, its own Mongo collection,
-/// a startup reconcile, and the recurring reconcile job.
+/// Set up one limit-order sleeve: its own Mongo collection, a startup reconcile,
+/// and the recurring reconcile job, against the shared sleeve-capable exchange
+/// client built by [`setup_limit_sleeves`].
 async fn setup_one_sleeve(
+    exchange: Arc<dyn exchange::SleeveExchange>,
+    source_label: &str,
     sleeve_cfg: config::LimitSleeveConfig,
     notion_cfg: config::NotionConfig,
-    config: &Config,
     sched: &JobScheduler,
 ) -> Result<()> {
     let asset = sleeve_cfg.asset.clone();
 
-    // The sleeve holds a concrete Kraken client (its resting-order methods aren't on
-    // the Exchange trait). Uses the same credentials as the trading backend.
-    let kraken = kraken::KrakenClient::new(
-        config.kraken.api_key.clone(),
-        config.kraken.secret_key.clone(),
-        config.kraken.base_url.clone(),
-    );
-
     // Notion mirror; fills are tagged "Limit Sleeve Fill" inside the monthly page.
     // Absent config just means Mongo-only recording.
     let notion = if !notion_cfg.token.is_empty() && !notion_cfg.database_id.is_empty() {
-        match NotionDCATracker::new(&notion_cfg, &sleeve_cfg.asset, "Kraken") {
+        match NotionDCATracker::new(&notion_cfg, &sleeve_cfg.asset, source_label) {
             Ok(tracker) => Some(tracker),
             Err(e) => {
                 warn!("[sleeve:{}] Notion mirror disabled: {}", asset, e);
@@ -413,7 +434,7 @@ async fn setup_one_sleeve(
         None
     };
 
-    let sleeve = limit_sleeve::LimitSleeve::new(kraken, sleeve_cfg.clone())
+    let sleeve = limit_sleeve::LimitSleeve::new(exchange, sleeve_cfg.clone())
         .await?
         .with_notion(notion);
 

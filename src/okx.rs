@@ -37,7 +37,11 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::dca_stats_mongo::DcaPurchase;
-use crate::exchange::{Exchange, LimitBuyConfig, OrderOutcome};
+use crate::exchange::{
+    ClosedSleeveFill, Exchange, LimitBuyConfig, OpenSleeveOrder, OrderOutcome, PairSpec,
+    RestingOrderState, SleeveExchange,
+};
+use crate::levels::{BidLadder, VolumeProfileConfig, compute_volume_profile, derive_bid_ladder};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -96,6 +100,17 @@ struct OrderData {
     state: String,
     #[serde(default)]
     side: String,
+    /// Client order id — the sleeve stamps a tag prefix into this to pick its
+    /// own orders out of account-wide pending/history listings (OKX has no
+    /// userref-like native tag).
+    #[serde(rename = "clOrdId", default)]
+    cl_ord_id: String,
+    /// Resting limit price (pending orders only).
+    #[serde(default)]
+    px: String,
+    /// Ordered base volume (pending orders only).
+    #[serde(default)]
+    sz: String,
     #[serde(rename = "accFillSz", default)]
     acc_fill_sz: String,
     #[serde(rename = "avgPx", default)]
@@ -153,6 +168,9 @@ struct InstrumentData {
     /// Minimum order size (base ccy).
     #[serde(rename = "minSz", default)]
     min_sz: String,
+    /// Price tick size.
+    #[serde(rename = "tickSz", default)]
+    tick_sz: String,
 }
 
 impl OkxClient {
@@ -339,9 +357,10 @@ impl OkxClient {
         })
     }
 
-    /// Fetch the instrument's size constraints: (lot size, minimum size), both in
-    /// base ccy. Limit orders with a size not on the lot grid are rejected.
-    async fn fetch_size_spec(&self, inst_id: &str) -> Result<(Decimal, Decimal)> {
+    /// Fetch the instrument's trading constraints: tick size, lot size, and
+    /// minimum order size, all needed to place a valid resting bid. Limit orders
+    /// with a price/size off either grid are rejected.
+    async fn fetch_pair_spec(&self, inst_id: &str) -> Result<PairSpec> {
         let data: Vec<InstrumentData> = self
             .public_get(&format!(
                 "/api/v5/public/instruments?instType=SPOT&instId={inst_id}"
@@ -351,11 +370,240 @@ impl OkxClient {
             .into_iter()
             .next()
             .ok_or_else(|| anyhow!("OKX returned no instrument spec for {}", inst_id))?;
-        let lot_sz = parse_dec(&inst.lot_sz);
-        if lot_sz <= Decimal::ZERO {
-            return Err(anyhow!("OKX gave non-positive lotSz for {}", inst_id));
+        let tick_size = parse_dec(&inst.tick_sz);
+        let lot_size = parse_dec(&inst.lot_sz);
+        if tick_size <= Decimal::ZERO || lot_size <= Decimal::ZERO {
+            return Err(anyhow!(
+                "OKX gave non-positive tickSz/lotSz for {}",
+                inst_id
+            ));
         }
-        Ok((lot_sz, parse_dec(&inst.min_sz)))
+        Ok(PairSpec {
+            tick_size,
+            lot_size,
+            ordermin: parse_dec(&inst.min_sz),
+        })
+    }
+
+    /// Fetch OHLC candles from OKX's public API and reduce them to
+    /// `(price, volume)` observations for volume-profile computation, using each
+    /// candle's own VWAP (`volCcyQuote / vol`, i.e. quote volume over base
+    /// volume) as the representative price — same definition Kraken hands back
+    /// directly. `history-candles` caps at 100 rows/page, so this paginates
+    /// backwards via the `after` cursor to approximate Kraken's ~720-candle
+    /// single-shot window.
+    async fn fetch_volume_observations(
+        &self,
+        inst_id: &str,
+        interval_minutes: u32,
+    ) -> Result<Vec<(Decimal, Decimal)>> {
+        let bar = minutes_to_bar(interval_minutes)?;
+        const PAGE_LIMIT: usize = 100;
+        const MAX_PAGES: usize = 8; // ~800 candles for a 1H bar ≈ Kraken's ~720 cap
+
+        let mut observations = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let mut path = format!(
+                "/api/v5/market/history-candles?instId={inst_id}&bar={bar}&limit={PAGE_LIMIT}"
+            );
+            if let Some(a) = &after {
+                path.push_str(&format!("&after={a}"));
+            }
+            let rows: Vec<Vec<String>> = self.public_get(&path).await?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                // Row layout: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm].
+                if row.len() < 8 {
+                    continue;
+                }
+                let vol = parse_dec(&row[5]);
+                let vol_ccy_quote = parse_dec(&row[7]);
+                if vol > Decimal::ZERO && vol_ccy_quote > Decimal::ZERO {
+                    observations.push((vol_ccy_quote / vol, vol));
+                }
+            }
+            let page_len = rows.len();
+            after = rows.into_iter().next_back().map(|r| r[0].clone());
+            if page_len < PAGE_LIMIT {
+                break; // reached the oldest data OKX has
+            }
+        }
+        info!(
+            "OKX candles for {} ({}m): {} usable candles",
+            inst_id,
+            interval_minutes,
+            observations.len()
+        );
+        Ok(observations)
+    }
+
+    /// Build a volume-profile bid ladder for `symbol` straight from live OKX
+    /// data (mirrors [`KrakenClient::build_bid_ladder`]). Returns the ladder and
+    /// the spot price it was derived against — reuse it, don't re-read.
+    async fn build_bid_ladder(
+        &self,
+        symbol: &str,
+        interval_minutes: u32,
+        config: &VolumeProfileConfig,
+    ) -> Result<(BidLadder, Decimal)> {
+        let inst = Self::okx_inst(symbol);
+        let observations = self
+            .fetch_volume_observations(&inst, interval_minutes)
+            .await?;
+        let profile = compute_volume_profile(&observations, config)?;
+        let current_price = self.get_price(symbol).await?;
+        let ladder = derive_bid_ladder(&profile, current_price, config)?;
+        Ok((ladder, current_price))
+    }
+
+    /// Prefix stamped into `clOrdId` for every order the sleeve places, and the
+    /// filter used to pick its own orders out of account-wide pending/history
+    /// listings. OKX has no native userref-like tag, so the sleeve's numeric tag
+    /// is encoded as a clOrdId prefix instead (clOrdId itself must still be
+    /// unique per order, so [`Self::place_resting_limit_buy`] appends a random
+    /// suffix at placement).
+    fn sleeve_tag_prefix(userref: i32) -> String {
+        format!("sleeve{userref}")
+    }
+
+    /// The sleeve's currently-resting orders (those whose `clOrdId` carries the
+    /// sleeve's tag prefix), across all spot instruments.
+    async fn get_open_sleeve_orders(&self, userref: i32) -> Result<Vec<OpenSleeveOrder>> {
+        let prefix = Self::sleeve_tag_prefix(userref);
+        let orders: Vec<OrderData> = self
+            .private_request("GET", "/api/v5/trade/orders-pending?instType=SPOT", None)
+            .await?;
+        Ok(orders
+            .into_iter()
+            .filter(|o| o.cl_ord_id.starts_with(&prefix))
+            .map(|o| OpenSleeveOrder {
+                txid: o.ord_id,
+                price: parse_dec(&o.px),
+                volume: parse_dec(&o.sz),
+                executed_qty: parse_dec(&o.acc_fill_sz),
+            })
+            .collect())
+    }
+
+    /// The sleeve's orders that left the book with a nonzero fill since `start`
+    /// (unix seconds), the crash-safe source of truth for realized fills.
+    /// Paginates the archive endpoint (3-month history) via the `after` cursor.
+    async fn get_closed_sleeve_fills(
+        &self,
+        userref: i32,
+        start: Option<i64>,
+    ) -> Result<Vec<ClosedSleeveFill>> {
+        let prefix = Self::sleeve_tag_prefix(userref);
+        const PAGE_LIMIT: usize = 100;
+        const MAX_PAGES: usize = 20;
+
+        let begin = start.map(|s| (s * 1000).to_string());
+        let mut out = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let mut path = format!(
+                "/api/v5/trade/orders-history-archive?instType=SPOT&limit={PAGE_LIMIT}"
+            );
+            if let Some(b) = &begin {
+                path.push_str(&format!("&begin={b}"));
+            }
+            if let Some(a) = &after {
+                path.push_str(&format!("&after={a}"));
+            }
+            let page: Vec<OrderData> = self.private_request("GET", &path, None).await?;
+            if page.is_empty() {
+                break;
+            }
+            for o in &page {
+                if o.side != "buy" || !o.cl_ord_id.starts_with(&prefix) {
+                    continue;
+                }
+                let qty = parse_dec(&o.acc_fill_sz);
+                if qty <= Decimal::ZERO {
+                    continue;
+                }
+                let avg = parse_dec(&o.avg_px);
+                out.push(ClosedSleeveFill {
+                    txid: o.ord_id.clone(),
+                    executed_qty: qty,
+                    executed_value: qty * avg,
+                    fee: fee_to_usdc(&o.fee, &o.fee_ccy, avg),
+                    closetm: o.u_time.parse::<i64>().unwrap_or(0) / 1000,
+                });
+            }
+            let page_len = page.len();
+            after = page.into_iter().next_back().map(|o| o.ord_id);
+            if page_len < PAGE_LIMIT {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Post a fire-and-forget, post-only limit buy tagged with `userref` (see
+    /// [`Self::sleeve_tag_prefix`]), returning the OKX order id. `price`/`volume`
+    /// must already be tick/lot-rounded by the caller.
+    async fn place_resting_limit_buy(
+        &self,
+        symbol: &str,
+        price: Decimal,
+        volume: Decimal,
+        userref: i32,
+    ) -> Result<String> {
+        let inst = Self::okx_inst(symbol);
+        // Short random suffix keeps clOrdId unique per order while the shared
+        // prefix stays filterable; well under OKX's 32-char/alphanumeric cap.
+        let cl_ord_id = format!(
+            "{}{}",
+            Self::sleeve_tag_prefix(userref),
+            &Uuid::new_v4().simple().to_string()[..8]
+        );
+        let body = serde_json::json!({
+            "instId": inst,
+            "tdMode": "cash",
+            "side": "buy",
+            "ordType": "post_only",
+            "px": price.normalize().to_string(),
+            "sz": volume.normalize().to_string(),
+            "clOrdId": cl_ord_id,
+        });
+        let data: Vec<PlaceOrderData> = self
+            .private_request("POST", "/api/v5/trade/order", Some(body))
+            .await?;
+        let placed = data
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("OKX order placement returned no data"))?;
+        if placed.s_code != "0" {
+            return Err(anyhow!(
+                "OKX rejected resting order: code {} ({})",
+                placed.s_code,
+                placed.s_msg
+            ));
+        }
+        Ok(placed.ord_id)
+    }
+
+    /// Current state of a resting order, or `None` if OKX doesn't know the id.
+    async fn query_resting_order(
+        &self,
+        symbol: &str,
+        id: &str,
+    ) -> Result<Option<RestingOrderState>> {
+        let inst = Self::okx_inst(symbol);
+        Ok(self.query_order(&inst, id).await?.map(|o| {
+            let avg = parse_dec(&o.avg_px);
+            let qty = parse_dec(&o.acc_fill_sz);
+            RestingOrderState {
+                status: o.state,
+                executed_qty: qty,
+                executed_value: qty * avg,
+                fee: fee_to_usdc(&o.fee, &o.fee_ccy, avg),
+            }
+        }))
     }
 
     /// Post a maker-only limit buy of `sz` base asset at `px`. OKX's `post_only`
@@ -441,7 +689,8 @@ impl OkxClient {
     ) -> Result<OrderOutcome> {
         let inst = Self::okx_inst(symbol);
         let min_remaining = cfg.min_remaining; // stop once the unspent budget is dust
-        let (lot_sz, min_sz) = self.fetch_size_spec(&inst).await?;
+        let spec = self.fetch_pair_spec(&inst).await?;
+        let (lot_sz, min_sz) = (spec.lot_size, spec.ordermin);
 
         // Reference: what a taker would pay right now. Drift is measured off this.
         let start = self.get_order_book(&inst).await?;
@@ -658,6 +907,31 @@ fn fee_to_usdc(fee: &str, fee_ccy: &str, avg_price: Decimal) -> Decimal {
     } else {
         fee * avg_price
     }
+}
+
+/// Map the sleeve's `interval_minutes` to an OKX candle `bar` code. Only the
+/// values the sleeve's config actually uses need covering; an unmapped value is
+/// caller misconfiguration, not a runtime data issue, so it's an `Err`.
+fn minutes_to_bar(interval_minutes: u32) -> Result<&'static str> {
+    Ok(match interval_minutes {
+        1 => "1m",
+        3 => "3m",
+        5 => "5m",
+        15 => "15m",
+        30 => "30m",
+        60 => "1H",
+        120 => "2H",
+        240 => "4H",
+        360 => "6H",
+        720 => "12H",
+        1440 => "1D",
+        other => {
+            return Err(anyhow!(
+                "no OKX candle bar mapping for interval_minutes={}",
+                other
+            ));
+        }
+    })
 }
 
 #[async_trait]
@@ -949,6 +1223,64 @@ impl Exchange for OkxClient {
             .ok_or_else(|| anyhow!("OKX withdrawal returned no wdId"))?;
         info!("OKX withdrawal initiated, wdId {}", wd_id);
         Ok(wd_id)
+    }
+}
+
+/// Thin delegation to the inherent methods above — Rust always prefers an
+/// inherent method over a trait one, so `self.method()` here calls the
+/// concrete OKX implementation, not this trait fn recursively.
+#[async_trait]
+impl SleeveExchange for OkxClient {
+    async fn build_bid_ladder(
+        &self,
+        symbol: &str,
+        interval_minutes: u32,
+        config: &VolumeProfileConfig,
+    ) -> Result<(BidLadder, Decimal)> {
+        self.build_bid_ladder(symbol, interval_minutes, config).await
+    }
+
+    async fn fetch_pair_spec(&self, symbol: &str) -> Result<PairSpec> {
+        self.fetch_pair_spec(&Self::okx_inst(symbol)).await
+    }
+
+    async fn get_open_sleeve_orders(&self, userref: i32) -> Result<Vec<OpenSleeveOrder>> {
+        self.get_open_sleeve_orders(userref).await
+    }
+
+    async fn get_closed_sleeve_fills(
+        &self,
+        userref: i32,
+        start: Option<i64>,
+    ) -> Result<Vec<ClosedSleeveFill>> {
+        self.get_closed_sleeve_fills(userref, start).await
+    }
+
+    async fn place_resting_limit_buy(
+        &self,
+        symbol: &str,
+        price: Decimal,
+        volume: Decimal,
+        userref: i32,
+    ) -> Result<String> {
+        self.place_resting_limit_buy(symbol, price, volume, userref)
+            .await
+    }
+
+    async fn cancel_resting_order(&self, symbol: &str, id: &str) {
+        self.cancel_order(&Self::okx_inst(symbol), id).await
+    }
+
+    async fn query_resting_order(
+        &self,
+        symbol: &str,
+        id: &str,
+    ) -> Result<Option<RestingOrderState>> {
+        self.query_resting_order(symbol, id).await
+    }
+
+    async fn get_usdc_per_eur(&self) -> Result<Decimal> {
+        Exchange::get_usdc_per_eur(self).await
     }
 }
 
