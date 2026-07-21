@@ -31,7 +31,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::dca_stats_mongo::DcaPurchase;
-use crate::exchange::{Exchange, LimitBuyConfig, OrderOutcome};
+use crate::exchange::{
+    ClosedSleeveFill, Exchange, LimitBuyConfig, OpenSleeveOrder, OrderOutcome, PairSpec,
+    RestingOrderState, SleeveExchange,
+};
 use crate::levels::{BidLadder, VolumeProfileConfig, compute_volume_profile, derive_bid_ladder};
 
 type HmacSha512 = Hmac<Sha512>;
@@ -126,45 +129,6 @@ struct ClosedOrdersResult {
     closed: HashMap<String, KrakenOrderInfo>,
 }
 
-/// One resting sleeve order, as seen in `OpenOrders`.
-#[derive(Debug, Clone)]
-pub struct OpenSleeveOrder {
-    pub txid: String,
-    /// Resting limit price.
-    pub price: Decimal,
-    /// Total ordered base volume.
-    pub volume: Decimal,
-    /// Base volume filled so far (a partial fill; the order is still `open`).
-    pub executed_qty: Decimal,
-}
-
-/// A sleeve order that has left the book (filled or canceled-after-partial), with
-/// the fill it realised. Only orders with a nonzero fill are surfaced. The average
-/// fill price is derived by the caller from `executed_value / executed_qty` (which
-/// equals Kraken's own `cost / vol_exec`), so it isn't duplicated here.
-#[derive(Debug, Clone)]
-pub struct ClosedSleeveFill {
-    pub txid: String,
-    pub executed_qty: Decimal,
-    /// USDC spent.
-    pub executed_value: Decimal,
-    /// USDC fee.
-    pub fee: Decimal,
-    /// Kraken close time (unix seconds) — the *actual* fill time, so the record is
-    /// dated correctly rather than to when the reconcile happened to observe it.
-    pub closetm: i64,
-}
-
-/// Per-pair trading constraints from Kraken's `AssetPairs`, needed to place valid
-/// resting bids: prices must be a multiple of `tick_size`, volumes rounded to
-/// `lot_decimals`, and every order must be at least `ordermin` base units.
-#[derive(Debug, Clone)]
-pub struct PairSpec {
-    pub tick_size: Decimal,
-    pub lot_decimals: u32,
-    pub ordermin: Decimal,
-}
-
 /// Raw `Depth` response. Each level is `[price, volume, timestamp]` with mixed
 /// string/number types, so keep it loosely typed and pull out what we need.
 #[derive(Debug, Deserialize)]
@@ -195,29 +159,6 @@ struct WithdrawInfoResult {
 #[derive(Debug, Deserialize)]
 struct WithdrawResult {
     refid: String,
-}
-
-/// Normalised snapshot of a resting sleeve order, distilled from Kraken's
-/// `QueryOrders`. Exposes only what the limit sleeve needs — the current status
-/// and the fill accumulated so far — without leaking the raw Kraken payload.
-///
-/// IMPORTANT for reconcile logic: Kraken has **no `partial` status**. A partially
-/// filled order is still `open` with a nonzero `executed_qty`. So "did this order
-/// fill anything?" must be answered by `executed_qty > 0`, *independently* of
-/// `status` — branching on `status == "closed"` alone silently drops partial fills
-/// (which is exactly the real-money bug the realize-before-cancel rule guards
-/// against). The patient-maker loop follows the same rule.
-#[derive(Debug, Clone)]
-pub struct RestingOrderState {
-    /// Kraken order status: `open`, `closed`, `canceled`, `pending`, `expired`.
-    /// Note a partial fill is `open`, not a distinct status — see the type docs.
-    pub status: String,
-    /// Base asset filled so far (may be partial while still `open`).
-    pub executed_qty: Decimal,
-    /// USDC spent so far.
-    pub executed_value: Decimal,
-    /// USDC fees charged so far.
-    pub fee: Decimal,
 }
 
 impl KrakenClient {
@@ -369,7 +310,10 @@ impl KrakenClient {
         }
         Ok(PairSpec {
             tick_size,
-            lot_decimals: info.lot_decimals,
+            // `PairSpec::lot_size` is a step (shared with OKX, which has no
+            // decimal-place concept); Kraken's own `lot_decimals` converts
+            // trivially since it's always a power-of-ten step.
+            lot_size: Decimal::ONE / Decimal::from(10u64.pow(info.lot_decimals)),
             ordermin: parse_dec(&info.ordermin),
         })
     }
@@ -1265,6 +1209,67 @@ impl Exchange for KrakenClient {
             .await?;
         info!("Kraken withdrawal initiated, refid {}", result.refid);
         Ok(result.refid)
+    }
+}
+
+/// Thin delegation to the inherent methods above — Rust always prefers an
+/// inherent method over a trait one, so `self.method()` here calls the
+/// concrete Kraken implementation, not this trait fn recursively.
+#[async_trait]
+impl SleeveExchange for KrakenClient {
+    async fn build_bid_ladder(
+        &self,
+        symbol: &str,
+        interval_minutes: u32,
+        config: &VolumeProfileConfig,
+    ) -> Result<(BidLadder, Decimal)> {
+        self.build_bid_ladder(symbol, interval_minutes, config).await
+    }
+
+    async fn fetch_pair_spec(&self, symbol: &str) -> Result<PairSpec> {
+        self.fetch_pair_spec(symbol).await
+    }
+
+    async fn get_open_sleeve_orders(&self, userref: i32) -> Result<Vec<OpenSleeveOrder>> {
+        self.get_open_sleeve_orders(userref).await
+    }
+
+    async fn get_closed_sleeve_fills(
+        &self,
+        userref: i32,
+        start: Option<i64>,
+    ) -> Result<Vec<ClosedSleeveFill>> {
+        self.get_closed_sleeve_fills(userref, start).await
+    }
+
+    async fn place_resting_limit_buy(
+        &self,
+        symbol: &str,
+        price: Decimal,
+        volume: Decimal,
+        userref: i32,
+    ) -> Result<String> {
+        self.place_resting_limit_buy(symbol, price, volume, userref)
+            .await
+    }
+
+    async fn cancel_resting_order(&self, symbol: &str, id: &str) {
+        // Kraken's txid alone identifies the order account-wide; no pair needed.
+        let _ = symbol;
+        self.cancel_resting_order(id).await
+    }
+
+    async fn query_resting_order(
+        &self,
+        symbol: &str,
+        id: &str,
+    ) -> Result<Option<RestingOrderState>> {
+        let _ = symbol;
+        self.query_resting_order(id).await
+    }
+
+    async fn get_usdc_per_eur(&self) -> Result<Decimal> {
+        Exchange::get_usdc_per_eur(self).await
     }
 }
 

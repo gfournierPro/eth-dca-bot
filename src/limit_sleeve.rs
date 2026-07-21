@@ -1,7 +1,8 @@
 //! Limit-order sleeve: rests post-only bids at volume-profile levels below spot,
 //! funded by a fixed USDC war chest that drains as dips fill. Fully isolated from
 //! the DCA core — own budget, own Mongo collection, tagged Notion body blocks — so
-//! DCA stats stay pure. Kraken-only (reuses its validated post-only order path).
+//! DCA stats stay pure. Works against any [`SleeveExchange`] backend (Kraken, OKX;
+//! Binance doesn't implement one).
 //!
 //! The heart is [`LimitSleeve::reconcile`], run on a cron: it recomputes the ladder,
 //! records any fills, and brings the resting orders in line with the fresh levels.
@@ -11,13 +12,15 @@
 //! - **War chest is derived, never stored**: `remaining = war_chest − Σ(recorded
 //!   fill values)`, recomputed each reconcile from the fills collection. It cannot
 //!   drift from the fills and survives a crash mid-reconcile.
-//! - **Fills are recorded idempotently** from Kraken's `ClosedOrders` (deduped by
-//!   txid), which is the crash-safe source of truth — a fill on Kraken is never lost
-//!   even if we crash before writing it; the next reconcile picks it up.
-//! - **A partial fill is realised before its order is cancelled** (and the
-//!   ClosedOrders scan is the backstop), so cancelling a partially-filled bid can
-//!   never lose the bought quantity.
+//! - **Fills are recorded idempotently** from the exchange's closed-orders history
+//!   (deduped by order id), which is the crash-safe source of truth — a fill is
+//!   never lost even if we crash before writing it; the next reconcile picks it up.
+//! - **A partial fill is realised before its order is cancelled** (the closed-orders
+//!   scan is the backstop), so cancelling a partially-filled bid can never lose the
+//!   bought quantity.
 //! - **Never over-commit**: resting reservations + recorded fills ≤ war chest.
+
+use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -27,8 +30,7 @@ use uuid::Uuid;
 
 use crate::config::LimitSleeveConfig;
 use crate::dca_stats_mongo::{DcaPurchase, DcaStatsDB};
-use crate::exchange::Exchange;
-use crate::kraken::{ClosedSleeveFill, KrakenClient, OpenSleeveOrder, PairSpec};
+use crate::exchange::{ClosedSleeveFill, OpenSleeveOrder, PairSpec, SleeveExchange};
 use crate::levels::BidLevel;
 use crate::notion_integration::NotionDCATracker;
 
@@ -55,10 +57,13 @@ fn round_price_to_tick(price: Decimal, tick: Decimal) -> Decimal {
     (price / tick).floor() * tick
 }
 
-/// Round a volume DOWN to the pair's lot precision (truncation, so we never size a
-/// bid above the budget that produced it).
-fn round_volume_to_lot(volume: Decimal, lot_decimals: u32) -> Decimal {
-    volume.trunc_with_scale(lot_decimals)
+/// Round a volume DOWN to the pair's lot grid (floor division), so we never size a
+/// bid above the budget that produced it.
+fn round_volume_to_lot(volume: Decimal, lot_size: Decimal) -> Decimal {
+    if lot_size <= Decimal::ZERO {
+        return volume;
+    }
+    (volume / lot_size).floor() * lot_size
 }
 
 /// Turn a target USDC `value` at a raw HVN `price` into a valid, placeable bid, or
@@ -72,7 +77,7 @@ fn size_bid(raw_price: Decimal, value: Decimal, spec: &PairSpec) -> Option<Sized
     if price <= Decimal::ZERO {
         return None;
     }
-    let volume = round_volume_to_lot(value / price, spec.lot_decimals);
+    let volume = round_volume_to_lot(value / price, spec.lot_size);
     if volume <= Decimal::ZERO || volume < spec.ordermin {
         return None;
     }
@@ -107,7 +112,7 @@ fn desired_bids(levels: &[BidLevel], deployable: Decimal, spec: &PairSpec) -> Ve
 
 #[derive(Clone)]
 pub struct LimitSleeve {
-    kraken: KrakenClient,
+    exchange: Arc<dyn SleeveExchange>,
     config: LimitSleeveConfig,
     /// Own Mongo collection (isolated from DCA). Reuses [`DcaStatsDB`]/[`DcaPurchase`]:
     /// a fill is just a purchase, and `total_usdc_invested` gives spent-so-far.
@@ -120,10 +125,10 @@ impl LimitSleeve {
     /// Build a sleeve over its own Mongo collection. Notion is attached separately
     /// via [`LimitSleeve::with_notion`] so the caller owns config resolution, exactly
     /// as `DcaTrader` does.
-    pub async fn new(kraken: KrakenClient, config: LimitSleeveConfig) -> Result<Self> {
+    pub async fn new(exchange: Arc<dyn SleeveExchange>, config: LimitSleeveConfig) -> Result<Self> {
         let fills_db = DcaStatsDB::with_collection(&config.mongo_collection).await?;
         Ok(Self {
-            kraken,
+            exchange,
             config,
             fills_db,
             notion: None,
@@ -145,14 +150,14 @@ impl LimitSleeve {
 
         // 1. Fresh ladder + the spot it was derived against (reuse it; don't re-read).
         let (ladder, spot) = self
-            .kraken
+            .exchange
             .build_bid_ladder(
                 &symbol,
                 self.config.interval_minutes,
                 &self.config.volume_profile,
             )
             .await?;
-        let spec = self.kraken.fetch_pair_spec(&symbol).await?;
+        let spec = self.exchange.fetch_pair_spec(&symbol).await?;
 
         // 2. Record any new fills FIRST, so the war-chest math sees them and partials
         //    from prior cancels are captured before we size anything.
@@ -163,7 +168,7 @@ impl LimitSleeve {
         let deployable = self.config.war_chest_usdc - spent;
 
         let open = self
-            .kraken
+            .exchange
             .get_open_sleeve_orders(self.config.userref)
             .await?;
 
@@ -182,7 +187,7 @@ impl LimitSleeve {
             // holds no bids until fresh budget appears (e.g. the cap is raised).
             for o in &open {
                 self.realize_before_cancel(o).await;
-                self.kraken.cancel_resting_order(&o.txid).await;
+                self.exchange.cancel_resting_order(&symbol, &o.txid).await;
             }
             return Ok(());
         }
@@ -204,7 +209,7 @@ impl LimitSleeve {
                 kept_reserved += o.price * (o.volume - o.executed_qty).max(Decimal::ZERO);
             } else {
                 self.realize_before_cancel(o).await;
-                self.kraken.cancel_resting_order(&o.txid).await;
+                self.exchange.cancel_resting_order(&symbol, &o.txid).await;
             }
         }
 
@@ -241,7 +246,7 @@ impl LimitSleeve {
                 continue;
             }
             match self
-                .kraken
+                .exchange
                 .place_resting_limit_buy(&symbol, bid.price, bid.volume, self.config.userref)
                 .await
             {
@@ -269,7 +274,11 @@ impl LimitSleeve {
         if o.executed_qty <= Decimal::ZERO {
             return;
         }
-        match self.kraken.query_resting_order(&o.txid).await {
+        match self
+            .exchange
+            .query_resting_order(&self.config.symbol, &o.txid)
+            .await
+        {
             Ok(Some(state)) if state.executed_qty > Decimal::ZERO => {
                 // The order is still open (we're about to cancel it), so it has no
                 // close time yet — the partial is realised now.
@@ -310,7 +319,7 @@ impl LimitSleeve {
             .map(|t| t.timestamp() - 300);
 
         let fills: Vec<ClosedSleeveFill> = self
-            .kraken
+            .exchange
             .get_closed_sleeve_fills(self.config.userref, start)
             .await?;
         for f in fills {
@@ -372,7 +381,7 @@ impl LimitSleeve {
         // Mirror to Notion (shared monthly page, tagged). Best-effort: a Notion
         // hiccup must not fail the reconcile or the Mongo record.
         if let Some(notion) = &self.notion {
-            let eur = match self.kraken.get_usdc_per_eur().await {
+            let eur = match self.exchange.get_usdc_per_eur().await {
                 Ok(rate) if rate > Decimal::ZERO => value_usdc / rate,
                 _ => value_usdc, // fall back to ~USDC if the rate is unavailable
             };
@@ -392,10 +401,10 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
-    fn spec(tick: Decimal, lot_decimals: u32, ordermin: Decimal) -> PairSpec {
+    fn spec(tick: Decimal, lot_size: Decimal, ordermin: Decimal) -> PairSpec {
         PairSpec {
             tick_size: tick,
-            lot_decimals,
+            lot_size,
             ordermin,
         }
     }
@@ -428,13 +437,18 @@ mod tests {
 
     #[test]
     fn volume_truncates_to_lot_precision() {
-        assert_eq!(round_volume_to_lot(dec!(0.123456789), 8), dec!(0.12345678));
-        assert_eq!(round_volume_to_lot(dec!(1.9999), 2), dec!(1.99));
+        assert_eq!(
+            round_volume_to_lot(dec!(0.123456789), dec!(0.00000001)),
+            dec!(0.12345678)
+        );
+        assert_eq!(round_volume_to_lot(dec!(1.9999), dec!(0.01)), dec!(1.99));
+        // Non-positive lot size is a no-op (defensive).
+        assert_eq!(round_volume_to_lot(dec!(1.5), dec!(0)), dec!(1.5));
     }
 
     #[test]
     fn size_bid_applies_tick_lot_and_ordermin() {
-        let s = spec(dec!(0.01), 8, dec!(0.002));
+        let s = spec(dec!(0.01), dec!(0.00000001), dec!(0.002));
         // $30 at ~$3000.5 -> price floored to 3000.5? tick 0.01 keeps it; vol ~0.009998.
         let bid = size_bid(dec!(3000.5), dec!(30), &s).unwrap();
         assert_eq!(bid.price, dec!(3000.5));
@@ -444,21 +458,21 @@ mod tests {
 
     #[test]
     fn size_bid_skips_below_ordermin() {
-        let s = spec(dec!(0.01), 8, dec!(0.01));
+        let s = spec(dec!(0.01), dec!(0.00000001), dec!(0.01));
         // $5 at $3000 -> ~0.00166 base, below ordermin 0.01 -> skipped.
         assert!(size_bid(dec!(3000), dec!(5), &s).is_none());
     }
 
     #[test]
     fn size_bid_skips_nonpositive_value() {
-        let s = spec(dec!(0.01), 8, dec!(0.001));
+        let s = spec(dec!(0.01), dec!(0.00000001), dec!(0.001));
         assert!(size_bid(dec!(3000), dec!(0), &s).is_none());
         assert!(size_bid(dec!(3000), dec!(-10), &s).is_none());
     }
 
     #[test]
     fn desired_bids_sizes_each_level_by_weight() {
-        let s = spec(dec!(0.01), 8, dec!(0.001));
+        let s = spec(dec!(0.01), dec!(0.00000001), dec!(0.001));
         let levels = vec![
             BidLevel {
                 price: dec!(2900),
@@ -477,19 +491,19 @@ mod tests {
         assert_eq!(bids[0].price, dec!(2900));
         assert_eq!(
             bids[0].volume,
-            round_volume_to_lot(dec!(60) / dec!(2900), 8)
+            round_volume_to_lot(dec!(60) / dec!(2900), dec!(0.00000001))
         );
         assert_eq!(bids[1].price, dec!(2800));
         assert_eq!(
             bids[1].volume,
-            round_volume_to_lot(dec!(40) / dec!(2800), 8)
+            round_volume_to_lot(dec!(40) / dec!(2800), dec!(0.00000001))
         );
     }
 
     #[test]
     fn desired_bids_drops_sub_ordermin_levels() {
         // Large ordermin so a small per-level budget can't meet it -> empty ladder.
-        let s = spec(dec!(0.01), 8, dec!(1)); // needs >= 1 whole unit per order
+        let s = spec(dec!(0.01), dec!(0.00000001), dec!(1)); // needs >= 1 whole unit per order
         let levels = vec![BidLevel {
             price: dec!(3000),
             weight: dec!(1),

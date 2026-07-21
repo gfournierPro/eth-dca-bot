@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 
 use crate::dca_stats_mongo::DcaPurchase;
+use crate::levels::{BidLadder, VolumeProfileConfig};
 
 /// Tuning for a "patient maker" limit buy (see [`Exchange::place_limit_buy`]).
 ///
@@ -129,4 +130,129 @@ pub trait Exchange: Send + Sync {
         amount: Decimal,
         network: &str,
     ) -> Result<String>;
+}
+
+// --- Limit-order sleeve support ---------------------------------------------
+//
+// The sleeve needs resting-order primitives (place/cancel/query a post-only
+// limit, list its own open/closed orders) that aren't part of the core
+// `Exchange` trait, since only some backends (Kraken, OKX) support them —
+// Binance does not. Kept as a separate trait for that reason.
+
+/// Per-pair trading constraints needed to place a valid resting bid: the price
+/// must land on a `tick_size` multiple, the volume on a `lot_size` multiple, and
+/// every order must be at least `ordermin` base units.
+#[derive(Debug, Clone)]
+pub struct PairSpec {
+    pub tick_size: Decimal,
+    /// Volume step the exchange rounds order sizes to (e.g. `0.00000001`).
+    pub lot_size: Decimal,
+    pub ordermin: Decimal,
+}
+
+/// One resting sleeve order, as seen in the exchange's open-orders listing.
+#[derive(Debug, Clone)]
+pub struct OpenSleeveOrder {
+    /// Exchange order identifier (Kraken txid / OKX ordId).
+    pub txid: String,
+    /// Resting limit price.
+    pub price: Decimal,
+    /// Total ordered base volume.
+    pub volume: Decimal,
+    /// Base volume filled so far (a partial fill; the order is still resting).
+    pub executed_qty: Decimal,
+}
+
+/// A sleeve order that has left the book (filled or canceled-after-partial),
+/// with the fill it realised. Only orders with a nonzero fill are surfaced. The
+/// average fill price is derived by the caller from `executed_value /
+/// executed_qty`, so it isn't duplicated here.
+#[derive(Debug, Clone)]
+pub struct ClosedSleeveFill {
+    pub txid: String,
+    pub executed_qty: Decimal,
+    /// USDC spent.
+    pub executed_value: Decimal,
+    /// USDC fee.
+    pub fee: Decimal,
+    /// Unix seconds the order actually closed — the *actual* fill time, so the
+    /// record is dated correctly rather than to when the reconcile happened to
+    /// observe it.
+    pub closetm: i64,
+}
+
+/// Normalised snapshot of a resting sleeve order's current state.
+///
+/// IMPORTANT for reconcile logic: "did this order fill anything?" must be
+/// answered by `executed_qty > 0`, independently of `status` — Kraken has no
+/// distinct `partial` status (a partially filled order is still `open`), so
+/// branching on status alone would silently drop partial fills.
+#[derive(Debug, Clone)]
+pub struct RestingOrderState {
+    /// Raw exchange status string (vocabulary differs per exchange — the
+    /// sleeve does not branch on it, only on `executed_qty`).
+    pub status: String,
+    /// Base asset filled so far (may be partial while still resting).
+    pub executed_qty: Decimal,
+    /// USDC spent so far.
+    pub executed_value: Decimal,
+    /// USDC fees charged so far.
+    pub fee: Decimal,
+}
+
+/// Resting-order primitives the limit-order sleeve needs. Implemented by
+/// Kraken and OKX; the sleeve holds an `Arc<dyn SleeveExchange>` so it works
+/// against whichever backend `EXCHANGE` selects.
+#[async_trait]
+pub trait SleeveExchange: Send + Sync {
+    /// Build a volume-profile bid ladder for `symbol` from live market data.
+    /// Returns the ladder **and the spot price it was derived against** — the
+    /// sleeve must compare bids against this same spot rather than re-reading
+    /// price, since a second read could straddle an HVN center.
+    async fn build_bid_ladder(
+        &self,
+        symbol: &str,
+        interval_minutes: u32,
+        config: &VolumeProfileConfig,
+    ) -> Result<(BidLadder, Decimal)>;
+
+    /// Per-pair tick/lot/minimum-order constraints.
+    async fn fetch_pair_spec(&self, symbol: &str) -> Result<PairSpec>;
+
+    /// The sleeve's currently-resting orders (those tagged with `userref`).
+    async fn get_open_sleeve_orders(&self, userref: i32) -> Result<Vec<OpenSleeveOrder>>;
+
+    /// The sleeve's orders that left the book with a nonzero fill, scanned from
+    /// `start` (unix seconds, `None` for "from the beginning") — the crash-safe
+    /// source of truth for realized fills.
+    async fn get_closed_sleeve_fills(
+        &self,
+        userref: i32,
+        start: Option<i64>,
+    ) -> Result<Vec<ClosedSleeveFill>>;
+
+    /// Post a fire-and-forget, post-only limit **buy** of `volume` base asset
+    /// at `price` for `symbol`, tagged with `userref`, returning the order id.
+    /// `price`/`volume` must already be tick/lot-rounded by the caller (see
+    /// [`Self::fetch_pair_spec`]).
+    async fn place_resting_limit_buy(
+        &self,
+        symbol: &str,
+        price: Decimal,
+        volume: Decimal,
+        userref: i32,
+    ) -> Result<String>;
+
+    /// Cancel a resting order, tolerating the "already closed/unknown" races.
+    async fn cancel_resting_order(&self, symbol: &str, id: &str);
+
+    /// Current state of a resting order, or `None` if the exchange doesn't
+    /// know the id.
+    async fn query_resting_order(&self, symbol: &str, id: &str)
+    -> Result<Option<RestingOrderState>>;
+
+    /// How many USDC one EUR is worth (mirrors [`Exchange::get_usdc_per_eur`];
+    /// duplicated here so the sleeve can work from a `dyn SleeveExchange` alone
+    /// without also needing `dyn Exchange`).
+    async fn get_usdc_per_eur(&self) -> Result<Decimal>;
 }
