@@ -295,7 +295,7 @@ impl NotionDCATracker {
         );
 
         properties.insert(
-            "Network Fee".to_string(),
+            self.network_fee_property_name().to_string(),
             PageProperty::Number {
                 id: None,
                 number: Some(serde_json::Number::from_f64(0.0).unwrap()),
@@ -407,7 +407,7 @@ impl NotionDCATracker {
                 );
 
                 props.insert(
-                    "Network Fee".to_string(),
+                    self.network_fee_property_name().to_string(),
                     Some(PageProperty::Number {
                         id: None,
                         number: new_network_fee
@@ -485,6 +485,17 @@ impl NotionDCATracker {
         }
     }
 
+    /// Property name for the network-fee column. The BTC Notion database has a
+    /// trailing space in this column's name (a pre-existing typo baked into that
+    /// database's schema); ETH's does not. Using the wrong name makes every BTC
+    /// Notion write fail with "Network Fee is not a property that exists".
+    fn network_fee_property_name(&self) -> &str {
+        match self.asset.as_str() {
+            "BTC" => "Network Fee ",
+            _ => "Network Fee",
+        }
+    }
+
     async fn get_current_page_data(&self, page_id: &str) -> Result<MonthlyDCAData> {
         let page = self
             .client
@@ -497,7 +508,7 @@ impl NotionDCATracker {
         let properties = page.properties;
 
         let network_fee_eth = self
-            .extract_number_property(&properties, "Network Fee")
+            .extract_number_property(&properties, self.network_fee_property_name())
             .unwrap_or(dec!(0));
         let trading_fee_eth = self
             .extract_number_property(&properties, "Trading Fee")
