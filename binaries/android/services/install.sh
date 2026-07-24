@@ -22,7 +22,7 @@ for svc in mongod eth-dca-bot; do
   touch "$dest/down"
 done
 
-pgrep -f "runsvdir $SVDIR" >/dev/null || (nohup runsvdir "$SVDIR" >"$LOGDIR/runsvdir.log" 2>&1 & disown)
+pgrep -f "runsvdir $SVDIR" >/dev/null || nohup runsvdir "$SVDIR" >"$LOGDIR/runsvdir.log" 2>&1 &
 sleep 2
 sv-enable mongod
 sv-enable eth-dca-bot
