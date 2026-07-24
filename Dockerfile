@@ -22,8 +22,8 @@ COPY src ./src
 # Build the actual application
 RUN cargo build --release
 
-# Use a minimal runtime image
-FROM debian:bookworm-slim
+# Use a minimal runtime image (trixie to match the rust:1.90 builder's glibc)
+FROM debian:trixie-slim
 
 # Install necessary runtime dependencies
 RUN apt-get update && apt-get install -y \
