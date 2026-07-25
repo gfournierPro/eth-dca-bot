@@ -253,8 +253,12 @@ impl LimitSleeve {
                 Ok(txid) => {
                     available -= bid.value();
                     info!(
-                        "[sleeve:{}] placed bid {} @ {} (txid {})",
-                        self.config.asset, bid.volume, bid.price, txid
+                        "[sleeve:{}] placed bid {} @ {} (~{} USDC if filled) (txid {})",
+                        self.config.asset,
+                        bid.volume,
+                        bid.price,
+                        bid.value(),
+                        txid
                     );
                 }
                 Err(e) => warn!(
