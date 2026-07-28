@@ -163,8 +163,11 @@ impl LimitSleeve {
         //    from prior cancels are captured before we size anything.
         self.record_new_fills().await?;
 
-        // 3. Derive the remaining war chest from recorded fills.
-        let spent = self.fills_db.get_summary(spot).await?.total_usdc_invested;
+        // 3. Derive the remaining war chest from recorded fills. `total_usdc_invested`
+        //    is a signed net cash-flow (negative for BUY fills, see dca_stats_mongo.rs)
+        //    so it must be abs()'d to get a spend magnitude, same as everywhere else
+        //    that reads this field.
+        let spent = self.fills_db.get_summary(spot).await?.total_usdc_invested.abs();
         let deployable = self.config.war_chest_usdc - spent;
 
         let open = self
@@ -219,7 +222,7 @@ impl LimitSleeve {
         //    This closes a one-cycle over-commit where a just-realised partial wasn't
         //    yet subtracted. Sizing uses this fresh figure; keep/cancel decisions above
         //    used the pre-cancel one, which only affects marginal ordermin gating.
-        let spent = self.fills_db.get_summary(spot).await?.total_usdc_invested;
+        let spent = self.fills_db.get_summary(spot).await?.total_usdc_invested.abs();
         let deployable = (self.config.war_chest_usdc - spent).max(Decimal::ZERO);
 
         // 7. Place desired bids that aren't already resting, sized against what's left
