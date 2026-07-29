@@ -240,35 +240,58 @@ and fall back to the defaults below:
 > **Note:** The BTC Notion database must use the same property schema as the ETH one
 > (`Name`, `From`, `When`, `Currency`, `eur`, `Network Fee`, `Trading Fee`, `Link`).
 
-### Limit-Order Sleeve (Optional, Kraken only)
+### Limit-Order Sleeve (Optional, Kraken/OKX)
 
-> ⚠️ **Status: code-complete, not yet validated against a live authenticated
-> Kraken account.** The compute path (volume profile, ladder, tick/lot rounding)
-> and public-API parsing are validated live; order placement, cancellation, fill
-> recording, and the war-chest math have only been logic/unit-tested so far. Run
-> the [live smoke-test runbook](docs/limit-sleeve-smoke-test.md) before funding a
-> real war chest — see [`docs/limit-sleeve-roadmap.md`](docs/limit-sleeve-roadmap.md)
-> for the full picture of what's done vs. open.
+> ⚠️ **Status: disabled by default, never run live in this form.** The drawdown-tier
+> strategy is backtested and unit-tested, and its compute path is verified against
+> live exchange data, but no tier has ever filled with real money. Preview with
+> `sleeve_smoke ladder` and work through the
+> [live smoke-test runbook](docs/limit-sleeve-smoke-test.md) before funding a real
+> chest.
 
 On top of scheduled DCA buys, the bot can optionally run a **limit-order sleeve**
-that rests post-only bids at volume-profile levels below spot, funded by a fixed
-USDC "war chest" that drains as dips fill (never auto-replenished). It's fully
-isolated from the DCA core — own Mongo collection, own budget — so DCA stats stay
-pure. Kraken only (reuses Kraken's post-only order path); on Binance it's skipped
-with a warning if enabled.
+that rests post-only bids at **fixed drawdown tiers below a rolling high**, funded
+by a USDC chest that accrues monthly. It's fully isolated from the DCA core — own
+Mongo collection, own budget — so DCA stats stay pure. Kraken and OKX only; on
+Binance it's skipped with a warning if enabled.
 
-Enable it by setting `LIMIT_SLEEVE_ENABLED=true` (and `BTC_LIMIT_SLEEVE_ENABLED=true`
-for the BTC sleeve). Key variables — see `.env.example` for the full list with
-defaults:
+Two properties define the strategy, and both are deliberate:
 
-- `LIMIT_SLEEVE_WAR_CHEST_USDC`: fixed USDC budget the sleeve can deploy
-- `LIMIT_SLEEVE_REFRESH_CRON`: cron for recomputing levels and reconciling bids (default every 6h)
-- `LIMIT_SLEEVE_INTERVAL_MINUTES`: OHLC candle interval used to build the volume profile
-- `VP_BUCKET_SIZE_ETH`, `VP_HVN_THRESHOLD_RATIO`, `VP_LADDER_STEPS`, `VP_REQUIRE_LOCAL_MAXIMA`: volume-profile tunables (see `src/levels.rs`)
+1. **Levels anchor to the rolling high, not to spot.** A bid sits at
+   `rolling_high × (1 - depth)`, so it does not follow price down and ordinary dips
+   cannot reach the deep tiers. Routine dips are DCA's job.
+2. **Each tier deploys a fixed dollar amount, never a share of the remaining
+   chest.** A shallow fill therefore cannot consume the money reserved for a deeper
+   one — which is what keeps ammunition for the second and third legs of a crash.
 
-The BTC sleeve mirrors this with `BTC_LIMIT_SLEEVE_*` / `BTC_VP_*` and its own
-Kraken `userref`, so the two sleeves never see or cancel each other's orders.
-Use `make sleeve-smoke` to drive the validation runbook.
+Accept the tradeoff before enabling it: if price never falls to tier 1, the sleeve
+buys **nothing**, and that is the design working, not a fault.
+
+> The sleeve previously placed volume-profile (HVN) levels. That was abandoned: its
+> levels tracked spot, landing 1–2% below it, so routine noise drained the whole
+> chest — and during a sustained decline it placed nothing at all. The volume-profile
+> code remains for the `sleeve_smoke hvn-ladder` diagnostic only.
+
+Enable with `LIMIT_SLEEVE_ENABLED=true` (and `BTC_LIMIT_SLEEVE_ENABLED=true` for
+BTC). Key variables — see `.env.example` for the full annotated list:
+
+- `LIMIT_SLEEVE_TIERS`: `depth:allocation_usdc` pairs, shallowest first, e.g. `0.25:300,0.35:350,0.45:350`. Depths must strictly increase.
+- `LIMIT_SLEEVE_ANCHOR_DAYS`: lookback for the rolling high (default 90)
+- `LIMIT_SLEEVE_MONTHLY_ACCRUAL_USDC`, `LIMIT_SLEEVE_STARTING_CHEST_USDC`, `LIMIT_SLEEVE_ACCRUAL_START`: budget pacing
+- `LIMIT_SLEEVE_WAR_CHEST_USDC`: cap on the chest **at any one moment** (not a lifetime spend cap)
+- `LIMIT_SLEEVE_REFRESH_CRON`: reconcile cron (default every 6h)
+
+The BTC sleeve mirrors this with `BTC_LIMIT_SLEEVE_*` and its own `userref`, so the
+two sleeves never see or cancel each other's orders.
+
+Preview exactly what would be placed, without touching the order book:
+
+```bash
+cargo run --bin sleeve_smoke -- ladder --asset btc --exchange okx
+```
+
+It prints the anchor high, how far below it spot sits, which tiers are armed vs
+already spent, and the chest — reading the same env vars the bot does.
 
 ### Cron Expression Examples
 

@@ -1,7 +1,8 @@
+use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::levels::VolumeProfileConfig;
+use crate::levels::{DrawdownTier, VolumeProfileConfig};
 
 /// Which exchange backend the bot trades on. Both are kept so the active exchange
 /// can be flipped via the `EXCHANGE` env var without code changes.
@@ -76,18 +77,67 @@ pub struct LimitSleeveConfig {
     /// each sleeve would see (and cancel) the other's bids and record the other's
     /// fills against its own war chest.
     pub userref: i32,
-    /// Volume-profile tunables handed to [`crate::levels`].
+    /// Volume-profile tunables handed to [`crate::levels`]. Retained for the
+    /// `sleeve_smoke ladder` diagnostic (and a possible later refinement that snaps
+    /// tier triggers onto nearby HVNs); the live ladder is [`Self::drawdown`].
     pub volume_profile: VolumeProfileConfig,
+    /// Drawdown-tier tunables — the strategy the sleeve actually places bids from.
+    pub drawdown: DrawdownConfig,
+}
+
+/// Drawdown-tier strategy configuration.
+///
+/// The sleeve rests one post-only bid per armed tier at `anchor_high * (1 - depth)`,
+/// where `anchor_high` is the rolling high over `anchor_days`. Each tier deploys a
+/// fixed USDC allocation, capped by the accrued chest. See [`crate::levels`] for the
+/// derivation, and why absolute allocations rather than normalised weights are the
+/// whole point.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DrawdownConfig {
+    /// Lookback for the rolling high the tiers hang off, in days.
+    pub anchor_days: usize,
+    /// Tiers, shallowest first. Depth is a fraction (`0.25` = -25%).
+    pub tiers: Vec<DrawdownTier>,
+    /// USDC added to the chest per elapsed month since [`Self::accrual_start`].
+    /// Paces deployment so one early crash can't spend a whole year's budget, and
+    /// revives the sleeve in later years instead of flattening it forever.
+    pub monthly_accrual_usdc: Decimal,
+    /// USDC the chest holds at [`Self::accrual_start`], before any accrual.
+    pub starting_chest_usdc: Decimal,
+    /// Date accrual is measured from.
+    pub accrual_start: NaiveDate,
+}
+
+/// Build a tier list from `(depth, allocation_usdc)` pairs.
+fn tiers(spec: &[(i64, i64)]) -> Vec<DrawdownTier> {
+    spec.iter()
+        .map(|(depth_pct, alloc)| DrawdownTier {
+            depth: Decimal::new(*depth_pct, 2),
+            allocation_usdc: Decimal::new(*alloc, 0),
+        })
+        .collect()
+}
+
+/// Accrual start for the shipped defaults: the month the drawdown sleeve was
+/// written. Overridable via `{prefix}_ACCRUAL_START`.
+fn default_accrual_start() -> NaiveDate {
+    NaiveDate::from_ymd_opt(2026, 8, 1).expect("valid literal date")
 }
 
 impl LimitSleeveConfig {
     /// Sensible ETH defaults for the sleeve. Off unless `LIMIT_SLEEVE_ENABLED=true`
     /// flips it on in `load_config`, where these get overridden from env.
+    ///
+    /// Tier depths are scaled deeper than BTC's (-35/-50/-65 vs -25/-35/-45): ETH's
+    /// drawdowns run materially larger, so BTC's depths would fill on moves that are
+    /// ordinary for ETH — the exact "too shallow" leak the tiers exist to avoid.
+    /// These are a scaling judgement, not a backtested result (the validation run was
+    /// BTC-only); revisit with an ETH backtest before funding it heavily.
     pub fn eth_default() -> Self {
         Self {
             asset: "ETH".to_string(),
             symbol: "ETHUSDC".to_string(),
-            war_chest_usdc: Decimal::new(500, 0), // $500 war chest
+            war_chest_usdc: Decimal::new(500, 0), // chest cap
             refresh_cron: "0 0 */6 * * *".to_string(), // every 6 hours
             timezone: "Europe/Berlin".to_string(),
             interval_minutes: 60, // hourly candles ≈ 30 days
@@ -98,6 +148,13 @@ impl LimitSleeveConfig {
                 hvn_threshold_ratio: Decimal::new(7, 1), // 0.7
                 ladder_steps: 4,
                 require_local_maxima: true,
+            },
+            drawdown: DrawdownConfig {
+                anchor_days: 90,
+                tiers: tiers(&[(35, 150), (50, 175), (65, 175)]),
+                monthly_accrual_usdc: Decimal::new(4167, 2), // $500/yr
+                starting_chest_usdc: Decimal::new(250, 0),
+                accrual_start: default_accrual_start(),
             },
         }
     }
@@ -111,7 +168,7 @@ impl LimitSleeveConfig {
         Self {
             asset: "BTC".to_string(),
             symbol: "BTCUSDC".to_string(),
-            war_chest_usdc: Decimal::new(500, 0), // $500 war chest
+            war_chest_usdc: Decimal::new(1000, 0), // chest cap
             refresh_cron: "0 0 */6 * * *".to_string(), // every 6 hours
             timezone: "Europe/Berlin".to_string(),
             interval_minutes: 60, // hourly candles ≈ 30 days
@@ -122,6 +179,18 @@ impl LimitSleeveConfig {
                 hvn_threshold_ratio: Decimal::new(7, 1), // 0.7
                 ladder_steps: 4,
                 require_local_maxima: true,
+            },
+            // The backtested configuration: -25/-35/-45% at $300/$350/$350 off a 90d
+            // rolling high, $1000/yr accrued monthly against a $1000 cap. Replaying
+            // 2024-2026 daily candles (Feb 2025, Nov 2025 and Feb 2026 crashes) this
+            // averaged ~80.2k, versus ~94k for every shallower or re-normalising
+            // variant, and still held ammunition for the second and third legs.
+            drawdown: DrawdownConfig {
+                anchor_days: 90,
+                tiers: tiers(&[(25, 300), (35, 350), (45, 350)]),
+                monthly_accrual_usdc: Decimal::new(8333, 2), // $1000/yr
+                starting_chest_usdc: Decimal::new(500, 0),
+                accrual_start: default_accrual_start(),
             },
         }
     }
@@ -418,4 +487,179 @@ impl AssetDcaConfig {
             },
         }
     }
+}
+
+// --- Env overlay ------------------------------------------------------------
+
+/// Overlay `{prefix}_*` / `{vp_prefix}_*` env vars onto a sleeve's defaults, then
+/// fail fast on nonsensical values — a startup error is far easier to diagnose than
+/// one at the first reconcile tick hours later (`levels.rs` guards `bucket_size`
+/// internally too). The ETH sleeve reads `LIMIT_SLEEVE_*`/`VP_*`, the BTC sleeve
+/// `BTC_LIMIT_SLEEVE_*`/`BTC_VP_*`.
+pub fn load_sleeve_env(
+    mut sleeve: LimitSleeveConfig,
+    prefix: &str,
+    vp_prefix: &str,
+) -> anyhow::Result<LimitSleeveConfig> {
+    if let Ok(v) = std::env::var(format!("{prefix}_SYMBOL")) {
+        sleeve.symbol = v;
+    }
+    if let Ok(v) = std::env::var(format!("{prefix}_WAR_CHEST_USDC")) {
+        sleeve.war_chest_usdc = v.parse()?;
+    }
+    if let Ok(v) = std::env::var(format!("{prefix}_REFRESH_CRON")) {
+        sleeve.refresh_cron = v;
+    }
+    // Reuse the global TIMEZONE unless a sleeve-specific one is provided.
+    sleeve.timezone = std::env::var(format!("{prefix}_TIMEZONE"))
+        .ok()
+        .or_else(|| std::env::var("TIMEZONE").ok())
+        .unwrap_or(sleeve.timezone);
+    if let Ok(v) = std::env::var(format!("{prefix}_INTERVAL_MINUTES")) {
+        sleeve.interval_minutes = v.parse()?;
+    }
+    if let Ok(v) = std::env::var(format!("{prefix}_MONGO_COLLECTION")) {
+        sleeve.mongo_collection = v;
+    }
+
+    // Volume-profile tunables. The bucket size accepts the asset-suffixed spelling
+    // first for backwards compatibility (the ETH sleeve shipped as
+    // `VP_BUCKET_SIZE_ETH`), then the plain `{vp_prefix}_BUCKET_SIZE`.
+    if let Ok(v) = std::env::var(format!("{vp_prefix}_BUCKET_SIZE_{}", sleeve.asset))
+        .or_else(|_| std::env::var(format!("{vp_prefix}_BUCKET_SIZE")))
+    {
+        sleeve.volume_profile.bucket_size = v.parse()?;
+    }
+    if let Ok(v) = std::env::var(format!("{vp_prefix}_HVN_THRESHOLD_RATIO")) {
+        sleeve.volume_profile.hvn_threshold_ratio = v.parse()?;
+    }
+    if let Ok(v) = std::env::var(format!("{vp_prefix}_LADDER_STEPS")) {
+        sleeve.volume_profile.ladder_steps = v.parse()?;
+    }
+    if let Ok(v) = std::env::var(format!("{vp_prefix}_REQUIRE_LOCAL_MAXIMA")) {
+        sleeve.volume_profile.require_local_maxima = v.parse().unwrap_or(true);
+    }
+
+    let vp = &sleeve.volume_profile;
+    if vp.bucket_size <= Decimal::ZERO {
+        return Err(anyhow::anyhow!("{vp_prefix}_BUCKET_SIZE must be positive"));
+    }
+    if vp.ladder_steps == 0 {
+        return Err(anyhow::anyhow!(
+            "{vp_prefix}_LADDER_STEPS must be greater than 0"
+        ));
+    }
+    if vp.hvn_threshold_ratio <= Decimal::ZERO
+        || vp.hvn_threshold_ratio > Decimal::ONE
+    {
+        return Err(anyhow::anyhow!(
+            "{vp_prefix}_HVN_THRESHOLD_RATIO must be in (0, 1]"
+        ));
+    }
+    if sleeve.war_chest_usdc <= Decimal::ZERO {
+        return Err(anyhow::anyhow!("{prefix}_WAR_CHEST_USDC must be positive"));
+    }
+    if sleeve.interval_minutes == 0 {
+        return Err(anyhow::anyhow!(
+            "{prefix}_INTERVAL_MINUTES must be greater than 0"
+        ));
+    }
+
+    // Drawdown-tier tunables — the strategy that actually places bids.
+    if let Ok(v) = std::env::var(format!("{prefix}_ANCHOR_DAYS")) {
+        sleeve.drawdown.anchor_days = v.parse()?;
+    }
+    if let Ok(v) = std::env::var(format!("{prefix}_TIERS")) {
+        sleeve.drawdown.tiers = parse_tiers(&v)
+            .map_err(|e| anyhow::anyhow!("{prefix}_TIERS is invalid ({e}); expected \
+                 comma-separated depth:allocation pairs like \"0.25:300,0.35:350,0.45:350\""))?;
+    }
+    if let Ok(v) = std::env::var(format!("{prefix}_MONTHLY_ACCRUAL_USDC")) {
+        sleeve.drawdown.monthly_accrual_usdc = v.parse()?;
+    }
+    if let Ok(v) = std::env::var(format!("{prefix}_STARTING_CHEST_USDC")) {
+        sleeve.drawdown.starting_chest_usdc = v.parse()?;
+    }
+    if let Ok(v) = std::env::var(format!("{prefix}_ACCRUAL_START")) {
+        sleeve.drawdown.accrual_start = NaiveDate::parse_from_str(v.trim(), "%Y-%m-%d")
+            .map_err(|e| anyhow::anyhow!("{prefix}_ACCRUAL_START must be YYYY-MM-DD: {e}"))?;
+    }
+
+    let dd = &sleeve.drawdown;
+    if dd.anchor_days == 0 {
+        return Err(anyhow::anyhow!("{prefix}_ANCHOR_DAYS must be greater than 0"));
+    }
+    if dd.tiers.is_empty() {
+        return Err(anyhow::anyhow!("{prefix}_TIERS must list at least one tier"));
+    }
+    // Depths must be a strictly increasing fraction in (0,1): equal-or-decreasing
+    // depths would break the shallowest-first spend attribution that derives which
+    // tiers are still armed, silently mis-funding tiers.
+    let mut previous = Decimal::ZERO;
+    for t in &dd.tiers {
+        if t.depth <= Decimal::ZERO || t.depth >= Decimal::ONE {
+            return Err(anyhow::anyhow!(
+                "{prefix}_TIERS depths must be fractions in (0, 1), got {}",
+                t.depth
+            ));
+        }
+        if t.depth <= previous {
+            return Err(anyhow::anyhow!(
+                "{prefix}_TIERS depths must increase (shallowest first), got {} after {}",
+                t.depth,
+                previous
+            ));
+        }
+        if t.allocation_usdc <= Decimal::ZERO {
+            return Err(anyhow::anyhow!(
+                "{prefix}_TIERS allocations must be positive, got {}",
+                t.allocation_usdc
+            ));
+        }
+        previous = t.depth;
+    }
+    if dd.monthly_accrual_usdc < Decimal::ZERO {
+        return Err(anyhow::anyhow!(
+            "{prefix}_MONTHLY_ACCRUAL_USDC cannot be negative"
+        ));
+    }
+    if dd.starting_chest_usdc < Decimal::ZERO {
+        return Err(anyhow::anyhow!(
+            "{prefix}_STARTING_CHEST_USDC cannot be negative"
+        ));
+    }
+
+    // Tiers are funded shallowest-first from whatever the chest holds, so a cap below
+    // the total allocation starves the DEEPEST tier — precisely the one meant to catch
+    // a capitulation. Warn rather than fail: a deliberately tiny chest is how the
+    // smoke test runs. Set the cap >= the sum to have every tier resting at once.
+    let total_alloc: Decimal = dd.tiers.iter().map(|t| t.allocation_usdc).sum();
+    if sleeve.war_chest_usdc < total_alloc {
+        tracing::warn!(
+            "[sleeve:{}] {prefix}_WAR_CHEST_USDC ({}) is below the total tier allocation ({}); \
+             the deepest tier(s) may never get a resting bid",
+            sleeve.asset,
+            sleeve.war_chest_usdc,
+            total_alloc
+        );
+    }
+
+    Ok(sleeve)
+}
+
+/// Parse `"0.25:300,0.35:350,0.45:350"` into tiers (depth fraction : USDC allocation).
+fn parse_tiers(spec: &str) -> anyhow::Result<Vec<DrawdownTier>> {
+    spec.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|pair| {
+            let (depth, alloc) = pair
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("'{pair}' is not depth:allocation"))?;
+            Ok(DrawdownTier {
+                depth: depth.trim().parse()?,
+                allocation_usdc: alloc.trim().parse()?,
+            })
+        })
+        .collect()
 }

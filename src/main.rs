@@ -643,7 +643,7 @@ fn load_config() -> Result<Config> {
         .map(|v| v == "true")
         .unwrap_or(false)
     {
-        config.limit_sleeve = Some(load_sleeve_env(
+        config.limit_sleeve = Some(config::load_sleeve_env(
             config::LimitSleeveConfig::eth_default(),
             "LIMIT_SLEEVE",
             "VP",
@@ -653,7 +653,7 @@ fn load_config() -> Result<Config> {
         .map(|v| v == "true")
         .unwrap_or(false)
     {
-        config.btc_limit_sleeve = Some(load_sleeve_env(
+        config.btc_limit_sleeve = Some(config::load_sleeve_env(
             config::LimitSleeveConfig::btc_default(),
             "BTC_LIMIT_SLEEVE",
             "BTC_VP",
@@ -663,82 +663,7 @@ fn load_config() -> Result<Config> {
     Ok(config)
 }
 
-/// Overlay `{prefix}_*` / `{vp_prefix}_*` env vars onto a sleeve's defaults, then
-/// fail fast on nonsensical values — a startup error is far easier to diagnose than
-/// one at the first reconcile tick hours later (`levels.rs` guards `bucket_size`
-/// internally too). The ETH sleeve reads `LIMIT_SLEEVE_*`/`VP_*`, the BTC sleeve
-/// `BTC_LIMIT_SLEEVE_*`/`BTC_VP_*`.
-fn load_sleeve_env(
-    mut sleeve: config::LimitSleeveConfig,
-    prefix: &str,
-    vp_prefix: &str,
-) -> Result<config::LimitSleeveConfig> {
-    if let Ok(v) = env::var(format!("{prefix}_SYMBOL")) {
-        sleeve.symbol = v;
-    }
-    if let Ok(v) = env::var(format!("{prefix}_WAR_CHEST_USDC")) {
-        sleeve.war_chest_usdc = v.parse()?;
-    }
-    if let Ok(v) = env::var(format!("{prefix}_REFRESH_CRON")) {
-        sleeve.refresh_cron = v;
-    }
-    // Reuse the global TIMEZONE unless a sleeve-specific one is provided.
-    sleeve.timezone = env::var(format!("{prefix}_TIMEZONE"))
-        .ok()
-        .or_else(|| env::var("TIMEZONE").ok())
-        .unwrap_or(sleeve.timezone);
-    if let Ok(v) = env::var(format!("{prefix}_INTERVAL_MINUTES")) {
-        sleeve.interval_minutes = v.parse()?;
-    }
-    if let Ok(v) = env::var(format!("{prefix}_MONGO_COLLECTION")) {
-        sleeve.mongo_collection = v;
-    }
 
-    // Volume-profile tunables. The bucket size accepts the asset-suffixed spelling
-    // first for backwards compatibility (the ETH sleeve shipped as
-    // `VP_BUCKET_SIZE_ETH`), then the plain `{vp_prefix}_BUCKET_SIZE`.
-    if let Ok(v) = env::var(format!("{vp_prefix}_BUCKET_SIZE_{}", sleeve.asset))
-        .or_else(|_| env::var(format!("{vp_prefix}_BUCKET_SIZE")))
-    {
-        sleeve.volume_profile.bucket_size = v.parse()?;
-    }
-    if let Ok(v) = env::var(format!("{vp_prefix}_HVN_THRESHOLD_RATIO")) {
-        sleeve.volume_profile.hvn_threshold_ratio = v.parse()?;
-    }
-    if let Ok(v) = env::var(format!("{vp_prefix}_LADDER_STEPS")) {
-        sleeve.volume_profile.ladder_steps = v.parse()?;
-    }
-    if let Ok(v) = env::var(format!("{vp_prefix}_REQUIRE_LOCAL_MAXIMA")) {
-        sleeve.volume_profile.require_local_maxima = v.parse().unwrap_or(true);
-    }
-
-    let vp = &sleeve.volume_profile;
-    if vp.bucket_size <= rust_decimal::Decimal::ZERO {
-        return Err(anyhow::anyhow!("{vp_prefix}_BUCKET_SIZE must be positive"));
-    }
-    if vp.ladder_steps == 0 {
-        return Err(anyhow::anyhow!(
-            "{vp_prefix}_LADDER_STEPS must be greater than 0"
-        ));
-    }
-    if vp.hvn_threshold_ratio <= rust_decimal::Decimal::ZERO
-        || vp.hvn_threshold_ratio > rust_decimal::Decimal::ONE
-    {
-        return Err(anyhow::anyhow!(
-            "{vp_prefix}_HVN_THRESHOLD_RATIO must be in (0, 1]"
-        ));
-    }
-    if sleeve.war_chest_usdc <= rust_decimal::Decimal::ZERO {
-        return Err(anyhow::anyhow!("{prefix}_WAR_CHEST_USDC must be positive"));
-    }
-    if sleeve.interval_minutes == 0 {
-        return Err(anyhow::anyhow!(
-            "{prefix}_INTERVAL_MINUTES must be greater than 0"
-        ));
-    }
-
-    Ok(sleeve)
-}
 
 fn validate_config(config: &Config) -> Result<()> {
     match config.exchange {

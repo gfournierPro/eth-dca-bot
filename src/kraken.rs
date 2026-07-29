@@ -245,6 +245,23 @@ impl KrakenClient {
         Ok((ladder, current_price))
     }
 
+    /// Daily `(unix_seconds, high)` pairs, **oldest first**, for the drawdown
+    /// anchor. One OHLC call at `interval=1440`; Kraken returns ~720 candles
+    /// (≈2 years) already oldest-first, which is the window the tier depths were
+    /// validated against.
+    pub async fn fetch_daily_highs(&self, symbol: &str) -> Result<Vec<(i64, Decimal)>> {
+        let pair = Self::kraken_pair(symbol);
+        let result: serde_json::Value = self
+            .public_get(
+                "/public/OHLC",
+                &[("pair", pair.as_str()), ("interval", "1440")],
+            )
+            .await?;
+        let daily = ohlc_daily_highs(&result, symbol)?;
+        info!("Kraken daily highs for {}: {} candles", symbol, daily.len());
+        Ok(daily)
+    }
+
     // --- Resting-order primitives for the limit sleeve ---------------------------
     //
     // These are thin, sleeve-facing wrappers over the exact post-only / cancel /
@@ -884,6 +901,49 @@ fn parse_dec(s: &str) -> Decimal {
     s.parse::<Decimal>().unwrap_or(dec!(0))
 }
 
+/// Pull the candle array out of a Kraken `OHLC` result object.
+///
+/// The response shape is awkward: an object keyed by the (possibly legacy-coded)
+/// pair name whose value is the candle array, plus a sibling `"last"` cursor. The
+/// pair key can't be predicted exactly, so we take the first array-valued entry.
+fn ohlc_candle_array<'a>(
+    result: &'a serde_json::Value,
+    symbol: &str,
+) -> Result<&'a Vec<serde_json::Value>> {
+    result
+        .as_object()
+        .and_then(|obj| {
+            obj.iter()
+                .find(|(key, value)| *key != "last" && value.is_array())
+                .map(|(_, value)| value)
+        })
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| anyhow!("Kraken OHLC returned no candle series for {}", symbol))
+}
+
+/// Reduce a raw Kraken `OHLC` result object to `(unix_seconds, high)` pairs for the
+/// drawdown anchor, dropping rows with a non-positive high (malformed/empty candle).
+/// Kraken returns candles oldest-first; sorted anyway so the caller can rely on it.
+fn ohlc_daily_highs(result: &serde_json::Value, symbol: &str) -> Result<Vec<(i64, Decimal)>> {
+    let candles = ohlc_candle_array(result, symbol)?;
+
+    // Row layout: [time, open, high, low, close, vwap, volume, count].
+    let mut daily: Vec<(i64, Decimal)> = candles
+        .iter()
+        .filter_map(|c| {
+            let row = c.as_array()?;
+            if row.len() < 3 {
+                return None;
+            }
+            let ts = row[0].as_i64()?;
+            let high = row[2].as_str().map(parse_dec)?;
+            (high > Decimal::ZERO).then_some((ts, high))
+        })
+        .collect();
+    daily.sort_by_key(|(ts, _)| *ts);
+    Ok(daily)
+}
+
 /// Reduce a raw Kraken `OHLC` result object to `(vwap, volume)` observations.
 ///
 /// The response shape is awkward: an object keyed by the (possibly legacy-coded)
@@ -895,15 +955,7 @@ fn parse_dec(s: &str) -> Decimal {
 /// range down to zero). Kept separate from the network call so it is unit-testable
 /// offline.
 fn ohlc_observations(result: &serde_json::Value, symbol: &str) -> Result<Vec<(Decimal, Decimal)>> {
-    let candles = result
-        .as_object()
-        .and_then(|obj| {
-            obj.iter()
-                .find(|(key, value)| *key != "last" && value.is_array())
-                .map(|(_, value)| value)
-        })
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| anyhow!("Kraken OHLC returned no candle series for {}", symbol))?;
+    let candles = ohlc_candle_array(result, symbol)?;
 
     let mut observations = Vec::with_capacity(candles.len());
     for candle in candles {
@@ -1224,6 +1276,14 @@ impl SleeveExchange for KrakenClient {
         config: &VolumeProfileConfig,
     ) -> Result<(BidLadder, Decimal)> {
         self.build_bid_ladder(symbol, interval_minutes, config).await
+    }
+
+    async fn fetch_daily_highs(&self, symbol: &str) -> Result<Vec<(i64, Decimal)>> {
+        self.fetch_daily_highs(symbol).await
+    }
+
+    async fn fetch_spot_price(&self, symbol: &str) -> Result<Decimal> {
+        self.get_price(symbol).await
     }
 
     async fn fetch_pair_spec(&self, symbol: &str) -> Result<PairSpec> {

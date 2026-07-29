@@ -23,15 +23,15 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::config::LimitSleeveConfig;
+use crate::config::{DrawdownConfig, LimitSleeveConfig};
 use crate::dca_stats_mongo::{DcaPurchase, DcaStatsDB};
 use crate::exchange::{ClosedSleeveFill, OpenSleeveOrder, PairSpec, SleeveExchange};
-use crate::levels::BidLevel;
+use crate::levels::{TierBid, anchor_high_and_rearm, derive_drawdown_ladder};
 use crate::notion_integration::NotionDCATracker;
 
 /// A concrete, exchange-valid bid: price rounded to tick, volume rounded to lot.
@@ -99,15 +99,45 @@ fn prices_match(a: Decimal, b: Decimal, tick: Decimal) -> bool {
     (a - b).abs() * Decimal::TWO < tick
 }
 
-/// The ideal, full-size bid for each ladder level given the deployable budget.
-/// Used to decide which resting orders to keep vs cancel (by price). Placement
-/// re-sizes against the *still-available* budget so kept reservations aren't
-/// double-spent.
-fn desired_bids(levels: &[BidLevel], deployable: Decimal, spec: &PairSpec) -> Vec<SizedBid> {
-    levels
-        .iter()
-        .filter_map(|lvl| size_bid(lvl.price, deployable * lvl.weight, spec))
+/// The ideal, full-size bid for each tier. Used to decide which resting orders to
+/// keep vs cancel (by price). Placement re-sizes against the *still-available*
+/// budget so kept reservations aren't double-spent.
+///
+/// Each tier is sized from its own allocation — never from a share of the whole
+/// remaining chest — which is what keeps the deep tiers funded while shallow ones
+/// fill. Contrast [`crate::levels::derive_bid_ladder`]'s normalised weights.
+fn desired_bids(bids: &[TierBid], spec: &PairSpec) -> Vec<SizedBid> {
+    bids.iter()
+        .filter_map(|b| size_bid(b.price, b.value_usdc, spec))
         .collect()
+}
+
+/// Whole months elapsed from `start` to `now`, floored at zero.
+///
+/// Day-of-month is deliberately ignored: accrual ticks over on the 1st, so a chest
+/// configured mid-month is not shortchanged a partial month, and the figure never
+/// depends on what time of day a reconcile happens to run.
+fn months_elapsed(start: NaiveDate, now: NaiveDate) -> i64 {
+    let months = (now.year() as i64 - start.year() as i64) * 12
+        + (now.month() as i64 - start.month() as i64);
+    months.max(0)
+}
+
+/// USDC the sleeve may have committed in total right now: the starting chest plus
+/// accrual to date, less everything already spent, clamped to `[0, cap]`.
+///
+/// Capping the *available* figure (rather than lifetime spend) is what lets the
+/// sleeve revive in later years instead of flattening permanently once the original
+/// war chest is gone, while still bounding exposure at any single moment.
+fn accrued_chest(
+    cfg: &DrawdownConfig,
+    cap: Decimal,
+    spent_all_time: Decimal,
+    now: NaiveDate,
+) -> Decimal {
+    let accrued = cfg.starting_chest_usdc
+        + cfg.monthly_accrual_usdc * Decimal::from(months_elapsed(cfg.accrual_start, now));
+    (accrued - spent_all_time).clamp(Decimal::ZERO, cap)
 }
 
 #[derive(Clone)]
@@ -143,32 +173,68 @@ impl LimitSleeve {
         self
     }
 
-    /// One reconcile pass: record fills, recompute the ladder, and align resting
-    /// orders with fresh levels within the remaining war chest.
+    /// One reconcile pass: record fills, recompute the drawdown tiers, and align
+    /// resting orders with them inside the accrued chest.
     pub async fn reconcile(&self) -> Result<()> {
         let symbol = self.config.symbol.clone();
+        let dd = &self.config.drawdown;
 
-        // 1. Fresh ladder + the spot it was derived against (reuse it; don't re-read).
-        let (ladder, spot) = self
-            .exchange
-            .build_bid_ladder(
-                &symbol,
-                self.config.interval_minutes,
-                &self.config.volume_profile,
-            )
-            .await?;
+        // 1. Anchor high + the last time price set one, from daily candles, plus spot
+        //    (only needed to avoid resting a post-only buy at or above the market).
+        let daily = self.exchange.fetch_daily_highs(&symbol).await?;
+        let (anchor_high, rearm_ts) = anchor_high_and_rearm(&daily, dd.anchor_days)?;
+        let spot = self.exchange.fetch_spot_price(&symbol).await?;
         let spec = self.exchange.fetch_pair_spec(&symbol).await?;
 
-        // 2. Record any new fills FIRST, so the war-chest math sees them and partials
-        //    from prior cancels are captured before we size anything.
+        // 2. Record any new fills FIRST, so the chest math sees them and partials from
+        //    prior cancels are captured before we size anything.
         self.record_new_fills().await?;
 
-        // 3. Derive the remaining war chest from recorded fills. `total_usdc_invested`
-        //    is a signed net cash-flow (negative for BUY fills, see dca_stats_mongo.rs)
-        //    so it must be abs()'d to get a spend magnitude, same as everywhere else
-        //    that reads this field.
-        let spent = self.fills_db.get_summary(spot).await?.total_usdc_invested.abs();
-        let deployable = self.config.war_chest_usdc - spent;
+        // 3. Budget. Two different spend figures, for two different jobs:
+        //    - `spent_all_time` bounds the chest (what's left of the accrued budget).
+        //    - `spent_since_rearm` decides which tiers are still armed. Measuring from
+        //      the last new anchor high is what stops a long bear from re-buying the
+        //      same tier every cycle as the anchor decays.
+        //    `total_usdc_invested` is a signed net cash-flow (negative for BUY fills,
+        //    see dca_stats_mongo.rs) so it must be abs()'d to get a spend magnitude.
+        let spent_all_time = self.fills_db.get_summary(spot).await?.total_usdc_invested.abs();
+        let rearm_at = DateTime::<Utc>::from_timestamp(rearm_ts, 0).unwrap_or_else(Utc::now);
+        let spent_since_rearm = self.fills_db.total_spent_since(rearm_at).await?;
+        let deployable = accrued_chest(
+            dd,
+            self.config.war_chest_usdc,
+            spent_all_time,
+            Utc::now().date_naive(),
+        );
+
+        let tier_bids = derive_drawdown_ladder(anchor_high, spot, &dd.tiers, spent_since_rearm);
+        // anchor_high is always positive (both backends drop non-positive highs).
+        let drawdown_pct = (spot - anchor_high) / anchor_high * Decimal::ONE_HUNDRED;
+        info!(
+            "[sleeve:{}] anchor high {:.2} ({}d), spot {:.2} ({:+.1}%), armed since {}; \
+             chest {:.2} of {:.2} (spent {:.2} lifetime / {:.2} since arming); {} tier(s) in range",
+            self.config.asset,
+            anchor_high,
+            dd.anchor_days,
+            spot,
+            drawdown_pct,
+            rearm_at.date_naive(),
+            deployable,
+            self.config.war_chest_usdc,
+            spent_all_time,
+            spent_since_rearm,
+            tier_bids.len()
+        );
+        for b in &tier_bids {
+            info!(
+                "[sleeve:{}]   tier {} @ {:.2} (-{:.0}%) wants {:.2} USDC",
+                self.config.asset,
+                b.tier + 1,
+                b.price,
+                dd.tiers[b.tier].depth * Decimal::ONE_HUNDRED,
+                b.value_usdc
+            );
+        }
 
         let open = self
             .exchange
@@ -177,17 +243,16 @@ impl LimitSleeve {
 
         if deployable <= Decimal::ZERO {
             info!(
-                "[sleeve:{}] war chest cap reached (spent {:.2} / {:.2} USDC); cancelling {} resting order(s)",
+                "[sleeve:{}] chest exhausted (spent {:.2}, cap {:.2} USDC); cancelling {} resting order(s)",
                 self.config.asset,
-                spent,
+                spent_all_time,
                 self.config.war_chest_usdc,
                 open.len()
             );
-            // Deliberate flatten (not a side effect): the war chest is a hard spend
-            // cap, and every recorded fill has consumed it. Any still-resting bid, if
-            // it filled, would spend *beyond* the cap — so cancel them all, realising
-            // any partial first. The sleeve keeps computing levels next tick; it just
-            // holds no bids until fresh budget appears (e.g. the cap is raised).
+            // Deliberate flatten (not a side effect): the chest is a hard spend cap and
+            // every recorded fill has consumed it. Any still-resting bid, if it filled,
+            // would spend *beyond* the cap — so cancel them all, realising any partial
+            // first. Next month's accrual re-funds the chest and the tiers come back.
             for o in &open {
                 self.realize_before_cancel(o).await;
                 self.exchange.cancel_resting_order(&symbol, &o.txid).await;
@@ -195,8 +260,8 @@ impl LimitSleeve {
             return Ok(());
         }
 
-        // 4. Ideal bids for the fresh levels, and which resting orders to keep.
-        let desired = desired_bids(&ladder.levels, deployable, &spec);
+        // 4. Ideal bids for the armed tiers, and which resting orders to keep.
+        let desired = desired_bids(&tier_bids, &spec);
 
         // 5. Cancel resting orders whose level is gone/moved; sum the reservation held
         //    by the ones we keep so we don't double-spend their budget. Level matching
@@ -218,19 +283,26 @@ impl LimitSleeve {
 
         // 6. Re-read spent AFTER the cancel loop: `realize_before_cancel` may have
         //    recorded partial fills to Mongo, so the placement budget must reflect
-        //    them (fills recorded before the war-chest recompute that placement reads).
+        //    them (fills recorded before the chest recompute that placement reads).
         //    This closes a one-cycle over-commit where a just-realised partial wasn't
         //    yet subtracted. Sizing uses this fresh figure; keep/cancel decisions above
         //    used the pre-cancel one, which only affects marginal ordermin gating.
-        let spent = self.fills_db.get_summary(spot).await?.total_usdc_invested.abs();
-        let deployable = (self.config.war_chest_usdc - spent).max(Decimal::ZERO);
+        let spent_all_time = self.fills_db.get_summary(spot).await?.total_usdc_invested.abs();
+        let deployable = accrued_chest(
+            dd,
+            self.config.war_chest_usdc,
+            spent_all_time,
+            Utc::now().date_naive(),
+        );
 
-        // 7. Place desired bids that aren't already resting, sized against what's left
-        //    of the budget after fills + kept reservations. Never over-commits.
+        // 7. Place desired bids that aren't already resting. Each is capped by its own
+        //    tier allocation AND by what's left of the chest after fills + kept
+        //    reservations, so the sleeve never over-commits — but a shallow tier can
+        //    never reach past its allocation into a deeper tier's money either.
         let mut available = (deployable - kept_reserved).max(Decimal::ZERO);
 
-        for lvl in &ladder.levels {
-            let price = round_price_to_tick(lvl.price, spec.tick_size);
+        for tb in &tier_bids {
+            let price = round_price_to_tick(tb.price, spec.tick_size);
             let is_desired = desired
                 .iter()
                 .any(|d| prices_match(d.price, price, spec.tick_size));
@@ -240,9 +312,8 @@ impl LimitSleeve {
             if !is_desired || already_resting {
                 continue; // sub-ordermin at full size, or already resting (keep queue)
             }
-            let target = deployable * lvl.weight;
-            let capped = target.min(available);
-            let Some(bid) = size_bid(lvl.price, capped, &spec) else {
+            let capped = tb.value_usdc.min(available);
+            let Some(bid) = size_bid(tb.price, capped, &spec) else {
                 continue; // budget left can't fund an ordermin-sized bid here
             };
             if bid.value() > available {
@@ -477,23 +548,24 @@ mod tests {
         assert!(size_bid(dec!(3000), dec!(-10), &s).is_none());
     }
 
+    fn tier_bid(tier: usize, price: Decimal, value_usdc: Decimal) -> TierBid {
+        TierBid {
+            tier,
+            price,
+            value_usdc,
+        }
+    }
+
     #[test]
-    fn desired_bids_sizes_each_level_by_weight() {
+    fn desired_bids_sizes_each_tier_from_its_own_allocation() {
         let s = spec(dec!(0.01), dec!(0.00000001), dec!(0.001));
-        let levels = vec![
-            BidLevel {
-                price: dec!(2900),
-                weight: dec!(0.6),
-                source_volume: dec!(100),
-            },
-            BidLevel {
-                price: dec!(2800),
-                weight: dec!(0.4),
-                source_volume: dec!(80),
-            },
-        ];
-        // Deploy $100: level 1 gets $60 @2900, level 2 gets $40 @2800.
-        let bids = desired_bids(&levels, dec!(100), &s);
+        let bids = desired_bids(
+            &[
+                tier_bid(0, dec!(2900), dec!(60)),
+                tier_bid(1, dec!(2800), dec!(40)),
+            ],
+            &s,
+        );
         assert_eq!(bids.len(), 2);
         assert_eq!(bids[0].price, dec!(2900));
         assert_eq!(
@@ -508,15 +580,85 @@ mod tests {
     }
 
     #[test]
-    fn desired_bids_drops_sub_ordermin_levels() {
-        // Large ordermin so a small per-level budget can't meet it -> empty ladder.
+    fn desired_bids_drops_sub_ordermin_tiers() {
+        // Large ordermin so a small allocation can't meet it -> tier dropped.
         let s = spec(dec!(0.01), dec!(0.00000001), dec!(1)); // needs >= 1 whole unit per order
-        let levels = vec![BidLevel {
-            price: dec!(3000),
-            weight: dec!(1),
-            source_volume: dec!(100),
-        }];
         // $100 at $3000 -> 0.033 units, below ordermin 1 -> dropped.
-        assert!(desired_bids(&levels, dec!(100), &s).is_empty());
+        assert!(desired_bids(&[tier_bid(0, dec!(3000), dec!(100))], &s).is_empty());
+    }
+
+    /// The BTC production accrual: $500 start, $83.33/mo, $1000 cap.
+    fn dd(start: NaiveDate) -> DrawdownConfig {
+        DrawdownConfig {
+            anchor_days: 90,
+            tiers: vec![],
+            monthly_accrual_usdc: dec!(83.33),
+            starting_chest_usdc: dec!(500),
+            accrual_start: start,
+        }
+    }
+
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn months_elapsed_counts_calendar_months_and_never_goes_negative() {
+        let start = date(2026, 8, 1);
+        assert_eq!(months_elapsed(start, date(2026, 8, 31)), 0);
+        assert_eq!(months_elapsed(start, date(2026, 9, 1)), 1);
+        assert_eq!(months_elapsed(start, date(2027, 8, 1)), 12);
+        // A clock before the accrual start must not produce negative accrual.
+        assert_eq!(months_elapsed(start, date(2026, 1, 1)), 0);
+    }
+
+    #[test]
+    fn chest_accrues_monthly_and_stops_at_the_cap() {
+        let cfg = dd(date(2026, 8, 1));
+        let cap = dec!(1000);
+        // Month 0: just the starting chest.
+        assert_eq!(accrued_chest(&cfg, cap, dec!(0), date(2026, 8, 15)), dec!(500));
+        // Month 3: 500 + 3*83.33.
+        assert_eq!(
+            accrued_chest(&cfg, cap, dec!(0), date(2026, 11, 1)),
+            dec!(749.99)
+        );
+        // Far future: clamped to the cap, never above it.
+        assert_eq!(accrued_chest(&cfg, cap, dec!(0), date(2030, 1, 1)), cap);
+    }
+
+    #[test]
+    fn spending_reduces_the_chest_and_it_cannot_go_negative() {
+        let cfg = dd(date(2026, 8, 1));
+        let cap = dec!(1000);
+        // $200 spent out of a $500 chest.
+        assert_eq!(
+            accrued_chest(&cfg, cap, dec!(200), date(2026, 8, 15)),
+            dec!(300)
+        );
+        // Overspent (shouldn't happen, but must clamp rather than wrap negative —
+        // a negative "deployable" would flip the exhausted-chest branch's meaning).
+        assert_eq!(
+            accrued_chest(&cfg, cap, dec!(9999), date(2026, 8, 15)),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn accrual_revives_the_chest_after_a_full_drawdown_spend() {
+        // The whole point of accrual over a static pot: spend it all in month 1,
+        // and the sleeve is funded again later instead of flattened forever.
+        let cfg = dd(date(2026, 8, 1));
+        let cap = dec!(1000);
+        assert_eq!(
+            accrued_chest(&cfg, cap, dec!(500), date(2026, 8, 20)),
+            Decimal::ZERO,
+            "fully spent in month 0"
+        );
+        assert_eq!(
+            accrued_chest(&cfg, cap, dec!(500), date(2026, 11, 1)),
+            dec!(249.99),
+            "three months of accrual has re-funded it"
+        );
     }
 }

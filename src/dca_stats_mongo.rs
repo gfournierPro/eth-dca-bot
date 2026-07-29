@@ -265,6 +265,31 @@ impl DcaStatsDB {
         Ok(latest.map(|p| p.timestamp))
     }
 
+    /// Total USDC spent by BUY fills timestamped at or after `since`, as a
+    /// **positive** magnitude.
+    ///
+    /// The drawdown sleeve uses this to derive which tiers are still armed: spend
+    /// since the last new rolling high is absorbed shallowest-tier-first, so no
+    /// per-tier state has to be stored anywhere (see
+    /// [`crate::levels::derive_drawdown_ladder`]).
+    ///
+    /// Note this deliberately does NOT reuse `get_summary`'s aggregation: that
+    /// field is a *signed net cash-flow* (negative for buys, positive for sells),
+    /// which has already caused one war-chest sign bug. Here BUY magnitudes are
+    /// summed directly. Filtering happens in Rust rather than in the `$match`
+    /// because `timestamp`'s on-disk encoding depends on serde's chrono
+    /// representation, and a sleeve's fills collection is a handful of documents.
+    pub async fn total_spent_since(&self, since: DateTime<Utc>) -> Result<Decimal> {
+        let mut cursor = self.collection.find(doc! { "status": "FILLED" }).await?;
+        let mut spent = dec!(0);
+        while let Some(p) = cursor.try_next().await? {
+            if p.timestamp >= since && p.side != "SELL" {
+                spent += p.usdc_amount.abs();
+            }
+        }
+        Ok(spent)
+    }
+
     pub async fn get_recent_purchases(&self, limit: i64) -> Result<Vec<DcaPurchase>> {
         let mut cursor = self.collection.find(Document::new()).await?;
 

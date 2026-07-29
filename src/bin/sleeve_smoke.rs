@@ -16,9 +16,12 @@
 //!   cargo run --bin sleeve_smoke -- reconcile --asset btc --exchange okx --chest 1.0
 
 use anyhow::{Result, anyhow};
-use eth_dca_bot::config::LimitSleeveConfig;
+use chrono::{DateTime, Utc};
+use eth_dca_bot::config::{LimitSleeveConfig, load_sleeve_env};
+use eth_dca_bot::dca_stats_mongo::DcaStatsDB;
 use eth_dca_bot::exchange::SleeveExchange;
 use eth_dca_bot::kraken::KrakenClient;
+use eth_dca_bot::levels::{anchor_high_and_rearm, derive_drawdown_ladder};
 use eth_dca_bot::limit_sleeve::LimitSleeve;
 use eth_dca_bot::notion_integration::NotionDCATracker;
 use eth_dca_bot::okx::OkxClient;
@@ -78,10 +81,17 @@ fn decimal_arg(args: &[String], flag: &str, default: Decimal) -> Result<Decimal>
 /// The sleeve defaults selected by `--asset eth|btc` (default eth). Carries the
 /// per-asset symbol, userref, bucket size, and fills collection, so the smoke test
 /// exercises exactly what the production sleeve for that asset would.
+/// Resolve a sleeve's config exactly as the bot does — defaults overlaid with the
+/// same `{prefix}_*` env vars — so a preview reflects what the deployed bot would
+/// actually place, not the shipped defaults.
 fn sleeve_defaults(args: &[String]) -> Result<LimitSleeveConfig> {
     match arg_value(args, "--asset").as_deref().unwrap_or("eth") {
-        "eth" | "ETH" => Ok(LimitSleeveConfig::eth_default()),
-        "btc" | "BTC" => Ok(LimitSleeveConfig::btc_default()),
+        "eth" | "ETH" => load_sleeve_env(LimitSleeveConfig::eth_default(), "LIMIT_SLEEVE", "VP"),
+        "btc" | "BTC" => load_sleeve_env(
+            LimitSleeveConfig::btc_default(),
+            "BTC_LIMIT_SLEEVE",
+            "BTC_VP",
+        ),
         other => Err(anyhow!("unknown --asset '{other}' (expected eth or btc)")),
     }
 }
@@ -155,7 +165,78 @@ async fn cmd_reconcile(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Preview the drawdown-tier ladder the sleeve actually places — anchor high, which
+/// tiers are armed, and what each would bid — without touching the exchange's order
+/// book. This is the pre-funding sanity check: run it and confirm the trigger prices
+/// are where you expect before raising the chest.
+///
+/// Spend figures come from the live fills collection, so `--collection` matters.
 async fn cmd_ladder(args: &[String]) -> Result<()> {
+    let cfg = sleeve_defaults(args)?;
+    let dd = &cfg.drawdown;
+    let exchange = exchange_client(args)?;
+
+    let daily = exchange.fetch_daily_highs(&cfg.symbol).await?;
+    let (anchor_high, rearm_ts) = anchor_high_and_rearm(&daily, dd.anchor_days)?;
+    let spot = exchange.fetch_spot_price(&cfg.symbol).await?;
+    let spec = exchange.fetch_pair_spec(&cfg.symbol).await?;
+
+    let rearm_at = DateTime::<Utc>::from_timestamp(rearm_ts, 0).unwrap_or_else(Utc::now);
+    let fills = DcaStatsDB::with_collection(&cfg.mongo_collection).await?;
+    let spent_all_time = fills.get_summary(spot).await?.total_usdc_invested.abs();
+    let spent_since_rearm = fills.total_spent_since(rearm_at).await?;
+
+    println!(
+        "{}: spot {spot}  tick {}  lot {}  ordermin {}",
+        cfg.symbol, spec.tick_size, spec.lot_size, spec.ordermin
+    );
+    println!(
+        "  {} daily candles; {}d anchor high {anchor_high} (spot is {:.1}% below it)",
+        daily.len(),
+        dd.anchor_days,
+        (anchor_high - spot) / anchor_high * Decimal::ONE_HUNDRED
+    );
+    println!(
+        "  tiers last armed {} (spent since: {spent_since_rearm} USDC; {spent_all_time} lifetime)",
+        rearm_at.date_naive()
+    );
+    println!(
+        "  chest cap {}  accrual {}/mo from {}  start {}",
+        cfg.war_chest_usdc, dd.monthly_accrual_usdc, dd.accrual_start, dd.starting_chest_usdc
+    );
+
+    let bids = derive_drawdown_ladder(anchor_high, spot, &dd.tiers, spent_since_rearm);
+    for (i, t) in dd.tiers.iter().enumerate() {
+        let trigger = anchor_high * (Decimal::ONE - t.depth);
+        match bids.iter().find(|b| b.tier == i) {
+            Some(b) => println!(
+                "  tier {} -{}%: ARMED   bid {} @ {trigger}",
+                i + 1,
+                t.depth * Decimal::ONE_HUNDRED,
+                b.value_usdc
+            ),
+            None if trigger >= spot => println!(
+                "  tier {} -{}%: waiting (trigger {trigger} is above spot)",
+                i + 1,
+                t.depth * Decimal::ONE_HUNDRED
+            ),
+            None => println!(
+                "  tier {} -{}%: spent   (allocation {} consumed since arming)",
+                i + 1,
+                t.depth * Decimal::ONE_HUNDRED,
+                t.allocation_usdc
+            ),
+        }
+    }
+    if bids.is_empty() {
+        println!("  (no bids would be placed)");
+    }
+    Ok(())
+}
+
+/// Preview the legacy volume-profile ladder. Kept as a diagnostic only — the sleeve
+/// no longer places these; see `cmd_ladder`.
+async fn cmd_hvn_ladder(args: &[String]) -> Result<()> {
     let cfg = sleeve_defaults(args)?;
     let mut vp = cfg.volume_profile.clone();
     vp.bucket_size = decimal_arg(args, "--bucket", vp.bucket_size)?;
@@ -279,12 +360,13 @@ async fn main() -> Result<()> {
     match args.get(1).map(String::as_str) {
         Some("reconcile") => cmd_reconcile(&args).await,
         Some("ladder") => cmd_ladder(&args).await,
+        Some("hvn-ladder") => cmd_hvn_ladder(&args).await,
         Some("validate") => cmd_validate(&args).await,
         Some("list") => cmd_list(&args).await,
         Some("teardown") => cmd_teardown(&args).await,
         _ => {
             println!(
-                "usage (all commands take --asset eth|btc [default eth] and --exchange kraken|okx [default kraken]):\n  sleeve_smoke reconcile [--asset eth|btc] [--exchange kraken|okx] --chest <usdc> --collection <name> [--bucket N] [--hvn-ratio 0.7] [--ladder-steps 4] [--interval 60]\n  sleeve_smoke ladder [--asset eth|btc] [--exchange kraken|okx] [--bucket N] [--hvn-ratio 0.7] [--ladder-steps 4] [--interval 60]\n  sleeve_smoke validate [--asset eth|btc] --price <p> --volume <v>  (Kraken only)\n  sleeve_smoke list [--asset eth|btc] [--exchange kraken|okx]\n  sleeve_smoke teardown [--asset eth|btc] [--exchange kraken|okx]"
+                "usage (all commands take --asset eth|btc [default eth] and --exchange kraken|okx [default kraken]):\n  sleeve_smoke ladder      — preview the drawdown tiers the sleeve places (read-only)\n  sleeve_smoke reconcile --chest <usdc> --collection <name>\n  sleeve_smoke hvn-ladder [--bucket N] [--hvn-ratio 0.7] [--ladder-steps 4] [--interval 60]  — legacy volume-profile preview, no longer placed\n  sleeve_smoke validate --price <p> --volume <v>  (Kraken only)\n  sleeve_smoke list\n  sleeve_smoke teardown"
             );
             Ok(())
         }
