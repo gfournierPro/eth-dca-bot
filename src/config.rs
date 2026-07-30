@@ -370,7 +370,12 @@ impl Default for Config {
                 withdrawal_amount: None,         // Withdraw all available ETH
             },
             market_indicators: MarketIndicatorsConfig {
-                volatility_scaling_enabled: true,
+                // Off per the modulation backtest (tests/dca_modulation_backtest.rs):
+                // the 30d coefficient-of-variation almost always clears the 2% "high"
+                // bar, so this fired near-permanently — uniform ~1.1x on every buy,
+                // no average-entry benefit, ~9% budget overspend. RSI/MA/momentum
+                // carry the entry improvement without it.
+                volatility_scaling_enabled: false,
                 volatility_period: 30,
                 high_volatility_multiplier: Decimal::new(110, 2), // 1.1x (10% increase)
                 volatility_threshold: Decimal::new(2, 0),         // 2% of mean price
@@ -454,7 +459,12 @@ impl AssetDcaConfig {
                 withdrawal_amount: None,               // Withdraw all available BTC
             },
             market_indicators: MarketIndicatorsConfig {
-                volatility_scaling_enabled: true,
+                // Off per the modulation backtest (tests/dca_modulation_backtest.rs):
+                // the 30d coefficient-of-variation almost always clears the 2% "high"
+                // bar, so this fired near-permanently — uniform ~1.1x on every buy,
+                // no average-entry benefit, ~9% budget overspend. RSI/MA/momentum
+                // carry the entry improvement without it.
+                volatility_scaling_enabled: false,
                 volatility_period: 30,
                 high_volatility_multiplier: Decimal::new(110, 2), // 1.1x (10% increase)
                 volatility_threshold: Decimal::new(2, 0),         // 2% of mean price
