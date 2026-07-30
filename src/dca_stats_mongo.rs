@@ -338,6 +338,37 @@ impl DcaStatsDB {
         Ok(order_ids)
     }
 
+    /// Backfill any of `exchange_purchases` not already present (by `order_id`).
+    /// Exchange-agnostic counterpart to `sync_missing_orders_from_binance`, for
+    /// exchanges where fetching the purchases themselves is the exchange
+    /// client's job (see `Exchange::get_dca_purchases_since`).
+    pub async fn sync_missing_purchases(&self, exchange_purchases: &[DcaPurchase]) -> Result<usize> {
+        let existing_ids: std::collections::HashSet<String> =
+            self.get_all_order_ids().await?.into_iter().collect();
+
+        let mut added = 0;
+        for purchase in exchange_purchases {
+            if existing_ids.contains(&purchase.order_id) {
+                continue;
+            }
+            match self.record_purchase(purchase).await {
+                Ok(()) => {
+                    added += 1;
+                    info!(
+                        "✅ Backfilled missing purchase: order_id={} {} {} @ {} from {}",
+                        purchase.order_id,
+                        purchase.usdc_amount,
+                        purchase.symbol,
+                        purchase.eth_price,
+                        purchase.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+                    );
+                }
+                Err(e) => error!("❌ Failed to backfill purchase {}: {}", purchase.order_id, e),
+            }
+        }
+        Ok(added)
+    }
+
     /// Sync missing orders (both purchases and sales) from Binance to MongoDB
     /// Returns the number of orders added
     pub async fn sync_missing_orders_from_binance(

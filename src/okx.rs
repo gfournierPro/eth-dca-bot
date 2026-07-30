@@ -24,7 +24,7 @@ use std::time::Instant;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use chrono::{Datelike, TimeZone, Utc};
+use chrono::{DateTime, Datelike, TimeZone, Utc};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use rust_decimal::Decimal;
@@ -543,6 +543,56 @@ impl OkxClient {
         Ok(out)
     }
 
+    /// Filled buy orders for `symbol` since `start_ms` (unix millis), excluding
+    /// the limit sleeve's own orders (same account, same order-history endpoint
+    /// — see [`Self::sleeve_tag_prefix`]). Shared by the trait's
+    /// `get_current_month_purchases` (this-month window, for display) and
+    /// `get_dca_purchases_since` (arbitrary lookback, to backfill purchases the
+    /// bot failed to record — e.g. the process died mid patient-maker loop).
+    ///
+    /// ponytail: single page (100 orders) — far beyond what either caller's
+    /// window sees in practice; paginate via the `after` cursor if that stops
+    /// being true.
+    async fn fetch_filled_dca_buys(&self, symbol: &str, start_ms: i64) -> Result<Vec<DcaPurchase>> {
+        let inst = Self::okx_inst(symbol);
+        let path = format!(
+            "/api/v5/trade/orders-history-archive?instType=SPOT&instId={inst}&state=filled&begin={start_ms}"
+        );
+        let orders: Vec<OrderData> = self.private_request("GET", &path, None).await?;
+
+        let mut purchases = Vec::new();
+        for order in orders {
+            if order.side != "buy" || order.cl_ord_id.starts_with("sleeve") {
+                continue;
+            }
+            let executed_qty = parse_dec(&order.acc_fill_sz);
+            let avg_price = parse_dec(&order.avg_px);
+            if executed_qty <= dec!(0) || avg_price <= dec!(0) {
+                continue;
+            }
+            let timestamp = Utc
+                .timestamp_millis_opt(parse_dec(&order.u_time).try_into().unwrap_or(0))
+                .single()
+                .unwrap_or_else(Utc::now);
+
+            purchases.push(DcaPurchase {
+                id: Uuid::new_v4().to_string(),
+                timestamp,
+                symbol: symbol.to_string(),
+                side: "BUY".to_string(),
+                usdc_amount: executed_qty * avg_price,
+                eth_amount: executed_qty,
+                eth_price: avg_price,
+                fees_usdc: fee_to_usdc(&order.fee, &order.fee_ccy, avg_price),
+                order_id: order.ord_id,
+                status: "FILLED".to_string(),
+            });
+        }
+
+        purchases.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(purchases)
+    }
+
     /// Post a fire-and-forget, post-only limit buy tagged with `userref` (see
     /// [`Self::sleeve_tag_prefix`]), returning the OKX order id. `price`/`volume`
     /// must already be tick/lot-rounded by the caller.
@@ -1052,53 +1102,30 @@ impl Exchange for OkxClient {
     }
 
     async fn get_current_month_purchases(&self, symbol: &str) -> Result<Vec<DcaPurchase>> {
-        let inst = Self::okx_inst(symbol);
         let now = Utc::now();
         let start_ms = Utc
             .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
             .unwrap()
             .timestamp_millis();
 
-        // ponytail: single page (100 orders) — far beyond a month of DCA buys;
-        // paginate via the `after` cursor if that ever stops being true.
-        let path = format!(
-            "/api/v5/trade/orders-history-archive?instType=SPOT&instId={inst}&state=filled&begin={start_ms}"
-        );
-        let orders: Vec<OrderData> = self.private_request("GET", &path, None).await?;
-
-        let mut purchases = Vec::new();
-        for order in orders {
-            if order.side != "buy" {
-                continue;
-            }
-            let executed_qty = parse_dec(&order.acc_fill_sz);
-            let avg_price = parse_dec(&order.avg_px);
-            if executed_qty <= dec!(0) || avg_price <= dec!(0) {
-                continue;
-            }
-            let timestamp = Utc
-                .timestamp_millis_opt(parse_dec(&order.u_time).try_into().unwrap_or(0))
-                .single()
-                .unwrap_or_else(Utc::now);
-
-            purchases.push(DcaPurchase {
-                id: Uuid::new_v4().to_string(),
-                timestamp,
-                symbol: symbol.to_string(),
-                side: "BUY".to_string(),
-                usdc_amount: executed_qty * avg_price,
-                eth_amount: executed_qty,
-                eth_price: avg_price,
-                fees_usdc: fee_to_usdc(&order.fee, &order.fee_ccy, avg_price),
-                order_id: order.ord_id,
-                status: "FILLED".to_string(),
-            });
-        }
-
-        purchases.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        let purchases = self.fetch_filled_dca_buys(symbol, start_ms).await?;
         info!(
             "Found {} DCA purchases from current month on OKX",
             purchases.len()
+        );
+        Ok(purchases)
+    }
+
+    async fn get_dca_purchases_since(
+        &self,
+        symbol: &str,
+        start: DateTime<Utc>,
+    ) -> Result<Vec<DcaPurchase>> {
+        let purchases = self.fetch_filled_dca_buys(symbol, start.timestamp_millis()).await?;
+        info!(
+            "Found {} DCA purchase(s) on OKX since {}",
+            purchases.len(),
+            start.format("%Y-%m-%d %H:%M:%S UTC")
         );
         Ok(purchases)
     }

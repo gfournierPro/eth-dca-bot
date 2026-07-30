@@ -7,6 +7,9 @@
 //!                                                     # read-only: checks 0.001 ETH can go to
 //!                                                     # WITHDRAWAL_WALLET_ADDRESS on WITHDRAWAL_NETWORK
 //!   cargo run --bin test_okx -- --withdraw 0.001      # REAL withdrawal of 0.001 ETH
+//!   cargo run --bin test_okx -- --history 14 --symbol BTCUSDC
+//!                                                     # read-only: filled DCA buys
+//!                                                     # (non-sleeve) in the last N days
 //!
 //! Run the read-only mode first after creating the OKX API key — the client has
 //! never been exercised against a live account.
@@ -47,7 +50,14 @@ async fn main() -> Result<()> {
     let base_url = env::var("OKX_BASE_URL").unwrap_or_else(|_| "https://www.okx.com".to_string());
 
     let client = OkxClient::new(api_key, secret, passphrase, base_url);
-    let symbol = "ETHUSDC";
+    let args: Vec<String> = env::args().collect();
+    let symbol = args
+        .iter()
+        .position(|a| a == "--symbol")
+        .and_then(|pos| args.get(pos + 1))
+        .cloned()
+        .unwrap_or_else(|| "ETHUSDC".to_string());
+    let symbol = symbol.as_str();
 
     let usdc = client.get_usdc_balance().await?;
     let price = client.get_price(symbol).await?;
@@ -58,7 +68,6 @@ async fn main() -> Result<()> {
     println!("USDC per EUR      : {}", usdc_per_eur);
     println!("--------------------------------------------------");
 
-    let args: Vec<String> = env::args().collect();
     let parse_amount = |flag: &str| -> Result<Option<Decimal>> {
         match args.iter().position(|a| a == flag) {
             Some(pos) => {
@@ -71,7 +80,33 @@ async fn main() -> Result<()> {
         }
     };
 
-    if let Some(amount) = parse_amount("--buy")? {
+    let history_days: Option<i64> = args
+        .iter()
+        .position(|a| a == "--history")
+        .and_then(|pos| args.get(pos + 1))
+        .and_then(|s| s.parse().ok());
+
+    if let Some(days) = history_days {
+        let since = chrono::Utc::now() - chrono::Duration::days(days);
+        let purchases = client.get_dca_purchases_since(symbol, since).await?;
+        println!(
+            ">>> {} filled DCA (non-sleeve) buy(s) for {} since {}",
+            purchases.len(),
+            symbol,
+            since.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+        for p in &purchases {
+            println!(
+                "  {} | order_id {} | {} @ {} = {} USDC | fee {} USDC",
+                p.timestamp.format("%Y-%m-%d %H:%M:%S UTC"),
+                p.order_id,
+                p.eth_amount,
+                p.eth_price,
+                p.usdc_amount,
+                p.fees_usdc
+            );
+        }
+    } else if let Some(amount) = parse_amount("--buy")? {
         if amount > usdc {
             return Err(anyhow::anyhow!(
                 "Requested {} USDC exceeds balance {}",

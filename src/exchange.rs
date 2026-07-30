@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
 use crate::dca_stats_mongo::DcaPurchase;
@@ -109,6 +110,23 @@ pub trait Exchange: Send + Sync {
     /// Reconstruct this month's filled buy purchases from the exchange, used as a
     /// fallback when the local database has no record.
     async fn get_current_month_purchases(&self, symbol: &str) -> Result<Vec<DcaPurchase>>;
+
+    /// Reconstruct filled buy purchases for `symbol` since `start`, used to
+    /// backfill purchases that executed on the exchange but were never written
+    /// to Mongo (e.g. the process died between an order filling and
+    /// `record_purchase` running, inside the patient-maker loop).
+    ///
+    /// Default: unsupported (`Ok(vec![])`). Binance already has its own
+    /// dedicated integrity sync (`DcaStatsDB::sync_missing_orders_from_binance`);
+    /// OKX overrides this since it's the exchange actually in use.
+    async fn get_dca_purchases_since(
+        &self,
+        symbol: &str,
+        start: DateTime<Utc>,
+    ) -> Result<Vec<DcaPurchase>> {
+        let _ = (symbol, start);
+        Ok(Vec::new())
+    }
 
     /// Verify a withdrawal of `amount` `asset` to `destination` is possible.
     ///

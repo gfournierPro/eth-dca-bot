@@ -325,8 +325,41 @@ impl DcaTrader {
         Ok(())
     }
 
+    /// Backfill any purchase that filled on the exchange but never made it into
+    /// Mongo (see the crash window in `run_patient_maker_buy`/`fetch_filled_dca_buys`).
+    /// Looks back from the last recorded purchase with a safety margin, or 30
+    /// days if the collection is empty — there's no persisted "purchase
+    /// attempted" checkpoint to resume from otherwise.
+    pub async fn reconcile_missing_purchases(&self) -> Result<usize> {
+        let since = self
+            .stats_db
+            .latest_purchase_timestamp()
+            .await?
+            .map(|t| t - Duration::days(2))
+            .unwrap_or_else(|| Utc::now() - Duration::days(30));
+
+        let exchange_purchases = self
+            .exchange
+            .get_dca_purchases_since(&self.trading_config.symbol, since)
+            .await?;
+
+        if exchange_purchases.is_empty() {
+            return Ok(0);
+        }
+
+        self.stats_db
+            .sync_missing_purchases(&exchange_purchases)
+            .await
+    }
+
     pub async fn check_and_execute_startup_dca(&mut self) -> Result<()> {
         info!("🔍 Checking if a scheduled DCA was missed and needs to be executed...");
+
+        match self.reconcile_missing_purchases().await {
+            Ok(0) => {}
+            Ok(n) => info!("🔄 Backfilled {} missing purchase(s) from the exchange", n),
+            Err(e) => warn!("⚠️  Purchase reconciliation failed: {}", e),
+        }
 
         // Parse the cron schedule
         let schedule = match Schedule::from_str(&self.cron_schedule) {
