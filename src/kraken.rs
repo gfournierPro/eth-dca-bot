@@ -1331,6 +1331,10 @@ impl SleeveExchange for KrakenClient {
     async fn get_usdc_per_eur(&self) -> Result<Decimal> {
         Exchange::get_usdc_per_eur(self).await
     }
+
+    async fn get_usdc_balance(&self) -> Result<Decimal> {
+        Exchange::get_usdc_balance(self).await
+    }
 }
 
 #[cfg(test)]

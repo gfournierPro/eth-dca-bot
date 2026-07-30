@@ -301,6 +301,30 @@ impl LimitSleeve {
         //    never reach past its allocation into a deeper tier's money either.
         let mut available = (deployable - kept_reserved).max(Decimal::ZERO);
 
+        // Clamp to the USDC actually free on the account. A chest configured above
+        // the funded balance otherwise places bids the venue rejects one by one
+        // (seen live 2026-07-29: $100+$100 chests vs $103 on account → OKX "code 1"
+        // on every bid past the balance). OKX's available balance already excludes
+        // resting-order reservations; Kraken's Balance is a total, so the clamp is
+        // looser there — either way never worse than no clamp. A failed balance
+        // read degrades to unclamped (the venue still rejects, just noisily).
+        match self.exchange.get_usdc_balance().await {
+            Ok(free) if free < available => {
+                warn!(
+                    "[sleeve:{}] only {:.2} USDC free on the account but the chest wants {:.2} \
+                     for new bids; clamping — fund the account or lower the chest/allocations",
+                    self.config.asset, free, available
+                );
+                available = free.max(Decimal::ZERO);
+            }
+            Ok(_) => {}
+            Err(e) => warn!(
+                "[sleeve:{}] could not read free USDC balance ({}); placing without the \
+                 funded-balance clamp",
+                self.config.asset, e
+            ),
+        }
+
         for tb in &tier_bids {
             let price = round_price_to_tick(tb.price, spec.tick_size);
             let is_desired = desired

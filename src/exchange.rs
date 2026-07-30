@@ -265,4 +265,11 @@ pub trait SleeveExchange: Send + Sync {
     /// duplicated here so the sleeve can work from a `dyn SleeveExchange` alone
     /// without also needing `dyn Exchange`).
     async fn get_usdc_per_eur(&self) -> Result<Decimal>;
+
+    /// Free USDC in the trading account (mirrors [`Exchange::get_usdc_balance`],
+    /// same duplication rationale as [`Self::get_usdc_per_eur`]). The sleeve clamps
+    /// its deployable chest to this: a configured chest larger than the money
+    /// actually on the account would otherwise place bids the venue rejects one by
+    /// one — silently, if nobody reads the warn logs.
+    async fn get_usdc_balance(&self) -> Result<Decimal>;
 }
