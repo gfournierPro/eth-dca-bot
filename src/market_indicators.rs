@@ -130,6 +130,17 @@ impl MarketIndicators {
         }
     }
 
+    /// Build over a pre-supplied price history (oldest first), for offline
+    /// evaluation — the backtest harness feeds historical closes through the same
+    /// calculators production uses. Production goes through [`Self::new`] plus the
+    /// network fetch in `update_price_history` instead.
+    pub fn with_history(config: MarketIndicatorsConfig, history: Vec<PriceData>) -> Self {
+        Self {
+            config,
+            price_history: history.into(),
+        }
+    }
+
     /// Calculate dynamic DCA multiplier based on market conditions
     pub async fn calculate_dca_multiplier(
         &mut self,
@@ -140,9 +151,17 @@ impl MarketIndicators {
         // Update price history with latest data
         self.update_price_history(exchange, symbol).await?;
 
+        let total_multiplier = self.multiplier_from_history()?;
+        info!("Final DCA multiplier: {}", total_multiplier);
+        Ok(total_multiplier)
+    }
+
+    /// The combined, clamped multiplier from the in-memory price history alone —
+    /// the pure part of [`Self::calculate_dca_multiplier`], no network. Public so
+    /// the backtest harness can evaluate the production signals offline.
+    pub fn multiplier_from_history(&self) -> Result<Decimal> {
         let mut total_multiplier = Decimal::ONE;
 
-        // Calculate individual multipliers
         if self.config.volatility_scaling_enabled {
             let volatility_multiplier = self.calculate_volatility_multiplier()?;
             total_multiplier *= volatility_multiplier;
@@ -167,12 +186,9 @@ impl MarketIndicators {
             debug!("Momentum multiplier: {}", momentum_multiplier);
         }
 
-        // Apply bounds
-        total_multiplier = total_multiplier.max(self.config.min_total_multiplier);
-        total_multiplier = total_multiplier.min(self.config.max_total_multiplier);
-
-        info!("Final DCA multiplier: {}", total_multiplier);
-        Ok(total_multiplier)
+        Ok(total_multiplier
+            .max(self.config.min_total_multiplier)
+            .min(self.config.max_total_multiplier))
     }
 
     /// Update price history with recent data

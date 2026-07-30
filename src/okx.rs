@@ -398,10 +398,39 @@ impl OkxClient {
         interval_minutes: u32,
     ) -> Result<Vec<(Decimal, Decimal)>> {
         let bar = minutes_to_bar(interval_minutes)?;
-        const PAGE_LIMIT: usize = 100;
-        const MAX_PAGES: usize = 8; // ~800 candles for a 1H bar ≈ Kraken's ~720 cap
+        let rows = self.fetch_candle_rows(inst_id, &bar).await?;
 
         let mut observations = Vec::new();
+        for row in &rows {
+            // Row layout: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm].
+            if row.len() < 8 {
+                continue;
+            }
+            let vol = parse_dec(&row[5]);
+            let vol_ccy_quote = parse_dec(&row[7]);
+            if vol > Decimal::ZERO && vol_ccy_quote > Decimal::ZERO {
+                observations.push((vol_ccy_quote / vol, vol));
+            }
+        }
+        info!(
+            "OKX candles for {} ({}m): {} usable candles",
+            inst_id,
+            interval_minutes,
+            observations.len()
+        );
+        Ok(observations)
+    }
+
+    /// Paginate `history-candles` for `bar` and return the raw rows.
+    ///
+    /// OKX caps at 100 rows/page and walks *backwards* via the `after` cursor, so
+    /// the result is newest-first across pages — callers that care about ordering
+    /// must sort. 8 pages ≈ 800 candles, matching Kraken's ~720 single-shot window.
+    async fn fetch_candle_rows(&self, inst_id: &str, bar: &str) -> Result<Vec<Vec<String>>> {
+        const PAGE_LIMIT: usize = 100;
+        const MAX_PAGES: usize = 8;
+
+        let mut all = Vec::new();
         let mut after: Option<String> = None;
         for _ in 0..MAX_PAGES {
             let mut path = format!(
@@ -414,30 +443,35 @@ impl OkxClient {
             if rows.is_empty() {
                 break;
             }
-            for row in &rows {
-                // Row layout: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm].
-                if row.len() < 8 {
-                    continue;
-                }
-                let vol = parse_dec(&row[5]);
-                let vol_ccy_quote = parse_dec(&row[7]);
-                if vol > Decimal::ZERO && vol_ccy_quote > Decimal::ZERO {
-                    observations.push((vol_ccy_quote / vol, vol));
-                }
-            }
             let page_len = rows.len();
-            after = rows.into_iter().next_back().map(|r| r[0].clone());
+            after = rows.last().map(|r| r[0].clone());
+            all.extend(rows);
             if page_len < PAGE_LIMIT {
                 break; // reached the oldest data OKX has
             }
         }
-        info!(
-            "OKX candles for {} ({}m): {} usable candles",
-            inst_id,
-            interval_minutes,
-            observations.len()
-        );
-        Ok(observations)
+        Ok(all)
+    }
+
+    /// Daily `(unix_seconds, high)` pairs, **oldest first**, for the drawdown
+    /// anchor. OKX timestamps are milliseconds, so they're divided down to match
+    /// Kraken's seconds (and the `closetm` convention used elsewhere).
+    pub async fn fetch_daily_highs(&self, symbol: &str) -> Result<Vec<(i64, Decimal)>> {
+        let inst = Self::okx_inst(symbol);
+        let rows = self.fetch_candle_rows(&inst, "1D").await?;
+
+        let mut daily: Vec<(i64, Decimal)> = rows
+            .iter()
+            .filter(|r| r.len() >= 3)
+            .filter_map(|r| {
+                let ts = r[0].parse::<i64>().ok()? / 1000;
+                let high = parse_dec(&r[2]);
+                (high > Decimal::ZERO).then_some((ts, high))
+            })
+            .collect();
+        daily.sort_by_key(|(ts, _)| *ts);
+        info!("OKX daily highs for {}: {} candles", symbol, daily.len());
+        Ok(daily)
     }
 
     /// Build a volume-profile bid ladder for `symbol` straight from live OKX
@@ -1267,6 +1301,14 @@ impl SleeveExchange for OkxClient {
         self.build_bid_ladder(symbol, interval_minutes, config).await
     }
 
+    async fn fetch_daily_highs(&self, symbol: &str) -> Result<Vec<(i64, Decimal)>> {
+        self.fetch_daily_highs(symbol).await
+    }
+
+    async fn fetch_spot_price(&self, symbol: &str) -> Result<Decimal> {
+        self.get_price(symbol).await
+    }
+
     async fn fetch_pair_spec(&self, symbol: &str) -> Result<PairSpec> {
         self.fetch_pair_spec(&Self::okx_inst(symbol)).await
     }
@@ -1308,6 +1350,10 @@ impl SleeveExchange for OkxClient {
 
     async fn get_usdc_per_eur(&self) -> Result<Decimal> {
         Exchange::get_usdc_per_eur(self).await
+    }
+
+    async fn get_usdc_balance(&self) -> Result<Decimal> {
+        Exchange::get_usdc_balance(self).await
     }
 }
 

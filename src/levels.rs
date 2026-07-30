@@ -293,6 +293,135 @@ pub fn derive_bid_ladder(
     Ok(BidLadder { levels })
 }
 
+// --- Drawdown-tier ladder -----------------------------------------------------
+//
+// The volume-profile ladder above answers "where did volume trade recently?",
+// which turns out to be a mean-reversion question: its levels track spot and sit
+// 1-2% below it, so a routine wiggle fills the whole war chest and nothing is left
+// for a real drawdown. The tier ladder below answers a different question — "how
+// far below the cycle high are we?" — and is what the sleeve actually places.
+//
+// Two properties do the work, and both are load-bearing:
+//
+// 1. **Levels are anchored to a rolling high, not to spot.** They do not follow
+//    price down, so shallow noise cannot reach the deep tiers.
+// 2. **Allocations are absolute USDC, never normalised.** `derive_bid_ladder`
+//    returns weights summing to 1, which by construction commits 100% of the
+//    remaining chest to whatever levels are currently in range — the exact bug
+//    that drains the chest early. A tier gets its dollars and nothing more.
+
+/// One drawdown tier: how far below the anchor high it rests, and the fixed USDC
+/// it may ever deploy per arming.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DrawdownTier {
+    /// Fractional drawdown below the anchor high, e.g. `0.25` for -25%.
+    pub depth: Decimal,
+    /// Fixed USDC this tier deploys. Not a weight: it is never re-normalised
+    /// against the other tiers or the remaining chest.
+    pub allocation_usdc: Decimal,
+}
+
+/// A tier's concrete resting bid: trigger price plus the USDC it still has to
+/// spend (its allocation less whatever already filled since the last arming).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TierBid {
+    /// Index into the configured tier list, for logging.
+    pub tier: usize,
+    /// Trigger price: `anchor_high * (1 - depth)`.
+    pub price: Decimal,
+    /// USDC still unspent for this tier.
+    pub value_usdc: Decimal,
+}
+
+/// The anchor high and the arming time, from a daily `(timestamp, high)` series.
+///
+/// Returns `(anchor_high, rearm_ts)` where `anchor_high` is the maximum high over
+/// the trailing `anchor_days`, and `rearm_ts` is the timestamp of the most recent
+/// candle that set a new `anchor_days` high — the moment every tier re-armed.
+///
+/// Spend is measured from `rearm_ts`, which is what stops a bear market from
+/// re-buying the same tier forever: the tiers only reset once price has recovered
+/// to a fresh high. Falls back to the oldest candle when no new high occurs in the
+/// series (a long bear), so tiers stay disarmed rather than silently re-arming.
+///
+/// `Err` on empty input (caller misuse) or a non-positive `anchor_days`.
+pub fn anchor_high_and_rearm(
+    daily: &[(i64, Decimal)],
+    anchor_days: usize,
+) -> Result<(Decimal, i64)> {
+    if daily.is_empty() {
+        return Err(anyhow!("cannot derive a drawdown anchor from no candles"));
+    }
+    if anchor_days == 0 {
+        return Err(anyhow!("anchor_days must be greater than 0"));
+    }
+
+    // Anchor: highest high in the trailing window (the whole series if shorter).
+    let window_start = daily.len().saturating_sub(anchor_days);
+    let anchor_high = daily[window_start..]
+        .iter()
+        .map(|(_, h)| *h)
+        .max()
+        .expect("non-empty by the guard above");
+
+    // Most recent candle whose high matched or exceeded every high in the
+    // `anchor_days` before it. Candles earlier than a full window can't be judged
+    // against one, so they're skipped; the fallback covers that case.
+    let mut rearm_ts = daily[0].0;
+    for i in anchor_days..daily.len() {
+        let prior_max = daily[i - anchor_days..i]
+            .iter()
+            .map(|(_, h)| *h)
+            .max()
+            .expect("non-empty range");
+        if daily[i].1 >= prior_max {
+            rearm_ts = daily[i].0;
+        }
+    }
+
+    Ok((anchor_high, rearm_ts))
+}
+
+/// Derive the resting bids for the drawdown tiers.
+///
+/// `spent_since_rearm` is absorbed **shallowest tier first**, which is the correct
+/// attribution without storing per-tier state anywhere: price cannot reach tier 2's
+/// trigger without first passing tier 1's, so any spend since the last arming
+/// necessarily filled the shallower tiers first. A tier whose allocation is only
+/// partly consumed (a partial fill) keeps the remainder and re-bids for it.
+///
+/// Only tiers with unspent allocation **and** a trigger strictly below `spot` are
+/// returned — a post-only buy at or above spot would be rejected by the exchange.
+/// An empty result is a normal outcome (price near its high, or all tiers spent).
+pub fn derive_drawdown_ladder(
+    anchor_high: Decimal,
+    spot: Decimal,
+    tiers: &[DrawdownTier],
+    spent_since_rearm: Decimal,
+) -> Vec<TierBid> {
+    let mut unabsorbed = spent_since_rearm.max(Decimal::ZERO);
+    let mut bids = Vec::new();
+
+    for (i, tier) in tiers.iter().enumerate() {
+        let alloc = tier.allocation_usdc;
+        // Consume this tier's allocation from the spend still to be accounted for.
+        let consumed = unabsorbed.min(alloc);
+        unabsorbed -= consumed;
+        let remaining = alloc - consumed;
+
+        let price = anchor_high * (Decimal::ONE - tier.depth);
+        if remaining > Decimal::ZERO && price > Decimal::ZERO && price < spot {
+            bids.push(TierBid {
+                tier: i,
+                price,
+                value_usdc: remaining,
+            });
+        }
+    }
+
+    bids
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +627,145 @@ mod tests {
             .unwrap();
         assert_eq!(b0.volume, dec!(1));
         assert_eq!(b1.volume, dec!(1));
+    }
+
+    // --- Drawdown-tier ladder ---------------------------------------------------
+
+    /// The backtested production shape: -25/-35/-45% at $300/$350/$350.
+    fn tiers() -> Vec<DrawdownTier> {
+        vec![
+            DrawdownTier {
+                depth: dec!(0.25),
+                allocation_usdc: dec!(300),
+            },
+            DrawdownTier {
+                depth: dec!(0.35),
+                allocation_usdc: dec!(350),
+            },
+            DrawdownTier {
+                depth: dec!(0.45),
+                allocation_usdc: dec!(350),
+            },
+        ]
+    }
+
+    #[test]
+    fn tier_triggers_are_fixed_fractions_of_the_anchor_not_of_spot() {
+        // Anchor 100k, spot far below at 90k: triggers stay pinned to the anchor.
+        let bids = derive_drawdown_ladder(dec!(100000), dec!(90000), &tiers(), Decimal::ZERO);
+        assert_eq!(bids.len(), 3);
+        assert_eq!(bids[0].price, dec!(75000));
+        assert_eq!(bids[1].price, dec!(65000));
+        assert_eq!(bids[2].price, dec!(55000));
+        // Allocations are the configured dollars, NOT weights summing to anything.
+        assert_eq!(bids[0].value_usdc, dec!(300));
+        assert_eq!(bids[1].value_usdc, dec!(350));
+        assert_eq!(bids[2].value_usdc, dec!(350));
+    }
+
+    #[test]
+    fn spend_disarms_shallowest_tiers_first_and_leaves_the_deep_ones_funded() {
+        // $300 spent == exactly tier 1's allocation: it drops out, 2 and 3 untouched.
+        // This is the property the whole redesign exists for — a -25% dip must not
+        // be able to consume the budget reserved for -35% and -45%.
+        let bids = derive_drawdown_ladder(dec!(100000), dec!(90000), &tiers(), dec!(300));
+        assert_eq!(bids.len(), 2);
+        assert_eq!(bids[0].tier, 1);
+        assert_eq!(bids[0].value_usdc, dec!(350));
+        assert_eq!(bids[1].tier, 2);
+        assert_eq!(bids[1].value_usdc, dec!(350));
+    }
+
+    #[test]
+    fn a_partial_fill_leaves_the_tier_bidding_for_the_remainder() {
+        // $120 of tier 1's $300 filled -> it re-bids for the $180 balance.
+        let bids = derive_drawdown_ladder(dec!(100000), dec!(90000), &tiers(), dec!(120));
+        assert_eq!(bids.len(), 3);
+        assert_eq!(bids[0].tier, 0);
+        assert_eq!(bids[0].value_usdc, dec!(180));
+        assert_eq!(bids[1].value_usdc, dec!(350));
+    }
+
+    #[test]
+    fn spend_spilling_past_a_tier_boundary_partly_disarms_the_next() {
+        // $400 = all of tier 1 ($300) + $100 of tier 2 -> tier 2 bids its $250 rest.
+        let bids = derive_drawdown_ladder(dec!(100000), dec!(90000), &tiers(), dec!(400));
+        assert_eq!(bids.len(), 2);
+        assert_eq!(bids[0].tier, 1);
+        assert_eq!(bids[0].value_usdc, dec!(250));
+        assert_eq!(bids[1].tier, 2);
+        assert_eq!(bids[1].value_usdc, dec!(350));
+    }
+
+    #[test]
+    fn fully_spent_tiers_yield_no_bids() {
+        let bids = derive_drawdown_ladder(dec!(100000), dec!(90000), &tiers(), dec!(1000));
+        assert!(bids.is_empty());
+        // Over-spend (fees, rounding) must not wrap around into new bids.
+        let bids = derive_drawdown_ladder(dec!(100000), dec!(90000), &tiers(), dec!(5000));
+        assert!(bids.is_empty());
+    }
+
+    #[test]
+    fn triggers_at_or_above_spot_are_skipped() {
+        // Spot 70k: tier 1's trigger (75k) is above it — a post-only buy there would
+        // be rejected (and wouldn't be a dip buy). Deeper tiers still rest.
+        let bids = derive_drawdown_ladder(dec!(100000), dec!(70000), &tiers(), Decimal::ZERO);
+        assert_eq!(bids.len(), 2);
+        assert_eq!(bids[0].tier, 1);
+        assert_eq!(bids[1].tier, 2);
+
+        // Price at its high: nothing is in range at all. Normal, empty result.
+        let bids = derive_drawdown_ladder(dec!(100000), dec!(100000), &tiers(), Decimal::ZERO);
+        assert_eq!(bids.len(), 3, "all three triggers sit below a spot at the high");
+    }
+
+    /// Daily series helper: `(day_index_as_ts, high)`.
+    fn daily(highs: &[i64]) -> Vec<(i64, Decimal)> {
+        highs
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (i as i64, Decimal::from(*h)))
+            .collect()
+    }
+
+    #[test]
+    fn anchor_is_the_trailing_window_max() {
+        // Window of 3: only the last three candles count, so the early 500 spike is
+        // excluded once it rolls out of the window.
+        let series = daily(&[500, 100, 110, 120]);
+        let (anchor, _) = anchor_high_and_rearm(&series, 3).unwrap();
+        assert_eq!(anchor, dec!(120));
+        // A window longer than the series just uses the whole series.
+        let (anchor, _) = anchor_high_and_rearm(&series, 99).unwrap();
+        assert_eq!(anchor, dec!(500));
+    }
+
+    #[test]
+    fn rearm_is_the_last_candle_to_set_a_new_window_high() {
+        // Rally to a peak at index 4, then a decline that never reclaims it.
+        // Window 2: index 4 (140) beat both priors, indices 5-7 did not.
+        let series = daily(&[100, 110, 120, 130, 140, 120, 110, 100]);
+        let (anchor, rearm) = anchor_high_and_rearm(&series, 2).unwrap();
+        assert_eq!(rearm, 4, "the peak is the last arming, not the recent lows");
+        assert_eq!(anchor, dec!(110), "trailing 2 highs are 110 and 100");
+    }
+
+    #[test]
+    fn rearm_falls_back_to_the_oldest_candle_in_an_unbroken_decline() {
+        // A monotonic bear: no candle ever sets a new 3-day high, so there is no
+        // arming event in the window. Falling back to the oldest timestamp keeps
+        // tiers DISARMED (all spend since then counts) rather than resetting them,
+        // which would let a bear market re-buy the same tier over and over.
+        let series = daily(&[200, 190, 180, 170, 160, 150]);
+        let (_, rearm) = anchor_high_and_rearm(&series, 3).unwrap();
+        assert_eq!(rearm, 0);
+    }
+
+    #[test]
+    fn anchor_rejects_empty_series_and_zero_window() {
+        assert!(anchor_high_and_rearm(&[], 90).is_err());
+        assert!(anchor_high_and_rearm(&daily(&[100]), 0).is_err());
     }
 
     #[test]

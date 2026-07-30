@@ -234,6 +234,16 @@ pub trait SleeveExchange: Send + Sync {
         config: &VolumeProfileConfig,
     ) -> Result<(BidLadder, Decimal)>;
 
+    /// Daily `(unix_seconds, high)` pairs, **oldest first**, spanning as much
+    /// history as the venue returns in one sweep (~2 years). Feeds the
+    /// drawdown-tier anchor: the rolling high the tier depths hang off, and the
+    /// last time price set a new one (see [`crate::levels::anchor_high_and_rearm`]).
+    async fn fetch_daily_highs(&self, symbol: &str) -> Result<Vec<(i64, Decimal)>>;
+
+    /// Current spot price. The tier ladder needs it only to avoid resting a
+    /// post-only buy at or above the market (which the venue would reject).
+    async fn fetch_spot_price(&self, symbol: &str) -> Result<Decimal>;
+
     /// Per-pair tick/lot/minimum-order constraints.
     async fn fetch_pair_spec(&self, symbol: &str) -> Result<PairSpec>;
 
@@ -273,4 +283,11 @@ pub trait SleeveExchange: Send + Sync {
     /// duplicated here so the sleeve can work from a `dyn SleeveExchange` alone
     /// without also needing `dyn Exchange`).
     async fn get_usdc_per_eur(&self) -> Result<Decimal>;
+
+    /// Free USDC in the trading account (mirrors [`Exchange::get_usdc_balance`],
+    /// same duplication rationale as [`Self::get_usdc_per_eur`]). The sleeve clamps
+    /// its deployable chest to this: a configured chest larger than the money
+    /// actually on the account would otherwise place bids the venue rejects one by
+    /// one — silently, if nobody reads the warn logs.
+    async fn get_usdc_balance(&self) -> Result<Decimal>;
 }
