@@ -1,15 +1,17 @@
 //! Order-flow paper trader (BTC, OKX public API, no keys, no real orders).
 //!
 //! Polls the order book and trade tape every few seconds, computes two
-//! order-flow signals, and simulates a long-only strategy with honest costs:
+//! order-flow signals, and simulates a two-sided strategy with honest costs:
 //! buys fill at best ask, sells at best bid, taker fee each side.
 //!
 //! Signals:
 //!   - Book imbalance over top 10 levels: (bidVol - askVol) / (bidVol + askVol)
 //!   - CVD: rolling 5-minute cumulative volume delta from the tape (buys - sells)
 //!
-//! Strategy: enter long when imbalance > OF_IMB_ENTRY and CVD > 0; exit when
-//! imbalance < -0.1 or CVD < 0, or on a -1% stop. 60s cooldown between trades.
+//! Strategy: enter long when imbalance > OF_IMB_ENTRY and CVD > 0; enter short
+//! when imbalance < -OF_IMB_ENTRY and CVD < 0. Exit on the mirrored signal
+//! (long: imbalance < -0.1 or CVD < 0; short: imbalance > 0.1 or CVD > 0), or
+//! on a -1% adverse stop. 60s cooldown between trades.
 //!
 //! Closed trades append to orderflow_paper_trades.jsonl; each close also prints
 //! cumulative P&L vs buy-and-hold of the same stake from the first price seen.
@@ -54,7 +56,32 @@ fn round_trip_pnl(stake: f64, entry_px: f64, exit_px: f64) -> f64 {
     proceeds - stake
 }
 
+/// Net P&L in quote currency for a short round trip: base worth `stake` sold
+/// at `entry_px` (taker fee on the way in), bought back at `exit_px` (taker
+/// fee on the way out).
+fn short_round_trip_pnl(stake: f64, entry_px: f64, exit_px: f64) -> f64 {
+    let proceeds = stake * (1.0 - TAKER_FEE);
+    let buyback_cost = stake * exit_px / (entry_px * (1.0 - TAKER_FEE));
+    proceeds - buyback_cost
+}
+
+#[derive(Clone, Copy)]
+enum Side {
+    Long,
+    Short,
+}
+
+impl Side {
+    fn as_str(self) -> &'static str {
+        match self {
+            Side::Long => "long",
+            Side::Short => "short",
+        }
+    }
+}
+
 struct Position {
+    side: Side,
     entry_px: f64,
     entry_time: f64,
 }
@@ -217,24 +244,48 @@ async fn main() -> Result<()> {
 
         match &position {
             None => {
-                if imb > imb_entry && cvd > 0.0 && now - last_exit_time > COOLDOWN_SECS {
-                    println!(
-                        "[ENTER] long ${stake} @ {best_ask:.2} (imb={imb:.2} cvd={cvd:.4})"
-                    );
-                    position = Some(Position { entry_px: best_ask, entry_time: now });
+                if now - last_exit_time > COOLDOWN_SECS {
+                    let side = if imb > imb_entry && cvd > 0.0 {
+                        Some((Side::Long, best_ask))
+                    } else if imb < -imb_entry && cvd < 0.0 {
+                        Some((Side::Short, best_bid))
+                    } else {
+                        None
+                    };
+                    if let Some((side, entry_px)) = side {
+                        println!(
+                            "[ENTER] {} ${stake} @ {entry_px:.2} (imb={imb:.2} cvd={cvd:.4})",
+                            side.as_str()
+                        );
+                        position = Some(Position { side, entry_px, entry_time: now });
+                    }
                 }
             }
             Some(pos) => {
-                let unrealized = (best_bid - pos.entry_px) / pos.entry_px;
+                let (exit_px, unrealized, signal_exit) = match pos.side {
+                    Side::Long => (
+                        best_bid,
+                        (best_bid - pos.entry_px) / pos.entry_px,
+                        imb < IMB_EXIT || cvd < 0.0,
+                    ),
+                    Side::Short => (
+                        best_ask,
+                        (pos.entry_px - best_ask) / pos.entry_px,
+                        imb > -IMB_EXIT || cvd > 0.0,
+                    ),
+                };
                 let reason = if unrealized <= STOP_PCT {
                     Some("stop")
-                } else if imb < IMB_EXIT || cvd < 0.0 {
+                } else if signal_exit {
                     Some("signal")
                 } else {
                     None
                 };
                 if let Some(reason) = reason {
-                    let pnl = round_trip_pnl(stake, pos.entry_px, best_bid);
+                    let pnl = match pos.side {
+                        Side::Long => round_trip_pnl(stake, pos.entry_px, exit_px),
+                        Side::Short => short_round_trip_pnl(stake, pos.entry_px, exit_px),
+                    };
                     stats.trades += 1;
                     if pnl > 0.0 {
                         stats.wins += 1;
@@ -242,10 +293,11 @@ async fn main() -> Result<()> {
                     stats.net_pnl += pnl;
                     let hold_pnl = stake * (best_bid / stats.first_price - 1.0);
                     let record = json!({
+                        "side": pos.side.as_str(),
                         "entry_time": pos.entry_time,
                         "exit_time": now,
                         "entry_px": pos.entry_px,
-                        "exit_px": best_bid,
+                        "exit_px": exit_px,
                         "stake": stake,
                         "pnl": pnl,
                         "reason": reason,
@@ -256,9 +308,12 @@ async fn main() -> Result<()> {
                         eprintln!("failed to log trade: {e}");
                     }
                     println!(
-                        "[EXIT:{reason}] @ {best_bid:.2} pnl=${pnl:.2} | total: {} trades, \
+                        "[EXIT:{reason}] {} @ {exit_px:.2} pnl=${pnl:.2} | total: {} trades, \
                          {} wins, net=${:.2} | buy&hold same stake: ${hold_pnl:.2}",
-                        stats.trades, stats.wins, stats.net_pnl
+                        pos.side.as_str(),
+                        stats.trades,
+                        stats.wins,
+                        stats.net_pnl
                     );
                     position = None;
                     last_exit_time = now;
@@ -271,7 +326,7 @@ async fn main() -> Result<()> {
             println!(
                 "[tick] bid={best_bid:.2} ask={best_ask:.2} imb={imb:.2} cvd={cvd:.4} \
                  pos={} net=${:.2}",
-                if position.is_some() { "long" } else { "flat" },
+                position.as_ref().map_or("flat", |p| p.side.as_str()),
                 stats.net_pnl
             );
         }
@@ -305,6 +360,25 @@ mod tests {
         // +0.1% move on 0.1%/side fees is still a loss; +0.3% is a win.
         assert!(round_trip_pnl(300.0, 50_000.0, 50_050.0) < 0.0);
         assert!(round_trip_pnl(300.0, 50_000.0, 50_150.0) > 0.0);
+    }
+
+    #[test]
+    fn short_fees_eat_a_flat_round_trip() {
+        // Same entry and exit price must lose ~2x the taker fee, like the long.
+        let pnl = short_round_trip_pnl(300.0, 50_000.0, 50_000.0);
+        let expected = 300.0 * ((1.0 - TAKER_FEE) - 1.0 / (1.0 - TAKER_FEE));
+        assert!((pnl - expected).abs() < 1e-9, "pnl={pnl} expected={expected}");
+        assert!(pnl < 0.0);
+    }
+
+    #[test]
+    fn short_needs_drop_bigger_than_fees() {
+        // -0.1% move on 0.1%/side fees is still a loss; -0.3% is a win.
+        assert!(short_round_trip_pnl(300.0, 50_000.0, 49_950.0) < 0.0);
+        assert!(short_round_trip_pnl(300.0, 50_000.0, 49_850.0) > 0.0);
+        // Price going UP against a short loses more than fees alone.
+        let flat = short_round_trip_pnl(300.0, 50_000.0, 50_000.0);
+        assert!(short_round_trip_pnl(300.0, 50_000.0, 50_500.0) < flat);
     }
 
     #[test]
