@@ -82,6 +82,8 @@ pub struct DcaSummary {
 #[derive(Debug, Clone)]
 pub struct DcaStatsDB {
     collection: Collection<DcaPurchase>,
+    /// Order ids to never (re-)insert into `collection` — see [`DcaStatsDB::ignore_order_id`].
+    ignored: Collection<Document>,
 }
 
 impl DcaStatsDB {
@@ -100,9 +102,13 @@ impl DcaStatsDB {
         let client = Client::with_uri_str(&mongodb_url).await?;
         let database = client.database("dca_bot");
         let collection = database.collection(collection_name);
+        let ignored = database.collection(&format!("{collection_name}_ignored"));
 
         info!("🍃 Connected to MongoDB collection '{}'", collection_name);
-        Ok(Self { collection })
+        Ok(Self {
+            collection,
+            ignored,
+        })
     }
 
     pub async fn record_purchase(&self, purchase: &DcaPurchase) -> Result<()> {
@@ -363,13 +369,50 @@ impl DcaStatsDB {
         Ok(order_ids)
     }
 
+    /// Mark `order_id` as "never import this into the DCA history".
+    ///
+    /// Manual trades placed by hand in the exchange app are indistinguishable
+    /// from bot DCA buys on the wire (only the limit sleeve tags its orders, via
+    /// `clOrdId`), so `get_dca_purchases_since` returns them too. Deleting such a
+    /// record is therefore not enough — the next `reconcile_missing_purchases`
+    /// would re-add it. The ignore list is what makes a removal stick.
+    pub async fn ignore_order_id(&self, order_id: &str) -> Result<()> {
+        self.ignored
+            .update_one(
+                doc! { "order_id": order_id },
+                doc! { "$set": { "order_id": order_id } },
+            )
+            .upsert(true)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn ignored_order_ids(&self) -> Result<Vec<String>> {
+        let mut cursor = self.ignored.find(Document::new()).await?;
+        let mut ids = Vec::new();
+        while let Some(doc) = cursor.try_next().await? {
+            if let Ok(order_id) = doc.get_str("order_id") {
+                ids.push(order_id.to_string());
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Order ids that must not be inserted by a backfill: those already stored,
+    /// plus those explicitly ignored via [`Self::ignore_order_id`].
+    async fn known_order_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let mut ids: std::collections::HashSet<String> =
+            self.get_all_order_ids().await?.into_iter().collect();
+        ids.extend(self.ignored_order_ids().await?);
+        Ok(ids)
+    }
+
     /// Backfill any of `exchange_purchases` not already present (by `order_id`).
     /// Exchange-agnostic counterpart to `sync_missing_orders_from_binance`, for
     /// exchanges where fetching the purchases themselves is the exchange
     /// client's job (see `Exchange::get_dca_purchases_since`).
     pub async fn sync_missing_purchases(&self, exchange_purchases: &[DcaPurchase]) -> Result<usize> {
-        let existing_ids: std::collections::HashSet<String> =
-            self.get_all_order_ids().await?.into_iter().collect();
+        let existing_ids = self.known_order_ids().await?;
 
         let mut added = 0;
         for purchase in exchange_purchases {
@@ -416,9 +459,7 @@ impl DcaStatsDB {
         }
 
         // Get all existing order IDs from database
-        let existing_order_ids = self.get_all_order_ids().await?;
-        let existing_ids_set: std::collections::HashSet<String> =
-            existing_order_ids.into_iter().collect();
+        let existing_ids_set = self.known_order_ids().await?;
 
         info!(
             "📊 Found {} existing orders in database",
@@ -487,9 +528,7 @@ impl DcaStatsDB {
             .await?;
 
         // Get all existing order IDs from database
-        let existing_order_ids = self.get_all_order_ids().await?;
-        let existing_ids_set: std::collections::HashSet<String> =
-            existing_order_ids.into_iter().collect();
+        let existing_ids_set = self.known_order_ids().await?;
 
         // Find missing order IDs
         let missing_order_ids: Vec<String> = binance_orders
@@ -696,6 +735,75 @@ mod tests {
             .delete_many(Document::new())
             .await
             .expect("cleanup test collection");
+    }
+
+    // A manual trade made by hand in the exchange app comes back from
+    // `get_dca_purchases_since` looking exactly like a DCA buy, so deleting it
+    // alone is undone by the next backfill. Removing it must stick.
+    #[tokio::test]
+    async fn ignored_order_is_not_re_added_by_backfill() {
+        let db = DcaStatsDB::with_collection("test_ignored_order_backfill")
+            .await
+            .expect("connect to MongoDB");
+        db.collection
+            .delete_many(Document::new())
+            .await
+            .expect("clear test collection");
+        db.ignored
+            .delete_many(Document::new())
+            .await
+            .expect("clear ignore list");
+
+        let manual = DcaPurchase {
+            id: "manual-id".to_string(),
+            timestamp: Utc::now(),
+            symbol: "ETHUSDC".to_string(),
+            side: "BUY".to_string(),
+            usdc_amount: dec!(200),
+            eth_amount: dec!(0.1),
+            eth_price: dec!(2000),
+            fees_usdc: dec!(0.7),
+            order_id: "manual-order".to_string(),
+            status: "FILLED".to_string(),
+        };
+
+        // Before ignoring, the backfill legitimately imports it.
+        assert_eq!(
+            db.sync_missing_purchases(std::slice::from_ref(&manual))
+                .await
+                .expect("first backfill"),
+            1
+        );
+
+        db.ignore_order_id(&manual.order_id).await.expect("ignore");
+        db.remove_purchase_by_order_id(&manual.order_id)
+            .await
+            .expect("remove");
+
+        // The exchange still reports it, but it must not come back.
+        assert_eq!(
+            db.sync_missing_purchases(std::slice::from_ref(&manual))
+                .await
+                .expect("second backfill"),
+            0,
+            "ignored order must not be re-imported"
+        );
+        assert!(
+            db.get_purchase_by_order_id(&manual.order_id)
+                .await
+                .expect("lookup")
+                .is_none(),
+            "ignored order must stay out of the collection"
+        );
+
+        db.collection
+            .delete_many(Document::new())
+            .await
+            .expect("cleanup test collection");
+        db.ignored
+            .delete_many(Document::new())
+            .await
+            .expect("cleanup ignore list");
     }
 
     // Reproduces the exact failure from the field: a Monday 09:00 scheduled buy
