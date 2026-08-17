@@ -503,6 +503,23 @@ impl OkxClient {
         format!("sleeve{userref}")
     }
 
+    /// Prefix stamped into `clOrdId` for every order the DCA patient-maker loop
+    /// places (see [`Self::place_post_only_limit`] and [`Self::place_market_buy`]),
+    /// so [`Self::fetch_filled_dca_buys`] can tell a DCA purchase from a trade
+    /// placed by hand in the OKX app — both land on the same order-history
+    /// endpoint with no other distinguishing field.
+    const DCA_CL_ORD_PREFIX: &str = "dca";
+
+    /// Unique per-order clOrdId carrying [`Self::DCA_CL_ORD_PREFIX`]; well under
+    /// OKX's 32-char/alphanumeric cap.
+    fn new_dca_cl_ord_id() -> String {
+        format!(
+            "{}{}",
+            Self::DCA_CL_ORD_PREFIX,
+            &Uuid::new_v4().simple().to_string()[..8]
+        )
+    }
+
     /// The sleeve's currently-resting orders (those whose `clOrdId` carries the
     /// sleeve's tag prefix), across all spot instruments.
     async fn get_open_sleeve_orders(&self, userref: i32) -> Result<Vec<OpenSleeveOrder>> {
@@ -577,12 +594,14 @@ impl OkxClient {
         Ok(out)
     }
 
-    /// Filled buy orders for `symbol` since `start_ms` (unix millis), excluding
-    /// the limit sleeve's own orders (same account, same order-history endpoint
-    /// — see [`Self::sleeve_tag_prefix`]). Shared by the trait's
-    /// `get_current_month_purchases` (this-month window, for display) and
-    /// `get_dca_purchases_since` (arbitrary lookback, to backfill purchases the
-    /// bot failed to record — e.g. the process died mid patient-maker loop).
+    /// Filled buy orders for `symbol` since `start_ms` (unix millis) that carry
+    /// the DCA bot's own `clOrdId` tag (see [`Self::DCA_CL_ORD_PREFIX`]) — this
+    /// is an allow-list, not a sleeve exclusion, so a manual trade placed by
+    /// hand in the OKX app (untagged) is never mistaken for a DCA purchase.
+    /// Shared by the trait's `get_current_month_purchases` (this-month window,
+    /// for display) and `get_dca_purchases_since` (arbitrary lookback, to
+    /// backfill purchases the bot failed to record — e.g. the process died mid
+    /// patient-maker loop).
     ///
     /// ponytail: single page (100 orders) — far beyond what either caller's
     /// window sees in practice; paginate via the `after` cursor if that stops
@@ -596,7 +615,7 @@ impl OkxClient {
 
         let mut purchases = Vec::new();
         for order in orders {
-            if order.side != "buy" || order.cl_ord_id.starts_with("sleeve") {
+            if order.side != "buy" || !order.cl_ord_id.starts_with(Self::DCA_CL_ORD_PREFIX) {
                 continue;
             }
             let executed_qty = parse_dec(&order.acc_fill_sz);
@@ -703,6 +722,7 @@ impl OkxClient {
             "ordType": "post_only",
             "px": px,
             "sz": sz.normalize().to_string(),
+            "clOrdId": Self::new_dca_cl_ord_id(),
         });
         let data: Vec<PlaceOrderData> = self
             .private_request("POST", "/api/v5/trade/order", Some(body))
@@ -1089,6 +1109,7 @@ impl Exchange for OkxClient {
             "ordType": "market",
             "sz": quote_usdc.normalize().to_string(),
             "tgtCcy": "quote_ccy",
+            "clOrdId": Self::new_dca_cl_ord_id(),
         });
         let data: Vec<PlaceOrderData> = self
             .private_request("POST", "/api/v5/trade/order", Some(body))
@@ -1367,6 +1388,16 @@ mod tests {
         assert_eq!(OkxClient::okx_inst("BTCUSDC"), "BTC-USDC");
         // Non-USDC symbols pass through untouched.
         assert_eq!(OkxClient::okx_inst("ETH-EUR"), "ETH-EUR");
+    }
+
+    #[test]
+    fn dca_cl_ord_id_is_tagged_and_unique_and_a_manual_trades_blank_id_never_matches() {
+        let a = OkxClient::new_dca_cl_ord_id();
+        let b = OkxClient::new_dca_cl_ord_id();
+        assert!(a.starts_with(OkxClient::DCA_CL_ORD_PREFIX));
+        assert_ne!(a, b, "each order needs a unique clOrdId");
+        // A manual OKX-app trade leaves clOrdId blank — must never pass the tag check.
+        assert!(!"".starts_with(OkxClient::DCA_CL_ORD_PREFIX));
     }
 
     #[test]
